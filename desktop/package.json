@@ -1,0 +1,15 @@
+{
+  "name": "photoai-desktop",
+  "private": true,
+  "version": "0.9.0-beta.1",
+  "description": "照片选片 Windows 桌面壳",
+  "scripts": {
+    "check": "cargo check --manifest-path src-tauri/Cargo.toml",
+    "tauri": "tauri",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4"
+  }
+}
+

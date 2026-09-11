@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>照片选片</title>
+  <link rel="stylesheet" href="/static/app.css?v=54">
+</head>
+<body>
+  <header class="app-header">
+    <strong class="brand">照片选片</strong>
+    <nav aria-label="主导航">
+      <button class="tab active" data-view="cull">选片</button>
+      <button class="tab" data-view="toolbox">工具箱</button>
+      <button class="tab" data-view="settings">设置</button>
+    </nav>
+  </header>
+
+  <div id="alert-bar" class="alert-bar hidden" role="status"></div>
+  <div id="job-bar" class="job-bar hidden" role="status" aria-live="polite">
+    <div class="job-progress-panel">
+      <div class="job-summary">
+        <div class="job-copy"><strong id="job-title"></strong><span id="job-stage"></span></div>
+        <span id="job-percent" class="job-percent"></span>
+      </div>
+      <div id="job-progress-track" class="job-progress-track" role="progressbar" aria-label="任务总进度" aria-valuemin="0" aria-valuemax="100">
+        <span id="job-progress-fill" class="job-progress-fill"></span>
+      </div>
+      <div id="job-live-detail" class="job-live-detail hidden"></div>
+      <div id="job-nodes" class="job-nodes hidden" aria-label="计算阶段"></div>
+    </div>
+    <div class="job-actions">
+      <button id="job-retry" class="button job-retry hidden" type="button">重试</button>
+      <button id="job-cancel" class="text-button job-cancel" type="button">取消</button>
+    </div>
+  </div>
+
+  <main>
+    <section id="view-cull" class="view active">
+      <div class="page-head">
+        <div><h1>工程</h1></div>
+      </div>
+      <div id="model-setup-gate" class="panel setup-gate hidden">
+        <div><strong>先准备 AI 模型</strong><p id="model-setup-copy"></p></div>
+        <button id="model-setup-open" type="button" class="button primary">安装模型套装</button>
+      </div>
+      <form id="cull-form" class="panel cull-grid">
+        <div class="path-field"><label for="cull-path">照片目录</label><span class="path-picker"><input id="cull-path" name="input_path" autocomplete="off" required><button class="button folder-picker-button desktop-folder-picker hidden" data-folder-target="cull-path" type="button">浏览</button></span></div>
+        <div class="form-action"><button class="button primary" type="submit">创建工程</button></div>
+      </form>
+      <div class="section-title"><h2>最近工程</h2></div>
+      <div id="recent-projects" class="project-list empty">暂无工程</div>
+    </section>
+
+    <section id="view-project" class="view">
+      <div class="page-head project-start-head">
+        <div>
+          <button id="project-start-back" class="text-button review-back" type="button">← 返回</button>
+          <h1 id="project-start-title">工程</h1>
+          <p id="project-start-path"></p>
+        </div>
+      </div>
+      <section class="panel project-start-panel">
+        <span class="project-step-number">1</span>
+        <div class="project-step-copy"><strong>照片分组</strong><small>先按相似内容整理照片，完成后可手动调整，再开始 AI 评分。</small></div>
+        <form id="project-group-form"><button id="project-group-start" class="button primary" type="submit">开始分析分组</button></form>
+      </section>
+      <div id="project-model-setup-gate" class="panel setup-gate hidden">
+        <div><strong>AI 模型尚未就绪</strong><p id="project-model-setup-copy"></p></div>
+        <button id="project-model-setup-open" type="button" class="button primary">前往安装</button>
+      </div>
+    </section>
+
+    <section id="view-toolbox" class="view">
+      <div id="toolbox-home" class="toolbox-level" data-toolbox-panel="home">
+        <div class="page-head">
+          <div><h1>工具箱</h1><p>选择要使用的工具。</p></div>
+        </div>
+        <div class="toolbox-module-grid">
+          <button class="toolbox-module" data-toolbox-open="raw-jpeg" type="button">
+            <span class="toolbox-module-code">RAW</span>
+            <span class="toolbox-module-copy"><strong>RAW / 成片管理</strong><small>整理没有对应 RAW 或成片的孤立文件。</small></span>
+            <span class="toolbox-module-foot"><small id="toolbox-raw-jpeg-count">暂无操作记录</small><b aria-hidden="true">→</b></span>
+          </button>
+          <button class="toolbox-module" data-toolbox-open="xmp-cleanup" type="button">
+            <span class="toolbox-module-code">XMP</span>
+            <span class="toolbox-module-copy"><strong>清除文件夹 XMP</strong><small>扫描后永久删除，不可恢复。</small></span>
+            <span class="toolbox-module-foot"><small id="toolbox-xmp-cleanup-count">暂无清除记录</small><b aria-hidden="true">→</b></span>
+          </button>
+          <button class="toolbox-module" data-toolbox-open="xmp-records" type="button">
+            <span class="toolbox-module-code">记录</span>
+            <span class="toolbox-module-copy"><strong>XMP 写入记录</strong><small>查看选片工程写入的 XMP 与可用回滚。</small></span>
+            <span class="toolbox-module-foot"><small id="toolbox-xmp-record-count">暂无写入记录</small><b aria-hidden="true">→</b></span>
+          </button>
+        </div>
+      </div>
+
+      <div id="toolbox-raw-jpeg" class="toolbox-level hidden" data-toolbox-panel="raw-jpeg">
+        <div class="page-head toolbox-subhead">
+          <div><button class="text-button toolbox-back" data-toolbox-back type="button">← 工具箱</button><h1>RAW / 成片管理</h1><p>扫描后再决定是否整理，不会直接删除文件。</p></div>
+        </div>
+        <section class="tool-card">
+          <form id="raw-jpeg-form" class="panel toolbox-form">
+            <label>存放方式<select id="raw-jpeg-layout"><option value="mixed">混合在同一文件夹</option><option value="separate">RAW 与成片分开</option></select></label>
+            <label>处理方向<select id="raw-jpeg-direction"><option value="jpeg">以成片为准</option><option value="raw">以 RAW 为准</option><option value="both">双向清理孤片</option></select></label>
+            <div id="raw-jpeg-mixed-field" class="tool-wide path-field"><label for="raw-jpeg-mixed-path">照片目录</label><span class="path-picker"><input id="raw-jpeg-mixed-path" autocomplete="off" required><button class="button folder-picker-button desktop-folder-picker hidden" data-folder-target="raw-jpeg-mixed-path" type="button">浏览</button></span></div>
+            <div id="raw-jpeg-raw-field" class="tool-wide path-field hidden"><label for="raw-jpeg-raw-path">RAW 文件夹</label><span class="path-picker"><input id="raw-jpeg-raw-path" autocomplete="off"><button class="button folder-picker-button desktop-folder-picker hidden" data-folder-target="raw-jpeg-raw-path" type="button">浏览</button></span></div>
+            <div id="raw-jpeg-jpeg-field" class="tool-wide path-field hidden"><label for="raw-jpeg-jpeg-path">成片文件夹</label><span class="path-picker"><input id="raw-jpeg-jpeg-path" autocomplete="off"><button class="button folder-picker-button desktop-folder-picker hidden" data-folder-target="raw-jpeg-jpeg-path" type="button">浏览</button></span></div>
+            <label>RAW 格式<input id="raw-jpeg-raw-extensions" value="arw, cr3, cr2, nef, raf, dng, orf, rw2"></label>
+            <label>成片格式<input id="raw-jpeg-jpeg-extensions" value="jpg,jpeg,heic,heif,hif"></label>
+            <label class="check"><input id="raw-jpeg-recursive" type="checkbox">包含子文件夹</label>
+            <div class="form-action"><button id="raw-jpeg-preview" class="button primary" type="submit">扫描预览</button></div>
+          </form>
+          <div id="raw-jpeg-result" class="tool-result hidden"></div>
+        </section>
+        <section id="raw-jpeg-history" class="hidden">
+          <div class="section-title"><h2>最近操作</h2></div>
+          <div id="raw-jpeg-transactions" class="transaction-list"></div>
+        </section>
+      </div>
+
+      <div id="toolbox-xmp-cleanup" class="toolbox-level hidden" data-toolbox-panel="xmp-cleanup">
+        <div class="page-head toolbox-subhead">
+          <div><button class="text-button toolbox-back" data-toolbox-back type="button">← 工具箱</button><h1>清除文件夹 XMP</h1><p>仅删除 XMP 旁车文件，不删除照片；删除后不可恢复。</p></div>
+        </div>
+        <section class="tool-card xmp-cleanup-card">
+          <form id="xmp-cleanup-form" class="panel toolbox-form">
+            <div class="tool-wide path-field"><label for="xmp-cleanup-path">照片目录</label><span class="path-picker"><input id="xmp-cleanup-path" autocomplete="off" required><button class="button folder-picker-button desktop-folder-picker hidden" data-folder-target="xmp-cleanup-path" type="button">浏览</button></span></div>
+            <label class="check"><input id="xmp-cleanup-recursive" type="checkbox">包含子文件夹</label>
+            <div class="form-action"><button id="xmp-cleanup-preview" class="button primary" type="submit">扫描 XMP</button></div>
+          </form>
+          <div id="xmp-cleanup-result" class="tool-result hidden" role="status" aria-live="polite"></div>
+        </section>
+        <section id="xmp-cleanup-history" class="hidden">
+          <div class="section-title"><h2>清除记录</h2></div>
+          <div id="xmp-cleanup-transactions" class="transaction-list"></div>
+        </section>
+      </div>
+
+      <div id="toolbox-xmp-records" class="toolbox-level hidden" data-toolbox-panel="xmp-records">
+        <div class="page-head toolbox-subhead">
+          <div><button class="text-button toolbox-back" data-toolbox-back type="button">← 工具箱</button><h1>XMP 写入记录</h1><p>这里仅显示选片工程正式写入的记录。</p></div>
+        </div>
+        <div id="toolbox-xmp-empty" class="empty">暂无 XMP 写入记录</div>
+        <section id="toolbox-xmp" class="hidden">
+          <div id="toolbox-transactions" class="transaction-list"></div>
+        </section>
+      </div>
+    </section>
+
+    <section id="view-review" class="view">
+      <div id="review-empty" class="empty-state">
+        <h1>还没有打开批次</h1>
+        <p>从选片页打开一个工程。</p>
+      </div>
+      <div id="review-workspace" class="hidden">
+        <nav class="workflow-steps" aria-label="照片处理流程">
+          <button class="workflow-step" data-workflow-stage="review" type="button"><span>1</span><strong>选片</strong></button>
+          <button class="workflow-step" data-workflow-stage="crop" type="button"><span>2</span><strong>构图</strong></button>
+          <button class="workflow-step" data-workflow-stage="base" type="button"><span>3</span><strong>基础调色</strong></button>
+          <button class="workflow-step" data-workflow-stage="style" type="button"><span>4</span><strong>创意外观</strong></button>
+          <button class="workflow-step" data-workflow-stage="export" type="button"><span>5</span><strong>导出</strong></button>
+        </nav>
+        <div class="review-head">
+          <div class="review-heading">
+            <button id="review-back" class="text-button review-back" type="button">← 返回</button>
+            <h1 id="review-title">审片</h1><p id="review-summary"></p>
+          </div>
+          <div class="review-actions">
+            <button id="grouping-toggle" class="button hidden">调整分组</button>
+            <button id="batch-select-toggle" class="button hidden">批量选择</button>
+          </div>
+        </div>
+        <div id="grouping-notice" class="grouping-notice hidden"></div>
+        <div id="selection-toolbar" class="selection-toolbar panel hidden">
+          <strong id="selection-count">已选 0 张</strong>
+          <div class="selection-actions">
+            <button id="selection-all" class="text-button" type="button">全选</button>
+            <button id="selection-clear" class="text-button" type="button">清空</button>
+            <button id="selection-move" class="button" type="button">移动到…</button>
+            <button id="selection-up" class="button" type="button" title="移到当前组的上一组">上移</button>
+            <button id="selection-down" class="button" type="button" title="移到当前组的下一组">下移</button>
+            <button id="selection-new-group" class="button" type="button">新建组</button>
+            <button id="selection-remove" class="button danger-quiet" type="button">移出工程</button>
+          </div>
+        </div>
+        <div id="review-toolbar" class="review-toolbar panel">
+          <div class="filter-group" aria-label="照片筛选">
+            <button class="filter active" data-filter="all">全部</button>
+            <button class="filter" data-filter="4">4–5 星</button>
+            <button class="filter" data-filter="3">3 星</button>
+            <button class="filter" data-filter="0">0 星</button>
+            <button class="filter" data-filter="warning">技术警告</button>
+          </div>
+          <span id="visible-count"></span>
+        </div>
+        <div id="review-groups" class="review-groups"></div>
+        <div id="review-flow" class="workflow-footer">
+          <div class="workflow-footer-copy"><strong>第 1 步 · 选片</strong><span id="review-flow-copy">完成分组和评分后继续</span></div>
+          <div id="score-settings" class="score-settings hidden">
+            <label>保留比例<input id="retain-ratio" name="retain_ratio" type="number" min="0.05" max="1" step="0.05" value="0.30"></label>
+            <details class="score-advanced">
+              <summary>评分设置</summary>
+              <label>评分方式<select id="scoring-mode"><option value="deep" selected>深度（推荐）</option><option value="fast">快速</option></select></label>
+            </details>
+          </div>
+          <div class="workflow-footer-actions">
+            <button id="score-run" class="button primary hidden">开始 AI 选片</button>
+            <button id="develop-open" class="button primary hidden">下一步：构图</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-develop" class="view">
+      <nav class="workflow-steps" aria-label="照片处理流程">
+        <button class="workflow-step" data-workflow-stage="review" type="button"><span>1</span><strong>选片</strong></button>
+        <button class="workflow-step" data-workflow-stage="crop" type="button"><span>2</span><strong>构图</strong></button>
+        <button class="workflow-step" data-workflow-stage="base" type="button"><span>3</span><strong>基础调色</strong></button>
+        <button class="workflow-step" data-workflow-stage="style" type="button"><span>4</span><strong>创意外观</strong></button>
+        <button class="workflow-step" data-workflow-stage="export" type="button"><span>5</span><strong>导出</strong></button>
+      </nav>
+      <div class="develop-head">
+        <div class="review-heading">
+          <h1 id="develop-title">构图</h1>
+          <p id="develop-summary"></p>
+        </div>
+      </div>
+      <div id="develop-output-hint" class="develop-output-hint hidden" role="status" aria-live="polite"></div>
+      <div id="develop-grid" class="develop-grid"></div>
+      <section id="develop-base-workspace" class="hidden">
+        <div class="base-color-actions">
+          <button type="button" class="base-color-option" data-color-mode="auto"><span><strong>Lightroom 自动校准</strong><small>自动白平衡、明暗、镜头和色差</small></span><em id="develop-base-auto-state"></em></button>
+          <button type="button" class="base-color-option" data-color-mode="skip"><span><strong>不做基础校准</strong><small>保留相机原始显色</small></span><em id="develop-base-skip-state"></em></button>
+        </div>
+      </section>
+      <section id="style-workspace" class="style-workspace hidden">
+        <div class="style-toolbar">
+          <div class="style-scope-switch" role="group" aria-label="创意外观应用范围">
+            <button type="button" class="style-scope-option" data-style-scope="global">全局统一</button>
+            <button type="button" class="style-scope-option" data-style-scope="group">按组设置</button>
+          </div>
+          <div class="style-toolbar-actions">
+            <span id="style-group-batch-status" class="style-group-batch-status hidden" role="status" aria-live="polite"></span>
+            <button id="style-recommend-all" type="button" class="button primary hidden">一键为所有组生成</button>
+            <button id="style-recommend" type="button" class="button primary">AI 推荐</button>
+          </div>
+        </div>
+        <div id="style-groups" class="style-groups"></div>
+      </section>
+      <div id="develop-flow" class="workflow-footer">
+        <div class="workflow-footer-copy">
+          <strong id="develop-flow-title"></strong>
+          <span id="develop-flow-copy"></span>
+        </div>
+        <div class="workflow-footer-actions">
+          <button id="develop-back" class="button">上一步：选片</button>
+          <button id="develop-skip" class="button">跳过构图</button>
+          <button id="develop-apply-style" class="button hidden">全部采用 AI 推荐</button>
+          <button id="develop-next" class="button primary">下一步：基础调色</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-export" class="view">
+      <nav class="workflow-steps" aria-label="照片处理流程">
+        <button class="workflow-step" data-workflow-stage="review" type="button"><span>1</span><strong>选片</strong></button>
+        <button class="workflow-step" data-workflow-stage="crop" type="button"><span>2</span><strong>构图</strong></button>
+        <button class="workflow-step" data-workflow-stage="base" type="button"><span>3</span><strong>基础调色</strong></button>
+        <button class="workflow-step" data-workflow-stage="style" type="button"><span>4</span><strong>创意外观</strong></button>
+        <button class="workflow-step" data-workflow-stage="export" type="button"><span>5</span><strong>导出</strong></button>
+      </nav>
+      <div class="develop-head">
+        <div class="review-heading">
+          <h1 id="export-title">导出</h1>
+          <p id="export-summary"></p>
+        </div>
+      </div>
+      <div id="export-status" class="develop-output-hint hidden" role="status" aria-live="polite"></div>
+      <section class="panel export-panel">
+        <div id="export-content"></div>
+        <div class="export-targets" aria-label="输出目标">
+          <label class="export-target selected" data-export-target="xmp"><input id="export-xmp" type="checkbox" checked><span><strong>保存 XMP</strong><small>星级与最终调整</small></span></label>
+          <label class="export-target" data-export-target="jpeg"><input id="export-jpeg" type="checkbox"><span><strong>导出 JPEG</strong><small>sRGB · 原尺寸 · 质量 90 · 屏幕标准锐化</small></span></label>
+        </div>
+        <div id="export-directory-field" class="export-directory path-field hidden"><label for="export-directory">JPEG 输出目录</label><span class="path-picker"><input id="export-directory" autocomplete="off"><button class="button folder-picker-button desktop-folder-picker hidden" data-folder-target="export-directory" type="button">浏览</button></span></div>
+      </section>
+      <div id="export-flow" class="workflow-footer">
+        <div class="workflow-footer-actions">
+          <button id="export-back" class="button">上一步</button>
+          <button id="export-action" class="button primary">保存 XMP</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-settings" class="view">
+      <div class="page-head">
+        <div><h1>设置</h1></div>
+      </div>
+      <section class="panel data-location-settings">
+        <div class="settings-row">
+          <div><strong>数据目录</strong><p id="settings-content-root">跟随程序安装位置</p></div>
+          <button id="settings-content-root-change" type="button" class="button">修改位置</button>
+        </div>
+        <p class="settings-note">默认保存在程序安装目录的 data 文件夹；修改位置不会搬移原目录中的模型和工程。</p>
+      </section>
+      <div class="panel lightroom-settings">
+        <div id="lightroom-detail" class="compact-detail"></div>
+        <form id="lightroom-config-form" class="settings-config">
+          <label>Lightroom 程序路径<input id="lightroom-path" autocomplete="off" placeholder="Lightroom.exe 或安装文件夹"></label>
+          <div class="settings-actions">
+            <button id="lightroom-refresh" class="button" type="button">刷新连接</button>
+            <button id="lightroom-auto-configure" class="button" type="button">自动识别并配置</button>
+            <button id="lightroom-manual-configure" class="button primary" type="submit">按此路径配置</button>
+          </div>
+        </form>
+        <p id="lightroom-config-status" class="settings-note hidden" role="status" aria-live="polite"></p>
+      </div>
+      <section class="panel style-library-settings">
+        <div class="settings-row"><div><strong>风格库</strong><p id="settings-style-summary">尚未同步</p></div><button id="style-library-manage" type="button" class="button">打开风格库</button></div>
+      </section>
+      <section class="panel model-resource-settings">
+        <div class="settings-row"><div><strong>AI 模型</strong><p id="settings-model-summary">正在读取资源</p></div><button id="model-resource-open" type="button" class="button">管理资源</button></div>
+      </section>
+      <section class="panel settings-transfer">
+        <div class="settings-row">
+          <div><strong>设置迁移</strong><p>仅迁移流程、风格开关和导出偏好，不含工程、模型或滤镜文件。</p></div>
+          <div class="settings-actions">
+            <button id="settings-export" type="button" class="button">导出设置</button>
+            <button id="settings-import-open" type="button" class="button">导入设置</button>
+            <input id="settings-import-file" class="hidden" type="file" accept=".photoai-settings,application/json">
+          </div>
+        </div>
+        <p id="settings-transfer-status" class="settings-note hidden" role="status" aria-live="polite"></p>
+      </section>
+    </section>
+
+    <section id="view-resources" class="view">
+      <button id="model-resource-back" type="button" class="text-button">← 返回设置</button>
+      <div class="page-head resource-page-head">
+        <div><h1>模型资源</h1><p id="model-resource-storage"></p></div>
+      </div>
+      <p class="resource-independent-note">AI 模型安装与 Lightroom 相互独立；无需打开 Lightroom，也无需等待插件连接。</p>
+      <p id="model-resource-task-note" class="resource-independent-note warning hidden" role="status" aria-live="polite"></p>
+      <div id="model-gpu-summary" class="resource-gpu-summary"></div>
+      <div id="model-profile-list" class="model-profile-list"></div>
+      <div class="resource-list-head"><div><h2 id="model-resource-list-title">模型</h2><p id="model-resource-list-summary"></p></div><button id="model-profile-delete" type="button" class="button danger-quiet">删除此档模型</button></div>
+      <div id="model-resource-list" class="model-resource-list"></div>
+    </section>
+
+  </main>
+
+  <dialog id="photo-dialog" class="photo-dialog">
+    <button class="dialog-close" data-close-dialog="photo-dialog" aria-label="关闭">×</button>
+    <img id="dialog-image" alt="照片预览">
+    <div id="dialog-analysis" class="dialog-analysis"></div>
+    <div class="dialog-footer">
+      <strong id="dialog-name"></strong>
+      <div id="dialog-ratings" class="rating-buttons"></div>
+    </div>
+  </dialog>
+
+  <dialog id="group-dialog" class="confirm-dialog">
+    <form method="dialog"><button class="dialog-close" value="cancel" aria-label="关闭">×</button></form>
+    <h2>调整分组</h2>
+    <p id="group-dialog-copy"></p>
+    <label>移到<select id="group-target"></select></label>
+    <div class="dialog-actions"><button class="button" data-close-dialog="group-dialog">取消</button><button id="group-submit" class="button primary">保存</button></div>
+  </dialog>
+
+  <dialog id="rollback-dialog" class="confirm-dialog">
+    <form method="dialog"><button class="dialog-close" value="cancel" aria-label="关闭">×</button></form>
+    <h2>回滚 XMP</h2>
+    <p>只删除该事务创建且之后未被修改的 XMP。</p>
+    <label>输入“撤销 XMP”确认<input id="rollback-confirm" autocomplete="off"></label>
+    <div class="dialog-actions"><button class="button" data-close-dialog="rollback-dialog">取消</button><button id="rollback-submit" class="button danger">撤销 XMP</button></div>
+  </dialog>
+
+  <dialog id="delete-project-dialog" class="confirm-dialog">
+    <form method="dialog"><button class="dialog-close" value="cancel" aria-label="关闭">×</button></form>
+    <h2>删除工程</h2>
+    <p id="delete-project-copy">工程记录将移入所选数据目录的回收区。RAW 和现有 XMP 不会删除。</p>
+    <label>输入“删除工程”确认<input id="delete-project-confirm" autocomplete="off"></label>
+    <div class="dialog-actions"><button class="button" data-close-dialog="delete-project-dialog">取消</button><button id="delete-project-submit" class="button danger">移入回收目录</button></div>
+  </dialog>
+
+  <dialog id="raw-jpeg-confirm-dialog" class="confirm-dialog">
+    <form method="dialog"><button class="dialog-close" value="cancel" aria-label="关闭">×</button></form>
+    <h2>执行 RAW / 成片整理</h2>
+    <p id="raw-jpeg-confirm-copy"></p>
+    <p>文件会移入照片目录内的 <code>.photo-ai-trash</code> 回收区，不写入 C 盘；之后可在“最近操作”中撤销。</p>
+    <div class="dialog-actions"><button class="button" data-close-dialog="raw-jpeg-confirm-dialog">取消</button><button id="raw-jpeg-execute" class="button danger">移入回收区</button></div>
+  </dialog>
+
+  <dialog id="xmp-cleanup-confirm-dialog" class="confirm-dialog">
+    <button class="dialog-close" data-close-dialog="xmp-cleanup-confirm-dialog" aria-label="关闭">×</button>
+    <h2>清除这些 XMP？</h2>
+    <p id="xmp-cleanup-confirm-copy"></p>
+    <div class="dialog-actions"><button class="button" data-close-dialog="xmp-cleanup-confirm-dialog">取消</button><button id="xmp-cleanup-execute" class="button danger">永久删除</button></div>
+  </dialog>
+
+  <dialog id="style-search-dialog" class="style-search-dialog">
+    <form method="dialog"><button class="dialog-close" value="cancel" aria-label="关闭">×</button></form>
+    <h2>搜索风格预设</h2>
+    <input id="style-search-input" type="search" placeholder="名称、来源或分类" autocomplete="off">
+    <div id="style-search-results" class="style-search-results"></div>
+  </dialog>
+
+  <dialog id="style-library-manager-dialog" class="style-library-manager-dialog">
+    <form method="dialog"><button class="dialog-close" value="cancel" aria-label="关闭">×</button></form>
+    <div id="style-library-manager-home">
+      <div class="style-library-manager-head"><div><h2>风格库</h2><p id="style-library-manager-summary"></p></div></div>
+      <div class="style-source-modules">
+        <button type="button" class="style-source-module" data-style-source-open="lightroom"><span><strong>从 Lightroom 导入</strong><small>自动识别本机已安装预设</small></span><span id="style-source-lightroom-state" class="style-source-state"></span></button>
+        <button type="button" class="style-source-module" data-style-source-open="user"><span><strong>用户上传</strong><small>管理自己的 XMP 与 CUBE</small></span><span id="style-source-user-state" class="style-source-state"></span></button>
+      </div>
+    </div>
+    <div id="style-library-source-view" class="hidden">
+      <button id="style-library-source-back" type="button" class="text-button">← 返回风格来源</button>
+      <div class="style-library-source-head"><div><h2 id="style-library-source-title"></h2><p id="style-library-source-summary"></p></div><div class="settings-actions"><button id="style-library-source-rescan" type="button" class="button">重新扫描</button><button id="style-library-source-toggle" type="button" class="button"></button></div></div>
+      <div id="style-library-user-import" class="style-import-row hidden">
+        <label class="style-import-input">批量上传预设<input id="style-library-files" type="file" accept=".xmp,.cube" multiple></label>
+        <button id="style-library-import" type="button" class="button primary" disabled>上传所选</button>
+      </div>
+      <p id="style-library-import-status" class="settings-note hidden" role="status" aria-live="polite"></p>
+      <input id="style-library-manager-search" class="style-library-manager-search" type="search" placeholder="搜索当前来源" autocomplete="off">
+      <div id="style-library-manager-list" class="style-library-manager-list"></div>
+    </div>
+  </dialog>
+
+  <div id="toast" class="toast hidden" aria-live="polite"></div>
+  <script src="/static/app.js?v=74" defer></script>
+</body>
+</html>

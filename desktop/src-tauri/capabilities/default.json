@@ -1,0 +1,27 @@
+[
+  {
+    "$schema": "../gen/schemas/desktop-schema.json",
+    "identifier": "main-window-local",
+    "description": "The bundled repair/startup page can use the existing desktop recovery commands.",
+    "windows": ["main"],
+    "local": true,
+    "permissions": [
+      "core:default",
+      "allow-startup-status",
+      "allow-retry-service",
+      "allow-open-logs",
+      "allow-reconnect-content-root"
+    ]
+  },
+  {
+    "$schema": "../gen/schemas/desktop-schema.json",
+    "identifier": "main-window-loopback-folder-picker",
+    "description": "The hidden service UI receives only native folder selection and Content Root management. Runtime validation binds every command to the exact random service origin.",
+    "windows": ["main"],
+    "local": false,
+    "remote": {
+      "urls": ["http://127.0.0.1:*/*"]
+    },
+    "permissions": ["allow-pick-folder", "allow-ensure-content-root", "allow-reconnect-content-root"]
+  }
+]

@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-02T00:00:00Z",
+  "download_policy": {
+    "huggingface": [
+      "https://alpha.hf-mirror.com",
+      "https://beta.hf-mirror.com",
+      "https://hf-mirror.com",
+      "https://huggingface.co"
+    ],
+    "ollama_models": [
+      "ollama.ac.cn/library",
+      "registry.ollama.ai/library"
+    ],
+    "managed_python": [
+      "https://registry.npmmirror.com/-/binary/python-build-standalone",
+      "official"
+    ],
+    "python_packages": [
+      "https://mirrors.aliyun.com/pypi/simple",
+      "https://pypi.org/simple"
+    ],
+    "pytorch_wheels": [
+      "https://mirrors.aliyun.com/pytorch-wheels/cu130/",
+      "https://download.pytorch.org/whl/cu130"
+    ]
+  },
+  "huggingface": {
+    "dinov2-base": {
+      "repo_id": "facebook/dinov2-base",
+      "revision": "f9e44c814b77203eaa57a6bdbbd535f21ede1415",
+      "weight_files": {
+        "model.safetensors": "d73036b56966966d07975d696bde331762f37297e2f095de8cea0040c3aa0841"
+      }
+    },
+    "qrealign-mini": {
+      "repo_id": "q-future/Q-ReAlign-Mini-0.8B",
+      "revision": "fe1f45a7574c9e9d908875af9f7e90cb946aa19f",
+      "weight_files": {
+        "model.safetensors": "bde34df0375fff90d2dee716a127039c57d310c0c868b9f52f4fc2d1ead34aac"
+      }
+    },
+    "grounding-dino-tiny": {
+      "repo_id": "IDEA-Research/grounding-dino-tiny",
+      "revision": "a2bb814dd30d776dcf7e30523b00659f4f141c71",
+      "weight_files": {
+        "model.safetensors": "1a2412ef99bd74bcd3c2a246fa1e48581f8889a1300c9051974741314fc042f3"
+      }
+    },
+    "sam2-hiera-tiny": {
+      "repo_id": "facebook/sam2-hiera-tiny",
+      "revision": "7c218beaf0bb87874785f32b582f640134fc1c09",
+      "weight_files": {
+        "model.safetensors": "1449035ba6ba2ed524c646da989e5cb3a9b93b97f1c1b2d474e598c3b748d99f"
+      }
+    },
+    "segformer-b2": {
+      "repo_id": "nvidia/segformer-b2-finetuned-ade-512-512",
+      "revision": "de01bae28967510f9ddd496c60a969357195400c",
+      "weight_files": {
+        "pytorch_model.bin": "187ca07bea003a5717c63d04ea90b07f33cd033c0ebf44b4b89fce5070d6c8f3"
+      }
+    },
+    "clip-vit-b32": {
+      "repo_id": "openai/clip-vit-base-patch32",
+      "revision": "3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268",
+      "weight_files": {
+        "pytorch_model.bin": "a63082132ba4f97a80bea76823f544493bffa8082296d62d71581a4feff1576f"
+      }
+    }
+  },
+  "ollama": {
+    "qwen3-vl-4b": {
+      "name": "qwen3-vl:4b-instruct-q4_K_M",
+      "manifest_digest": "sha256:ee4b975b58c17ce268cd19d40db35d5edc64603035d2ffc1fee1968eb0947f7b"
+    },
+    "qwen3-vl-8b": {
+      "name": "qwen3-vl:8b-instruct-q4_K_M",
+      "manifest_digest": "sha256:0533d74300e4f9bc367d675d4e64ffd073d50ff16a2b4096cc2e8a1cf8c96319"
+    }
+  }
+}

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ensure-content-root"
+description = "Enables the ensure_content_root command without any pre-configured scope."
+commands.allow = ["ensure_content_root"]
+
+[[permission]]
+identifier = "deny-ensure-content-root"
+description = "Denies the ensure_content_root command without any pre-configured scope."
+commands.deny = ["ensure_content_root"]

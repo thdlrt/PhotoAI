@@ -1,0 +1,11 @@
+node_modules/
+src-tauri/target/
+src-tauri/gen/schemas/
+src-tauri/resources/core/*
+src-tauri/resources/tools/*
+src-tauri/resources/integrations/*
+src-tauri/resources/manifests/*
+!src-tauri/resources/core/.gitkeep
+!src-tauri/resources/tools/.gitkeep
+!src-tauri/resources/integrations/.gitkeep
+!src-tauri/resources/manifests/.gitkeep

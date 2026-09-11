@@ -1,0 +1,8 @@
+* text=auto
+# Preserve upstream notices verbatim and exclude them from code language stats.
+licenses/** -text -whitespace linguist-vendored
+*.whl binary
+*.zip binary
+*.png binary
+*.ico binary
+*.icns binary

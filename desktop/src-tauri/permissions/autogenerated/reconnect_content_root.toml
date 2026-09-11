@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-reconnect-content-root"
+description = "Enables the reconnect_content_root command without any pre-configured scope."
+commands.allow = ["reconnect_content_root"]
+
+[[permission]]
+identifier = "deny-reconnect-content-root"
+description = "Denies the reconnect_content_root command without any pre-configured scope."
+commands.deny = ["reconnect_content_root"]

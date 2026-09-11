@@ -1,0 +1,59 @@
+[project]
+name = "landscape-ai-culler"
+version = "0.9.0b1"
+description = "Local, non-destructive AI-assisted landscape photo culling and Lightroom workflow."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastapi==0.141.1",
+  "jinja2==3.1.6",
+  "pydantic==2.13.5",
+  "uvicorn==0.52.4",
+]
+
+[project.optional-dependencies]
+ai = [
+  "huggingface-hub==1.29.0",
+  "numpy==2.5.2",
+  "opencolorio==2.5.2",
+  "opencv-python-headless==5.0.0.93",
+  "pillow==12.3.0",
+  "pyiqa==0.1.16",
+  "pyvips[binary]==3.2.0",
+  "rawpy==0.27.1",
+  "torch==2.12.1",
+  "torchvision==0.27.1",
+  "tqdm==4.70.0",
+  "transformers==5.16.1",
+]
+web = []
+dev = [
+    "httpx>=0.28",
+    "pyinstaller==6.16.0",
+    "pytest>=8.4",
+]
+
+[project.scripts]
+landscape-culler = "landscape_culler.cli:main"
+landscape-culler-web = "landscape_culler.web:main"
+photoai-service = "landscape_culler.service:main"
+photoai-core-worker = "landscape_culler.core_worker:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/landscape_culler"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
