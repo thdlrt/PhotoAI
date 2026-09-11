@@ -9,7 +9,7 @@ from pathlib import Path
 # ``landscape_culler.web`` exposes a module-level ASGI app.  Pytest imports
 # that module during collection for progress/API helpers, before a per-test
 # fixture can redirect storage.  Always bind import-time state and caches to a
-# process-scoped E-drive QA directory so collection can never recover or
+# process-scoped QA directory inside this checkout so collection can never recover or
 # cancel a production Lightroom/Web job from ``.runtime/data``.
 if "landscape_culler.web" in sys.modules:
     raise RuntimeError(
@@ -19,8 +19,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _PYTEST_IMPORT_ROOT = (
     _PROJECT_ROOT / ".runtime" / "qa" / "pytest-import" / str(os.getpid())
 )
-if os.name == "nt" and _PYTEST_IMPORT_ROOT.resolve().drive.casefold() != "e:":
-    raise RuntimeError("pytest 导入隔离目录必须位于 E 盘。")
+if not _PYTEST_IMPORT_ROOT.resolve().is_relative_to(_PROJECT_ROOT.resolve()):
+    raise RuntimeError("pytest 导入隔离目录不能越出当前项目。")
 _PYTEST_ENV_DIRS = {
     "PHOTO_AI_DATA_DIR": _PYTEST_IMPORT_ROOT / "data",
     "TEMP": _PYTEST_IMPORT_ROOT / "temp",
