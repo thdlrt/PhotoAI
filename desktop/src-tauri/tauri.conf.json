@@ -16,6 +16,7 @@
   },
   "bundle": {
     "active": true,
+    "useLocalToolsDir": true,
     "targets": ["nsis"],
     "category": "Photography",
     "copyright": "PhotoAI",

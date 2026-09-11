@@ -22,6 +22,11 @@ Before building the desktop installer:
    locked npm dependencies; WebView2's official offline installer is downloaded
    by Tauri when preparing the NSIS package.
 
+Build tools are cached in `desktop/src-tauri/target/.tauri/`, not the system
+profile. If Tauri times out downloading WebView2 over a slow connection, run
+`./.venv/Scripts/python.exe packaging/prefetch-webview2.py` and retry the build.
+It uses Microsoft's official URL and supports resuming into the same cache.
+
 The checked-in `licenses/` folder must accompany the installer. When dependencies
 change, regenerate it with `./.venv/Scripts/python.exe packaging/collect-notices.py`
 after building the core sidecars and populating Cargo's locked Windows dependencies.
