@@ -40,3 +40,5 @@ packaging/vendor/
 *.photoai-settings
 *.pem
 *.key
+.playwright-cli/
+output/playwright/

@@ -292,6 +292,14 @@ def _run_smoke(layout: Any, profile_id: str) -> dict[str, Any]:
         _release_cuda(torch)
         telemetry.advance("Q-ReAlign Mini", "审美质量实测通过")
 
+        from .vision_provider import cloud_enabled
+        if cloud_enabled(layout.state):
+            # Cloud connectivity is tested explicitly in Settings, never charged by installation.
+            checks["cloud_vision"] = {"configured": True, "remote_inference_tested": False}
+            checks["profile"] = profile_id
+            checks["content_root"] = str(layout.root)
+            success = True
+            return checks
         endpoint = os.environ.get("PHOTO_AI_OLLAMA_ENDPOINT", "").rstrip("/")
         if not endpoint:
             raise RuntimeError("Ollama 自检端口未建立。")
@@ -378,7 +386,9 @@ def install_models_and_smoke(
         # A fully cached Ollama model skips the download path that normally
         # starts the private server.  Always establish the endpoint before
         # the Qwen smoke request so revalidation behaves like a first install.
-        ensure_owned_ollama(layout.models, layout.state)
+        from .vision_provider import cloud_enabled
+        if not cloud_enabled(layout.state):
+            ensure_owned_ollama(layout.models, layout.state)
         checks = _run_smoke(layout, profile_id)
         payload = {
             "schema_version": 1,

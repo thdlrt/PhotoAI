@@ -1604,6 +1604,12 @@ class GroupEditBody(BaseModel):
     base_revision: int = Field(0, ge=0)
 
 
+class GroupOrderBody(BaseModel):
+    group_ids: list[int] = Field(min_length=1, max_length=100000)
+    base_revision: int = Field(0, ge=0)
+    base_order_revision: int = Field(0, ge=0)
+
+
 class BulkGroupEditBody(BaseModel):
     indexes: list[int] = Field(min_length=1, max_length=5000)
     group_id: int | None = Field(None, ge=1, le=100000)
@@ -1941,6 +1947,14 @@ def _apply_review(payload: dict[str, Any], review: dict[str, Any]) -> dict[str, 
     cloned["manual_group_adjusted_count"] = len(effective_group_overrides)
     cloned["manual_excluded_adjusted_count"] = len(effective_exclusion_changes)
     cloned["group_count"] = len(group_sizes)
+    active_groups = sorted(group_sizes)
+    saved_order = review.get("group_order", payload.get("group_order", []))
+    if not isinstance(saved_order, list):
+        saved_order = []
+    cloned["group_order"] = list(dict.fromkeys(
+        [value for value in saved_order if value in group_sizes] + active_groups
+    ))
+    cloned["group_order_revision"] = int(review.get("group_order_revision", 0))
     cloned["needs_rescore"] = workflow_state == "scored" and bool(
         effective_group_overrides or effective_exclusion_changes
     )
@@ -2298,6 +2312,7 @@ def _edit_review(
             else:
                 ratings[str(index)] = rating
         review = {
+            **review,
             "revision": revision + 1,
             "ratings": ratings,
             "groups": dict(review.get("groups", {})),
@@ -2339,13 +2354,7 @@ def _edit_groups(
         current = _apply_review(payload, review)
         if any(current["results"][index].get("excluded") for index in indexes):
             raise HTTPException(409, "已移除的照片请先恢复，再调整分组。")
-        active_groups = sorted(
-            {
-                int(item.get("group_id", 0))
-                for item in current.get("results", [])
-                if not item.get("excluded")
-            }
-        )
+        active_groups = current["group_order"]
         target_group = group_id
         direction_targets: dict[int, int] = {}
         if direction:
@@ -2397,6 +2406,7 @@ def _edit_groups(
             applied = current
         else:
             review = {
+                **review,
                 "revision": revision + 1,
                 "ratings": dict(review.get("ratings", {})),
                 "groups": groups,
@@ -2483,6 +2493,7 @@ def _edit_excluded(
             else:
                 overrides[str(index)] = excluded
         updated = {
+            **review,
             "revision": revision + 1,
             "ratings": dict(review.get("ratings", {})),
             "groups": dict(review.get("groups", {})),
@@ -4416,6 +4427,38 @@ def create_app(
         except (OSError, ValueError, TypeError, RuntimeError) as exc:
             raise HTTPException(409, f"无法重试任务：{exc}") from exc
 
+    @app.get("/api/vision-provider")
+    def vision_provider_settings() -> dict[str, Any]:
+        from .vision_provider import public_config
+        return public_config(data_dir)
+
+    @app.put("/api/vision-provider", dependencies=[Depends(mutate_token)])
+    def configure_vision_provider(body: dict[str, Any]) -> dict[str, Any]:
+        from .vision_provider import save_config
+        if jobs.active():
+            raise HTTPException(409, "请等待当前任务结束后再切换模型。")
+        try:
+            return save_config(data_dir, body)
+        except (ValueError, OSError):
+            raise HTTPException(422, "请检查 HTTPS 地址、模型名、API Key、超时时间及预览图发送授权。") from None
+
+    @app.post("/api/vision-provider/test", dependencies=[Depends(mutate_token)])
+    def test_vision_provider() -> dict[str, Any]:
+        from .vision_provider import load_config, chat, TEST_IMAGE
+        config = load_config(data_dir)
+        if config.get("mode") != "cloud":
+            raise HTTPException(422, "请先保存云端配置。")
+        try:
+            # Synthetic image only: testing never sends a user's photograph.
+            result = chat(config, {"messages": [{"role": "user", "content": "Name the color of this image.",
+                "images": [TEST_IMAGE]}], "options": {"num_predict": 64}})
+            description = result["message"]["content"].casefold()
+            if "red" not in description and "红" not in description:
+                raise ValueError("接口已响应，但未正确识别红色色块，请确认所选模型支持图片输入。")
+            return {"ok": True, "message": "视觉模型连接成功（仅发送测试色块，未发送照片）。"}
+        except (ValueError, OSError) as exc:
+            raise HTTPException(422, str(exc)) from None
+
     @app.get("/api/model-resources")
     def model_resource_list() -> dict[str, Any]:
         try:
@@ -6125,6 +6168,29 @@ def create_app(
             body.base_revision,
             review_lock,
         )
+
+    @app.patch("/api/runs/{run_id}/group-order", dependencies=[Depends(mutate_token)])
+    def reorder_groups(run_id: str, body: GroupOrderBody) -> dict[str, Any]:
+        with review_lock:
+            active = jobs.active()
+            if active and active.get("kind") == "score" and active.get("context", {}).get("source_run_id") == run_id:
+                raise HTTPException(409, "这个分组正在评分，请等待完成后再调整。")
+            run_file = _run_file(data_dir, run_id)
+            review = _review(run_file)
+            if (int(review["revision"]) != body.base_revision
+                    or int(review.get("group_order_revision", 0)) != body.base_order_revision):
+                raise HTTPException(409, "分组已在别处更新，请刷新后重试。")
+            current = _apply_review(read_json(run_file), review)
+            if len(set(body.group_ids)) != len(body.group_ids) or set(body.group_ids) != set(current["group_order"]):
+                raise HTTPException(422, "排序必须完整包含当前所有分组，且不能重复。")
+            if body.group_ids != current["group_order"]:
+                # Ordering is presentation-only: do not invalidate scores/crops.
+                review.update(group_order=body.group_ids,
+                              group_order_revision=body.base_order_revision + 1,
+                              updated_at=_now())
+                write_json(_review_path(run_file), review)
+            return {"group_order": body.group_ids,
+                    "group_order_revision": int(review.get("group_order_revision", 0))}
 
     @app.patch("/api/runs/{run_id}/groups", dependencies=[Depends(mutate_token)])
     def move_groups(run_id: str, body: BulkGroupEditBody) -> dict[str, Any]:

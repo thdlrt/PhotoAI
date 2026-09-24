@@ -1288,6 +1288,10 @@ def smart_crop_candidates(
         mode = "full"
     data_dir = _data_dir_for_run(run_dir)
     digest = _image_digest(image)
+    from .vision_provider import load_config, identity
+    provider = load_config(data_dir)
+    if provider.get("mode") == "cloud":
+        digest = hashlib.sha256((digest + identity(provider)).encode()).hexdigest()
     cache_root = Path(os.environ.get("PHOTO_AI_CACHE_DIR") or data_dir / "cache")
     cache_path = (
         cache_root / "smart-crop" / SMART_CROP_VERSION / digest[:2] / f"{digest}.json"

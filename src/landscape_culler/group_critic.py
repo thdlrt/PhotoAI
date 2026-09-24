@@ -86,6 +86,12 @@ class OllamaGroupCritic:
             endpoint or os.environ.get("PHOTO_AI_OLLAMA_ENDPOINT") or OLLAMA_ENDPOINT
         ).rstrip("/")
         self.model = model
+        from .vision_provider import load_config, identity
+        self.cloud_config = load_config(data_dir)
+        self.cloud = self.cloud_config.get("mode") == "cloud"
+        if self.cloud:
+            self.model = self.cloud_config["model"]
+        self.provider_identity = identity(self.cloud_config) if self.cloud else "local"
         self.max_pixels = max_pixels
         cache_root = Path(os.environ.get("PHOTO_AI_CACHE_DIR") or data_dir / "cache")
         self.cache_dir = cache_root / "ai" / VLM_PROMPT_VERSION
@@ -96,6 +102,11 @@ class OllamaGroupCritic:
     def _request(
         self, path: str, payload: dict[str, Any] | None = None, timeout: float = 15.0
     ) -> Any:
+        if self.cloud:
+            from .vision_provider import chat
+            if path != "/api/chat" or payload is None:
+                raise ValueError("云端不支持此本地模型操作。")
+            return chat(self.cloud_config, payload)
         data = (
             None
             if payload is None
@@ -151,6 +162,10 @@ class OllamaGroupCritic:
         return matches[0] if matches else None
 
     def ensure_ready(self) -> None:
+        if self.cloud:
+            if not self.cloud_config.get("key") or not self.cloud_config.get("upload_consent"):
+                raise ValueError("请先在设置中配置云端视觉模型。")
+            return
         if not self._server_ready():
             executable = self._portable_executable()
             if executable is None:
@@ -205,6 +220,7 @@ class OllamaGroupCritic:
     def _cache_path(self, paths: list[Path], context: str = "group") -> Path:
         payload = {
             "model": self.model,
+            "provider": self.provider_identity,
             "prompt_version": VLM_PROMPT_VERSION,
             "preview_version": PREVIEW_VERSION,
             "image_version": VLM_IMAGE_VERSION,
@@ -474,6 +490,8 @@ class OllamaGroupCritic:
     def unload(self) -> None:
         """Ask Ollama to release Qwen from VRAM after the scoring run."""
 
+        if self.cloud:
+            return
         try:
             self._request(
                 "/api/generate",

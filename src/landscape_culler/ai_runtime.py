@@ -252,11 +252,18 @@ def ai_resources_status(layout: ContentRootLayout) -> dict[str, Any]:
 
     engine = ai_runtime_status(layout)
     models = model_resources_status(layout.models, layout.state)
+    if models.get("cloud_vision") and engine.get("engine_path"):
+        worker_root = Path(engine["engine_path"]) / "venv" / "Lib" / "site-packages" / "landscape_culler"
+        if not (worker_root / "vision_provider.py").is_file():
+            engine["ready"] = False
+            engine["message"] = "计算环境需要更新以支持云端模型，请重新配置当前档位（复用已下载模型）。"
     component = next(
         (item for item in models.get("components", []) if item.get("id") == "ollama"),
         {"verified": False},
     )
     smoke_ready = bool(engine.get("smoke_test", {}).get("status") == "passed")
+    if not models.get("cloud_vision") and engine.get("smoke_test", {}).get("checks", {}).get("cloud_vision"):
+        smoke_ready = False  # Switching back to local requires an actual Qwen smoke test.
     smoke_profile = engine.get("smoke_test", {}).get("profile_id")
     any_models_ready = any(
         bool(item.get("ready")) for item in models.get("profiles", [])
@@ -265,7 +272,7 @@ def ai_resources_status(layout: ContentRootLayout) -> dict[str, Any]:
         model_ready = bool(profile.get("ready"))
         profile["layers"] = {
             "engine": bool(engine.get("ready")),
-            "ollama": bool(component.get("verified")),
+            "ollama": bool(models.get("cloud_vision") or component.get("verified")),
             "models": model_ready,
             "smoke_test": smoke_ready and smoke_profile == profile.get("id"),
         }
@@ -274,7 +281,7 @@ def ai_resources_status(layout: ContentRootLayout) -> dict[str, Any]:
         engine=engine,
         readiness_layers={
             "engine": bool(engine.get("ready")),
-            "ollama": bool(component.get("verified")),
+            "ollama": bool(models.get("cloud_vision") or component.get("verified")),
             "models": any_models_ready,
             "smoke_test": smoke_ready,
         },

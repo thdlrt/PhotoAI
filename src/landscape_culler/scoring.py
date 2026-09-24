@@ -572,6 +572,7 @@ def score_directory(
         "selection_strategy": "group_then_global_v1",
         "source_run_id": source_run_id,
         "grouping_revision": grouping_meta.get("review_revision"),
+        "group_order": grouping_meta.get("group_order", []),
         "grouping_snapshot_sha256": grouping_snapshot_sha256,
         "image_count": len(results),
         "active_image_count": len(paths),

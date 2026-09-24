@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>照片选片</title>
-  <link rel="stylesheet" href="/static/app.css?v=54">
+  <link rel="stylesheet" href="/static/app.css?v=55">
 </head>
 <body>
   <header class="app-header">
@@ -323,6 +323,23 @@
       <section class="panel model-resource-settings">
         <div class="settings-row"><div><strong>AI 模型</strong><p id="settings-model-summary">正在读取资源</p></div><button id="model-resource-open" type="button" class="button">管理资源</button></div>
       </section>
+      <section class="panel vision-provider-settings">
+        <h2>视觉模型</h2>
+        <form id="vision-provider-form" class="settings-config">
+          <label>运行方式<select id="vision-mode"><option value="local">本地模型</option><option value="cloud">云端 / OpenAI 兼容接口</option></select></label>
+          <div id="vision-cloud-fields" class="hidden">
+            <label>API Base URL<input id="vision-url" type="url" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1"></label>
+            <button id="vision-bailian" type="button" class="text-button">使用百炼北京地址</button>
+            <label>视觉模型名称<input id="vision-model" placeholder="qwen3-vl-plus" autocomplete="off"></label>
+            <label>API Key<input id="vision-key" type="password" autocomplete="new-password" placeholder="留空保留已保存密钥"></label>
+            <label>请求超时（秒）<input id="vision-timeout" type="number" min="10" max="600" value="120"></label>
+            <label><input id="vision-consent" type="checkbox">允许将压缩预览图发送到此服务，可能产生 API 费用</label>
+            <p>替代 Qwen 的看图评审、构图理解和风格描述；分组、分割、审美模型仍在本机运行，Lightroom 处理保持不变。密钥仅保存在本机，不随设置导出。</p>
+          </div>
+          <div class="settings-actions"><button type="submit" class="button primary">保存配置</button><button id="vision-test" type="button" class="button">测试视觉连接</button></div>
+          <p id="vision-status" role="status"></p>
+        </form>
+      </section>
       <section class="panel settings-transfer">
         <div class="settings-row">
           <div><strong>设置迁移</strong><p>仅迁移流程、风格开关和导出偏好，不含工程、模型或滤镜文件。</p></div>
@@ -430,6 +447,6 @@
   </dialog>
 
   <div id="toast" class="toast hidden" aria-live="polite"></div>
-  <script src="/static/app.js?v=74" defer></script>
+  <script src="/static/app.js?v=75" defer></script>
 </body>
 </html>

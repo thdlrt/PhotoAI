@@ -844,7 +844,7 @@ function renderModelResources() {
   deleteProfile.disabled = busy || selected.installed_count === 0;
   deleteProfile.textContent = state.modelResourceBusy === `profile:${selected.id}` ? "正在删除…" : "删除此档模型";
   deleteProfile.dataset.profileId = selected.id;
-  const componentRows = (data.components || []).map((item) => `<article class="model-resource-row" data-model-resource-row="runtime">
+  const componentRows = (data.cloud_vision ? [] : data.components || []).map((item) => `<article class="model-resource-row" data-model-resource-row="runtime">
     <div class="model-resource-copy"><div><strong>${escapeHtml(item.label)}</strong><span class="resource-badge ${item.verified ? "active" : "missing"}">${item.verified ? "校验通过" : "将自动安装"}</span></div><p>运行本地视觉大模型；配置套装时自动下载到所选数据目录。</p><small>${contentRootConfigured ? `Ollama ${escapeHtml(item.version || "")} · ${escapeHtml(item.path || "")}` : "选择数据目录后自动安装"}</small></div>
     <div class="model-resource-inline-progress hidden" data-model-install-target="runtime" role="status" aria-live="polite"></div>
   </article>`).join("");
@@ -1146,6 +1146,137 @@ function clearGroupingSelection() {
   state.selectionAnchor = null;
 }
 
+function reviewGroupOrder(run = state.currentRun) {
+  const active = new Set((run?.results || []).filter((item) => !item.excluded).map((item) => Number(item.group_id)));
+  return [...new Set([...(run?.group_order || []).filter((id) => active.has(id)), ...[...active].sort((a, b) => a - b)])];
+}
+
+let groupingDrag = null;
+let groupingDragFrame = 0;
+let suppressDragClickUntil = 0;
+
+function endGroupingDrag() {
+  if (groupingDragFrame) cancelAnimationFrame(groupingDragFrame);
+  groupingDragFrame = 0;
+  groupingDrag = null;
+  document.body.classList.remove("grouping-dragging");
+  $$(".drag-source, .drop-photos, .drop-before, .drop-after").forEach((node) =>
+    node.classList.remove("drag-source", "drop-photos", "drop-before", "drop-after"));
+}
+
+function canDragGroups() {
+  const run = state.currentRun;
+  return run && !state.activeJob && !state.batchBusy &&
+    (state.groupingMode || run.workflow_state !== "scored" || run.needs_rescore);
+}
+
+function markGroupingDrop(x, y) {
+  $$(".drop-photos, .drop-before, .drop-after").forEach((node) => node.classList.remove("drop-photos", "drop-before", "drop-after"));
+  const target = document.elementFromPoint(x, y)?.closest("#review-groups .photo-group[data-group-id]");
+  if (!groupingDrag || !target) return null;
+  const id = Number(target.dataset.groupId);
+  if (groupingDrag.kind === "group" && id === groupingDrag.groupId) return null;
+  const after = y > target.getBoundingClientRect().top + target.getBoundingClientRect().height / 2;
+  target.classList.add(groupingDrag.kind === "photos" ? "drop-photos" : after ? "drop-after" : "drop-before");
+  return { id, after };
+}
+
+function scrollGroupingDrag(time) {
+  const drag = groupingDrag;
+  if (!drag) return;
+  if (!canDragGroups() || state.currentRun.run_id !== drag.runId) { endGroupingDrag(); return; }
+  const dt = Math.min(40, time - (drag.time || time));
+  drag.time = time;
+  const top = Math.max(24, document.querySelector(".app-header")?.getBoundingClientRect().bottom || 0);
+  const toolbar = document.querySelector("#selection-toolbar:not(.hidden)");
+  const bottom = Math.min(window.innerHeight, toolbar?.getBoundingClientRect().top || window.innerHeight);
+  const edge = 90;
+  const speed = drag.y < top + edge ? -Math.min(1, Math.max(0, (top + edge - drag.y) / edge))
+    : drag.y > bottom - edge ? Math.min(1, Math.max(0, (drag.y - bottom + edge) / edge)) : 0;
+  if (speed && drag.x >= 0 && drag.x <= window.innerWidth && drag.y >= 0 && drag.y <= window.innerHeight) {
+    window.scrollBy(0, speed * dt * 1.1);
+    markGroupingDrop(drag.x, drag.y);
+  }
+  groupingDragFrame = requestAnimationFrame(scrollGroupingDrag);
+}
+
+async function saveGroupOrder(order, drag) {
+  if (!canDragGroups() || state.currentRun.run_id !== drag.runId) return;
+  const run = state.currentRun;
+  const scrollTop = window.scrollY;
+  state.batchBusy = true;
+  renderReview();
+  try {
+    const updated = await api(`/api/runs/${run.run_id}/group-order`, {
+      method: "PATCH", body: { group_ids: order, base_revision: drag.revision, base_order_revision: drag.orderRevision },
+    });
+    if (state.currentRun?.run_id === run.run_id) Object.assign(state.currentRun, updated);
+    toast("分组顺序已保存");
+  } catch (error) {
+    toast(error.message);
+    if (error.message.includes("刷新") && state.currentRun?.run_id === run.run_id) await openRun(run.run_id);
+  } finally {
+    state.batchBusy = false;
+    renderReview();
+    window.scrollTo(0, scrollTop);
+  }
+}
+
+function bindGroupingDrag() {
+  const container = $("#review-groups");
+  container.addEventListener("dragstart", (event) => {
+    const handle = event.target.closest("[data-drag-group]");
+    const photo = event.target.closest("[data-drag-photo]");
+    if (!canDragGroups() || (!handle && !photo)) { event.preventDefault(); return; }
+    endGroupingDrag();
+    const run = state.currentRun;
+    const index = Number(photo?.dataset.dragPhoto);
+    groupingDrag = { kind: handle ? "group" : "photos", groupId: Number(handle?.dataset.dragGroup),
+      indexes: state.batchGrouping && state.selectedIndices.has(index) ? [...state.selectedIndices] : [index],
+      runId: run.run_id, revision: run.review_revision, orderRevision: run.group_order_revision || 0,
+      x: event.clientX, y: event.clientY };
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", handle ? `分组 ${handle.dataset.dragGroup}` : `移动 ${groupingDrag.indexes.length} 张照片`);
+    (handle?.closest(".photo-group") || photo.closest(".photo-card")).classList.add("drag-source");
+    document.body.classList.add("grouping-dragging");
+    groupingDragFrame = requestAnimationFrame(scrollGroupingDrag);
+  });
+  document.addEventListener("dragover", (event) => {
+    if (!groupingDrag) return;
+    event.preventDefault();
+    groupingDrag.x = event.clientX;
+    groupingDrag.y = event.clientY;
+    event.dataTransfer.dropEffect = markGroupingDrop(event.clientX, event.clientY) ? "move" : "none";
+  });
+  document.addEventListener("drop", (event) => {
+    if (!groupingDrag) return;
+    event.preventDefault();
+    const drag = groupingDrag;
+    const target = markGroupingDrop(event.clientX, event.clientY);
+    endGroupingDrag();
+    suppressDragClickUntil = Date.now() + 400;
+    if (!target || !canDragGroups() || state.currentRun.run_id !== drag.runId) return;
+    if (drag.kind === "photos") {
+      const indexes = drag.indexes.filter((index) => state.currentRun.results.some((item) => item.index === index && !item.excluded && Number(item.group_id) !== target.id));
+      if (indexes.length) applyGroupChange(indexes, { selected: String(target.id), preserveScroll: true, baseRevision: drag.revision });
+    } else {
+      const order = reviewGroupOrder();
+      const moved = order.filter((id) => id !== drag.groupId);
+      moved.splice(moved.indexOf(target.id) + (target.after ? 1 : 0), 0, drag.groupId);
+      if (order.join() !== moved.join()) saveGroupOrder(moved, drag);
+    }
+  });
+  document.addEventListener("dragend", () => { if (groupingDrag) suppressDragClickUntil = Date.now() + 400; endGroupingDrag(); });
+  document.addEventListener("click", (event) => {
+    if (Date.now() < suppressDragClickUntil && event.target.closest("#review-groups")) { event.preventDefault(); event.stopImmediatePropagation(); }
+  }, true);
+  document.addEventListener("keydown", (event) => { if (event.key === "Escape" && groupingDrag) { event.stopImmediatePropagation(); endGroupingDrag(); } }, true);
+  document.addEventListener("dragleave", (event) => { if (groupingDrag && !event.relatedTarget) groupingDrag.y = -1; });
+  window.addEventListener("blur", endGroupingDrag);
+  window.addEventListener("hashchange", endGroupingDrag);
+  document.addEventListener("visibilitychange", () => { if (document.hidden) endGroupingDrag(); });
+}
+
 function renderReview() {
   const run = state.currentRun;
   $("#review-empty").classList.toggle("hidden", Boolean(run));
@@ -1182,7 +1313,7 @@ function renderReview() {
   const selectionToolbar = $("#selection-toolbar");
   selectionToolbar.classList.toggle("hidden", !batch);
   $("#selection-count").textContent = `已选 ${state.selectedIndices.size} 张`;
-  const orderedGroups = [...new Set(activeItems.map((item) => Number(item.group_id)))].sort((a, b) => a - b);
+  const orderedGroups = reviewGroupOrder(run);
   const selectedGroups = new Set(activeItems.filter((item) => state.selectedIndices.has(item.index)).map((item) => Number(item.group_id)));
   const firstGroup = orderedGroups[0];
   const lastGroup = orderedGroups.at(-1);
@@ -1206,7 +1337,7 @@ function renderReview() {
     groups.get(item.group_id).push(item);
   });
   let visible = 0;
-  const groupMarkup = [...groups.entries()].sort((a, b) => Number(a[0]) - Number(b[0])).map(([groupId, items]) => {
+  const groupMarkup = [...groups.entries()].sort((a, b) => orderedGroups.indexOf(Number(a[0])) - orderedGroups.indexOf(Number(b[0]))).map(([groupId, items]) => {
     const ordered = grouping
       ? items.sort((a, b) => a.index - b.index)
       : items.sort((a, b) => b.effective_rating - a.effective_rating || b.score - a.score);
@@ -1231,7 +1362,7 @@ function renderReview() {
       </div>` : "";
       return `<article class="photo-card ${grouping ? "grouping-card" : ""} ${selected ? "selected" : ""} ${show ? "" : "hidden-by-filter"}" data-rating="${item.effective_rating}" data-index="${item.index}" aria-selected="${selected}">
         ${selector}
-        <button class="preview-button" data-open-photo="${item.index}"><img src="${item.preview_url}" loading="lazy" alt="${escapeHtml(item.filename)}"></button>
+        <button class="preview-button" data-open-photo="${item.index}" ${grouping ? `data-drag-photo="${item.index}" draggable="${!actionDisabled}" title="拖动照片到其他分组"` : ""}><img draggable="false" src="${item.preview_url}" loading="lazy" alt="${escapeHtml(item.filename)}"></button>
         <div class="photo-meta">
           <div class="photo-line"><strong title="${escapeHtml(item.filename)}">${escapeHtml(item.filename)}</strong></div>
           ${actions}
@@ -1243,7 +1374,8 @@ function renderReview() {
     }).join("");
     const groupVisible = grouping || items.some(matchesFilter);
     const selectGroup = batch ? `<button class="text-button select-group" data-select-group="${groupId}">选择本组</button>` : "";
-    return `<section class="photo-group ${groupVisible ? "" : "hidden-by-filter"}"><div class="group-head"><strong>组 ${groupId}</strong><span>${items.length === 1 ? "单张" : `${items.length} 张相似照片`}</span>${selectGroup}</div><div class="filmstrip">${cards}</div></section>`;
+    const dragHandle = grouping ? `<button class="group-drag-handle" data-drag-group="${groupId}" draggable="${!state.activeJob && !state.batchBusy}" ${state.activeJob || state.batchBusy ? "disabled" : ""} title="拖动调整分组顺序" aria-label="拖动组 ${groupId} 调整顺序">⠿</button>` : "";
+    return `<section class="photo-group ${groupVisible ? "" : "hidden-by-filter"}" data-group-id="${groupId}"><div class="group-head">${dragHandle}<strong>组 ${groupId}</strong><span>${items.length === 1 ? "单张" : `${items.length} 张相似照片`}</span>${selectGroup}</div><div class="filmstrip">${cards}</div></section>`;
   }).join("");
   const excludedMarkup = grouping && excludedItems.length ? `<details class="excluded-group">
     <summary>已移出工程 ${excludedItems.length} 张</summary>
@@ -2646,7 +2778,7 @@ function openGroupDialog(value) {
     counts.set(candidate.group_id, (counts.get(candidate.group_id) || 0) + 1)
   );
   const options = [...counts.entries()]
-    .sort((a, b) => Number(a[0]) - Number(b[0]))
+    .sort((a, b) => reviewGroupOrder(run).indexOf(Number(a[0])) - reviewGroupOrder(run).indexOf(Number(b[0])))
     .map(([groupId, count]) => `<option value="${groupId}" ${indexes.length === 1 && Number(groupId) === Number(item.group_id) ? "selected" : ""}>组 ${groupId}（${count} 张）</option>`)
     .join("");
   const restore = indexes.length === 1 && item.manual_group_override
@@ -2658,12 +2790,13 @@ function openGroupDialog(value) {
   $("#group-dialog").showModal();
 }
 
-async function applyGroupChange(indexes, { selected = null, direction = null, closeDialog = false } = {}) {
+async function applyGroupChange(indexes, { selected = null, direction = null, closeDialog = false, preserveScroll = false, baseRevision = null } = {}) {
   const run = state.currentRun;
   indexes = [...new Set(indexes.map(Number))];
   if (!run || !indexes.length) return;
-  if (state.activeJob) return toast("请等待当前任务完成");
-  const body = { indexes, base_revision: run.review_revision };
+  if (state.activeJob || state.batchBusy) return toast("请等待当前任务完成");
+  const scrollTop = window.scrollY;
+  const body = { indexes, base_revision: baseRevision ?? run.review_revision };
   if (direction) body.direction = direction;
   else if (selected === "new") body.new_group = true;
   else body.group_id = selected === "auto" ? null : Number(selected);
@@ -2699,6 +2832,7 @@ async function applyGroupChange(indexes, { selected = null, direction = null, cl
     state.batchBusy = false;
     if (closeDialog) $("#group-submit").disabled = false;
     renderReview();
+    if (preserveScroll) window.scrollTo(0, scrollTop);
   }
 }
 
@@ -2725,7 +2859,8 @@ function toggleBatchGrouping() {
 }
 
 function selectGroupingIndex(index, selected, range = false) {
-  const active = state.currentRun?.results.filter((item) => !item.excluded).map((item) => item.index) || [];
+  const active = reviewGroupOrder().flatMap((id) => state.currentRun.results
+    .filter((item) => !item.excluded && Number(item.group_id) === id).map((item) => item.index));
   if (range && state.selectionAnchor != null) {
     const start = active.indexOf(state.selectionAnchor);
     const end = active.indexOf(index);
@@ -3229,6 +3364,44 @@ async function routeFromHash() {
 }
 
 function bindEvents() {
+  $("#vision-mode").addEventListener("change", () => $("#vision-cloud-fields").classList.toggle("hidden", $("#vision-mode").value !== "cloud"));
+  $("#vision-bailian").addEventListener("click", () => {
+    $("#vision-url").value = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+    $("#vision-model").value = "qwen3-vl-plus";
+  });
+  $("#vision-provider-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const button = event.submitter;
+    button.disabled = true;
+    try {
+      await api("/api/vision-provider", {method: "PUT", body: {
+        mode: $("#vision-mode").value, base_url: $("#vision-url").value,
+        model: $("#vision-model").value, api_key: $("#vision-key").value,
+        timeout: Number($("#vision-timeout").value), upload_consent: $("#vision-consent").checked,
+      }});
+      $("#vision-key").value = "";
+      $("#vision-status").textContent = "已保存，下次任务生效。";
+      await refreshModelResources();
+    } catch (error) { $("#vision-status").textContent = error.message; }
+    finally { button.disabled = false; }
+  });
+  $("#vision-test").addEventListener("click", async () => {
+    $("#vision-test").disabled = true;
+    $("#vision-status").textContent = "正在测试已保存配置（仅发送测试色块）…";
+    try { $("#vision-status").textContent = (await api("/api/vision-provider/test", {method: "POST"})).message; }
+    catch (error) { $("#vision-status").textContent = error.message; }
+    finally { $("#vision-test").disabled = false; }
+  });
+  api("/api/vision-provider").then((config) => {
+    $("#vision-mode").value = config.mode;
+    $("#vision-url").value = config.base_url;
+    $("#vision-model").value = config.model;
+    $("#vision-timeout").value = config.timeout;
+    $("#vision-consent").checked = config.upload_consent;
+    $("#vision-cloud-fields").classList.toggle("hidden", config.mode !== "cloud");
+    if (config.has_key) $("#vision-key").placeholder = "已保存密钥；留空不变";
+  }).catch((error) => { $("#vision-status").textContent = error.message; });
+  bindGroupingDrag();
   bindDesktopFolderPickers();
   $$(".tab").forEach((node) => node.addEventListener("click", () => {
     if (node.dataset.view === "toolbox") openToolboxSection("home", "replace");

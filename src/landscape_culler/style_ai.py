@@ -306,6 +306,7 @@ class QwenStyleSceneAnalyzer:
         self.data_dir = Path(data_dir).resolve()
         self.storage_root, self.cache_root = _portable_storage_roots(self.data_dir)
         self._critic = critic_factory(self.data_dir, model=self.model, max_pixels=768)
+        self.model = getattr(self._critic, "model", self.model)
         self.cache_dir = (
             self.cache_root / "ai" / STYLE_SCENE_PROMPT_VERSION
         )
@@ -324,6 +325,7 @@ class QwenStyleSceneAnalyzer:
     def _cache_path(self, paths: Sequence[Path]) -> Path:
         payload = {
             "model": self.model,
+            "provider": getattr(self._critic, "provider_identity", "local"),
             "prompt": STYLE_SCENE_PROMPT_VERSION,
             "photos": [cache_key(path) for path in paths],
         }

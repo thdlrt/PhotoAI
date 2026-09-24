@@ -1044,6 +1044,8 @@ def _resource_status(
 
 
 def model_resources_status(runtime_root: Path, data_dir: Path) -> dict[str, Any]:
+    from .vision_provider import cloud_enabled
+    cloud = cloud_enabled(data_dir)
     runtime_root = Path(runtime_root).resolve()
     settings = load_model_resource_settings(data_dir)
     resources = {
@@ -1057,7 +1059,7 @@ def model_resources_status(runtime_root: Path, data_dir: Path) -> dict[str, Any]
     )
     profiles: list[dict[str, Any]] = []
     for profile_id, profile in PROFILE_SPECS.items():
-        model_ids = list(profile["model_ids"])
+        model_ids = [key for key in profile["model_ids"] if not cloud or MODEL_SPECS[key]["provider"] != "ollama"]
         installed_count = sum(1 for key in model_ids if resources[key]["installed"])
         verified_count = sum(1 for key in model_ids if resources[key]["verified"])
         profiles.append(
@@ -1068,7 +1070,7 @@ def model_resources_status(runtime_root: Path, data_dir: Path) -> dict[str, Any]
                 "recommended": profile_id == recommended,
                 "configured": profile_id == settings["active_profile"],
                 "ready": verified_count == len(model_ids)
-                and bool(component["verified"]),
+                and (cloud or bool(component["verified"])),
                 "installed_count": installed_count,
                 "verified_count": verified_count,
                 "model_count": len(model_ids),
@@ -1091,6 +1093,7 @@ def model_resources_status(runtime_root: Path, data_dir: Path) -> dict[str, Any]
         "profiles": profiles,
         "resources": list(resources.values()),
         "components": [component],
+        "cloud_vision": cloud,
         "installed_count": len(installed_unique),
         "installed_bytes": sum(
             int(item["installed_bytes"]) for item in installed_unique
@@ -1101,6 +1104,8 @@ def model_resources_status(runtime_root: Path, data_dir: Path) -> dict[str, Any]
 def active_model_profile_readiness(
     runtime_root: Path, data_dir: Path
 ) -> dict[str, Any]:
+    from .vision_provider import cloud_enabled
+    cloud = cloud_enabled(data_dir)
     runtime_root = Path(runtime_root).resolve()
     settings = load_model_resource_settings(data_dir)
     profile_id = settings.get("active_profile")
@@ -1120,6 +1125,8 @@ def active_model_profile_readiness(
     invalid: list[str] = []
     for resource_id in profile["model_ids"]:
         spec = MODEL_SPECS[resource_id]
+        if cloud and spec["provider"] == "ollama":
+            continue
         if spec["provider"] == "ollama":
             installed, _size, _locations, _name = _ollama_installed(runtime_root, spec)
             verified, _issues = _verify_ollama(runtime_root, spec)
@@ -1132,10 +1139,10 @@ def active_model_profile_readiness(
             missing.append(resource_id)
         elif not verified:
             invalid.append(resource_id)
-    ready = not missing and not invalid and bool(component["verified"])
+    ready = not missing and not invalid and (cloud or bool(component["verified"]))
     if ready:
         message = f"{profile['label']} 模型与运行组件校验通过。"
-    elif not component["verified"]:
+    elif not cloud and not component["verified"]:
         message = "本地 AI 运行组件尚未安装完整，请修复当前模型套装。"
     else:
         message = (
@@ -1759,10 +1766,14 @@ def configure_model_profile(
         raise ValueError("未知显存档位。")
     runtime_root = Path(runtime_root).resolve()
     runtime_root.mkdir(parents=True, exist_ok=True)
-    profile = PROFILE_SPECS[profile_id]
-    if allow_download:
+    from .vision_provider import cloud_enabled
+    cloud = cloud_enabled(data_dir)
+    profile = dict(PROFILE_SPECS[profile_id])
+    if cloud:
+        profile["model_ids"] = [key for key in profile["model_ids"] if MODEL_SPECS[key]["provider"] != "ollama"]
+    if allow_download and not cloud:
         _download_ollama_component(runtime_root)
-    elif not _ollama_component_status(runtime_root)["verified"]:
+    elif not cloud and not _ollama_component_status(runtime_root)["verified"]:
         raise RuntimeError("离线资源缺少可用的本地视觉模型运行组件。")
     for resource_id in profile["model_ids"]:
         spec = MODEL_SPECS[resource_id]
@@ -1843,11 +1854,11 @@ def configure_model_profile(
             for value in failed[:3]
         )
         raise RuntimeError(f"模型未安装完整：{details}。点击重试可复用已下载文件。")
-    if not _ollama_component_status(runtime_root)["verified"]:
+    if not cloud and not _ollama_component_status(runtime_root)["verified"]:
         raise RuntimeError("本地 AI 运行组件完整性校验未通过。")
     phase_end("verify", "校验整套模型", len(profile["model_ids"]), unit="项")
     vlm_resource_id = str(profile["vlm_model_id"])
-    vlm_status = verified[vlm_resource_id]
+    vlm_status = verified.get(vlm_resource_id, {})
     vlm_model = str(
         vlm_status.get("resolved_name") or MODEL_SPECS[vlm_resource_id]["ollama_name"]
     )
