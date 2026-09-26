@@ -3364,6 +3364,41 @@ async function routeFromHash() {
 }
 
 function bindEvents() {
+  let updateTimer = null;
+  async function renderAppUpdate() {
+    clearTimeout(updateTimer);
+    try {
+      const info = await api("/api/app-updates");
+      const busy = ["checking", "downloading", "installing"].includes(info.phase);
+      $("#app-update-version").textContent = `当前 ${info.current_version}${info.release ? ` · 可用 ${info.release.version}` : ""}`;
+      $("#app-update-check").disabled = busy;
+      $("#app-update-download").classList.toggle("hidden", !info.release || busy || info.phase === "ready");
+      $("#app-update-cancel").classList.toggle("hidden", info.phase !== "downloading");
+      $("#app-update-install").classList.toggle("hidden", info.phase !== "ready");
+      $("#app-update-install").disabled = Boolean(state.activeJob) || !window.__TAURI__?.core?.invoke;
+      $("#app-update-progress").classList.toggle("hidden", info.phase !== "downloading");
+      $("#app-update-progress").value = info.release?.size ? 100 * info.downloaded / info.release.size : 0;
+      const labels = {idle:"", checking:"正在检查 GitHub Release…", current:"已是当前通道最新版本。", available:"发现新版本。", ready:"下载完成。安装仅更新程序，保留工程、模型和设置。"};
+      $("#app-update-message").textContent = info.phase === "downloading"
+        ? `已下载 ${(info.downloaded/1048576).toFixed(1)} / ${(info.release.size/1048576).toFixed(1)} MB · ${(info.speed/1048576).toFixed(1)} MB/s`
+        : info.message || labels[info.phase] || "";
+      if (info.phase === "idle" && info.last_install) $("#app-update-message").textContent = info.last_install;
+      $("#app-update-notes-wrap").classList.toggle("hidden", !info.release?.notes);
+      $("#app-update-notes").textContent = info.release?.notes || "";
+      if (busy) updateTimer = setTimeout(renderAppUpdate, 700);
+    } catch (error) { $("#app-update-message").textContent = error.message; }
+  }
+  for (const action of ["check", "download", "cancel", "install"]) {
+    $(`#app-update-${action}`).addEventListener("click", async () => {
+      if (action === "install" && !confirm("现在退出并安装更新？工程、模型和设置会保留，完成后自动打开。")) return;
+      try {
+        await api(`/api/app-updates/${action}`, {method:"POST"});
+        if (action === "install") await window.__TAURI__.core.invoke("exit_for_update");
+        else await renderAppUpdate();
+      } catch (error) { $("#app-update-message").textContent = error.message; }
+    });
+  }
+  renderAppUpdate();
   $("#vision-mode").addEventListener("change", () => $("#vision-cloud-fields").classList.toggle("hidden", $("#vision-mode").value !== "cloud"));
   $("#vision-bailian").addEventListener("click", () => {
     $("#vision-url").value = "https://dashscope.aliyuncs.com/compatible-mode/v1";

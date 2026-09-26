@@ -932,6 +932,8 @@ class JobManager:
         self, kind: str, cli_args: list[str], context: dict[str, Any]
     ) -> dict[str, Any]:
         with self.lock:
+            if getattr(self, "update_installing", lambda: False)():
+                raise RuntimeError("正在安装更新，暂时不能启动任务。")
             active = self.active()
             if active:
                 raise RuntimeError(f"已有任务正在运行：{active['title']}")
@@ -4084,11 +4086,38 @@ def create_app(
     app.state.creative_lut_engine = lut_engine
     app.state.jobs = jobs
     app.state.token = token
+    from .app_updates import AppUpdater
+    updater = AppUpdater(content_layout.root if content_layout else data_dir)
+    app.state.updater = updater
+    jobs.update_installing = lambda: updater.installing
     app.mount("/static", StaticFiles(directory=STATIC_ROOT), name="static")
 
     def mutate_token(x_photo_ai_token: str | None = Header(None)) -> None:
         if not x_photo_ai_token or not secrets.compare_digest(x_photo_ai_token, token):
             raise HTTPException(403, "页面操作令牌已失效，请刷新。")
+        if updater.installing:
+            raise HTTPException(409, "正在安装更新，请等待程序重新打开。")
+
+    @app.get("/api/app-updates")
+    def app_update_status() -> dict[str, Any]:
+        return updater.status()
+
+    @app.post("/api/app-updates/{action}", dependencies=[Depends(mutate_token)])
+    def app_update_action(action: str) -> dict[str, Any]:
+        try:
+            if action == "install":
+                with jobs.lock:
+                    if jobs.active():
+                        raise ValueError("请等待照片处理或模型安装任务结束后再安装更新。")
+                    return updater.install()
+            if action == "cancel":
+                updater.cancelled.set()
+                return updater.status()
+            if action not in {"check", "download"}:
+                raise HTTPException(404, "未知更新操作")
+            return updater.start(action)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(409, str(exc)) from None
 
     @app.middleware("http")
     async def headers(request: Request, call_next: Any) -> Response:

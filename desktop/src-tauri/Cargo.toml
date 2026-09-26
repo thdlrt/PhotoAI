@@ -1,6 +1,6 @@
 [package]
 name = "photoai-desktop"
-version = "0.9.0-beta.1"
+version = "0.9.0-beta.2"
 description = "照片选片 Windows 桌面应用"
 authors = ["PhotoAI"]
 edition = "2021"

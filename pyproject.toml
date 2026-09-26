@@ -1,6 +1,6 @@
 [project]
 name = "landscape-ai-culler"
-version = "0.9.0b1"
+version = "0.9.0b2"
 description = "Local, non-destructive AI-assisted landscape photo culling and Lightroom workflow."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"

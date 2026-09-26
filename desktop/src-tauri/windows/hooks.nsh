@@ -15,6 +15,7 @@ Var PhotoAIPreviousDisplayName
 Var PhotoAIInstallMarkerContents
 Var PhotoAIFreshInstall
 Var PhotoAISelfTestExit
+Var PhotoAINestedDataRelative
 
 !macro NSIS_HOOK_PREINSTALL
   ; Keep the previous program tree beside the install directory until the new
@@ -23,6 +24,16 @@ Var PhotoAISelfTestExit
   ; second large copy on the user's small system disk.
   StrCpy $PhotoAIRollbackActive 0
   StrCpy $PhotoAIFreshInstall 0
+  StrCpy $PhotoAINestedDataRelative ""
+  ReadRegStr $PhotoAIContentRoot HKCU "Software\PhotoAI" "ContentRoot"
+  ${If} $PhotoAIContentRoot != ""
+    GetFullPathName $PhotoAIContentRoot "$PhotoAIContentRoot"
+    StrLen $0 "$INSTDIR\"
+    StrCpy $1 "$PhotoAIContentRoot" $0
+    ${If} $1 == "$INSTDIR\"
+      StrCpy $PhotoAINestedDataRelative "$PhotoAIContentRoot" "" $0
+    ${EndIf}
+  ${EndIf}
   ReadRegStr $PhotoAIPreviousInstallLocation SHCTX "${UNINSTKEY}" "InstallLocation"
   ReadRegStr $PhotoAIPreviousDisplayName SHCTX "${UNINSTKEY}" "DisplayName"
   IfFileExists "$INSTDIR\${MAINBINARYNAME}.exe" photoai_preinstall_validate_update photoai_preinstall_validate_fresh
@@ -270,6 +281,22 @@ Var PhotoAISelfTestExit
   ${EndIf}
   ${If} $PhotoAIRollbackActive == 1
     SetOutPath "$TEMP"
+    ; Content roots nested inside the install directory remain in the rollback
+    ; tree until the program self-test succeeds. Restore them before deleting
+    ; old program files. A failed move leaves the entire backup untouched.
+    ${If} $PhotoAINestedDataRelative != ""
+      IfFileExists "$PhotoAIRollbackDir\$PhotoAINestedDataRelative\." 0 photoai_nested_data_done
+      ${GetParent} "$INSTDIR\$PhotoAINestedDataRelative" $0
+      CreateDirectory "$0"
+      ClearErrors
+      Rename "$PhotoAIRollbackDir\$PhotoAINestedDataRelative" "$INSTDIR\$PhotoAINestedDataRelative"
+      ${If} ${Errors}
+        MessageBox MB_OK|MB_ICONSTOP "新版已安装，但数据目录未能自动归还。已保留全部旧数据，未执行清理：$\r$\n$PhotoAIRollbackDir\$PhotoAINestedDataRelative$\r$\n请勿删除此目录，恢复数据后再打开软件。"
+        SetErrorLevel 1
+        Abort
+      ${EndIf}
+      photoai_nested_data_done:
+    ${EndIf}
     RMDir /r /REBOOTOK "$PhotoAIRollbackDir"
   ${EndIf}
 !macroend

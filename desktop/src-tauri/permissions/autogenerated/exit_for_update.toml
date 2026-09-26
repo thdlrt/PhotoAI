@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-exit-for-update"
+description = "Enables the exit_for_update command without any pre-configured scope."
+commands.allow = ["exit_for_update"]
+
+[[permission]]
+identifier = "deny-exit-for-update"
+description = "Denies the exit_for_update command without any pre-configured scope."
+commands.deny = ["exit_for_update"]

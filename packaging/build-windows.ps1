@@ -26,8 +26,8 @@ $LightroomSource = Join-Path $ProjectRoot 'integrations\photo-ai-lightroom.lrplu
 $ExpectedUvVersion = 'uv 0.11.2 (02036a8ba 2026-03-26 x86_64-pc-windows-msvc)'
 $ExpectedUvSha256 = '0548e585d7030d3be5e23cbf32da0d510a4225d15b72c28b15cc7ee7187dbb59'
 $ExpectedExifToolSha256 = '68c079c32fdae0d6c7130e9a5fb73f8ac9dabdf9ab8da312da4f6c549d6d3385'
-$ProductVersion = '0.9.0-beta.1'
-$PythonPackageVersion = '0.9.0b1'
+$ProductVersion = '0.9.0-beta.2'
+$PythonPackageVersion = '0.9.0b2'
 
 function Reset-OwnedDirectory {
     param(
@@ -191,7 +191,7 @@ $BuiltWheels = @(Get-ChildItem -LiteralPath (Join-Path $BuildRoot 'ai-worker') -
 if ($BuiltWheels.Count -ne 1) {
     throw "AI Worker 必须生成且只生成一个 wheel，实际为 $($BuiltWheels.Count) 个。"
 }
-if ($BuiltWheels[0].Name -notmatch '^landscape_ai_culler-0\.9\.0b1-py3-none-any\.whl$') {
+if ($BuiltWheels[0].Name -ne "landscape_ai_culler-$PythonPackageVersion-py3-none-any.whl") {
     throw "AI Worker wheel 名称或版本不符合发布约定：$($BuiltWheels[0].Name)"
 }
 

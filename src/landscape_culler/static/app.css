@@ -359,6 +359,7 @@ input:focus, select:focus { border-color: #82663f; box-shadow: 0 0 0 2px rgb(214
 .lightroom-settings .compact-detail { margin: 0; padding: 0 0 12px; }
 .settings-config { padding-top: 12px; display: grid; grid-template-columns: minmax(280px, 1fr) auto; align-items: end; gap: 12px; border-top: 1px solid var(--line); }
 .vision-provider-settings { margin-top: 12px; padding: 12px 16px; }
+.software-update-settings { margin-top: 12px; padding: 12px 16px; }
 #vision-provider-form { grid-template-columns: 1fr; }
 #vision-cloud-fields:not(.hidden) { display: grid; gap: 12px; }
 #vision-cloud-fields input[type="checkbox"] { width: auto; }

@@ -60,6 +60,13 @@ const CONTENT_DIRECTORIES: &[&str] = &[
     "backups",
 ];
 
+#[tauri::command]
+fn exit_for_update(window: WebviewWindow, app: AppHandle, state: State<'_, DesktopState>) -> Result<(), String> {
+    validate_service_window_origin(&window, &state)?;
+    app.exit(0);
+    Ok(())
+}
+
 struct DesktopState {
     content_root: Mutex<Option<PathBuf>>,
     bootstrap_root: Mutex<Option<PathBuf>>,
@@ -325,7 +332,8 @@ fn main() {
             reconnect_content_root,
             ensure_content_root,
             pick_folder,
-            pick_offline_bundle
+            pick_offline_bundle,
+            exit_for_update
         ])
         .setup(|app| {
             #[cfg(debug_assertions)]
@@ -631,6 +639,7 @@ fn launch_service_blocking(app: &AppHandle) -> Result<StartedService, String> {
         .current_dir(service_dir)
         .env("PHOTO_AI_CONTENT_ROOT", &root)
         .env("PHOTO_AI_INSTALL_DIR", install_directory()?)
+        .env("PHOTO_AI_DESKTOP_PID", std::process::id().to_string())
         .env("PHOTO_AI_CORE_WORKER_EXE", worker_exe)
         .env("PHOTO_AI_RESOURCE_ROOT", resource_root)
         .env("PHOTO_AI_PARENT_PID", std::process::id().to_string())

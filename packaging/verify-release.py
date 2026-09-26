@@ -14,8 +14,8 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-PRODUCT_VERSION = "0.9.0-beta.1"
-PYTHON_PACKAGE_VERSION = "0.9.0b1"
+PRODUCT_VERSION = "0.9.0-beta.2"
+PYTHON_PACKAGE_VERSION = "0.9.0b2"
 FORBIDDEN_ARCHIVE_MODULE = re.compile(
     r"^\s*(?:"
     r"torch|torchvision|torchaudio|transformers|tokenizers|safetensors|"

@@ -22,6 +22,6 @@
     "remote": {
       "urls": ["http://127.0.0.1:*/*"]
     },
-    "permissions": ["allow-pick-folder", "allow-ensure-content-root", "allow-reconnect-content-root"]
+    "permissions": ["allow-pick-folder", "allow-ensure-content-root", "allow-reconnect-content-root", "allow-exit-for-update"]
   }
 ]

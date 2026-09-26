@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>照片选片</title>
-  <link rel="stylesheet" href="/static/app.css?v=55">
+  <link rel="stylesheet" href="/static/app.css?v=56">
 </head>
 <body>
   <header class="app-header">
@@ -351,6 +351,13 @@
         </div>
         <p id="settings-transfer-status" class="settings-note hidden" role="status" aria-live="polite"></p>
       </section>
+      <section class="panel software-update-settings">
+        <div class="settings-row"><div><strong>软件更新</strong><p id="app-update-version"></p></div><button id="app-update-check" class="button" type="button">检查 GitHub 更新</button></div>
+        <p id="app-update-message" role="status"></p>
+        <progress id="app-update-progress" class="hidden" max="100" value="0" style="width:100%"></progress>
+        <details id="app-update-notes-wrap" class="hidden"><summary>更新说明</summary><pre id="app-update-notes" style="white-space:pre-wrap"></pre></details>
+        <div class="settings-actions"><button id="app-update-download" class="button primary hidden" type="button">下载更新</button><button id="app-update-cancel" class="button hidden" type="button">取消下载</button><button id="app-update-install" class="button primary hidden" type="button">退出并安装更新</button></div>
+      </section>
     </section>
 
     <section id="view-resources" class="view">
@@ -447,6 +454,6 @@
   </dialog>
 
   <div id="toast" class="toast hidden" aria-live="polite"></div>
-  <script src="/static/app.js?v=75" defer></script>
+  <script src="/static/app.js?v=76" defer></script>
 </body>
 </html>
