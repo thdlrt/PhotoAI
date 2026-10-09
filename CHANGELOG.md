@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.0-beta.4
+
+- Stage update installers outside the installed program directory, with an
+  external helper working directory and TEMP/TMP, so nested data directories
+  cannot make the updater block its own installation.
+- Wait briefly for directory locks to clear and report a nonzero installer
+  exit when the previous version cannot be staged. Existing data stays intact.
+- Reuse the repaired beta.3 AI Worker for desktop-only updates by checking its
+  visual-critique revision rather than requiring every desktop version to match.
+
 ## 0.9.0-beta.3
 
 - Clarified confidence as 0–1 separately from 0–100 photo scores. Invalid model

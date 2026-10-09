@@ -60,6 +60,7 @@ def test_old_worker_requires_reconfiguration_without_changing_engine(tmp_path, m
     manifest_file = engine / runtime.ENGINE_MANIFEST
     manifest = runtime.read_json(manifest_file)
     manifest["product_version"] = "0.9.0-beta.2"
+    manifest.pop("vlm_prompt_version", None)
     runtime.write_json(manifest_file, manifest)
     before = manifest_file.read_bytes()
     status = runtime.ai_runtime_status(layout)
@@ -69,6 +70,17 @@ def test_old_worker_requires_reconfiguration_without_changing_engine(tmp_path, m
     manifest["product_version"] = runtime.PRODUCT_VERSION
     runtime.write_json(manifest_file, manifest)
     assert runtime.ai_runtime_status(layout)["ready"]
+
+
+def test_beta3_worker_remains_usable_for_desktop_only_update(tmp_path):
+    engine = tmp_path / "engine"
+    runtime.write_json(engine / runtime.ENGINE_MANIFEST, {"product_version": "0.9.0-beta.3"})
+    constants = engine / "venv" / "Lib/site-packages/landscape_culler/constants.py"
+    constants.parent.mkdir(parents=True)
+    constants.write_text(f'VLM_PROMPT_VERSION = "{runtime.VLM_PROMPT_VERSION}"\n', encoding="utf-8")
+    assert not runtime.ai_worker_needs_update(engine)
+    constants.write_text('VLM_PROMPT_VERSION = "landscape-group-critic-v1"\n', encoding="utf-8")
+    assert runtime.ai_worker_needs_update(engine)
 
 
 def _successful_runner(

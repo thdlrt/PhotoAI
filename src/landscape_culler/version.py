@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 PRODUCT_NAME = "照片选片"
-PRODUCT_VERSION = "0.9.0-beta.3"
+PRODUCT_VERSION = "0.9.0-beta.4"
 API_VERSION = "1"
 SERVICE_PROTOCOL = "PHOTO_AI_SERVICE/1"
 WORKER_PROTOCOL = "PHOTO_AI_WORKER/1"

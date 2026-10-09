@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from .content_root import ContentRootLayout, resolve_resource_path, runtime_environment
+from .constants import VLM_PROMPT_VERSION
 from .progress import emit_progress, heartbeat_timestamp, phase_end, phase_start
 from .util import read_json, write_json
 from .version import AI_ENGINE_VERSION, PRODUCT_VERSION, PYTHON_RUNTIME_VERSION
@@ -222,9 +223,22 @@ def active_engine(layout: ContentRootLayout) -> Path | None:
 def ai_worker_needs_update(engine: Path) -> bool:
     """Published worker wheels are installed separately from desktop updates."""
     try:
-        version = read_json(engine / ENGINE_MANIFEST).get("product_version")
+        manifest = read_json(engine / ENGINE_MANIFEST)
+        version = manifest.get("product_version")
     except (OSError, ValueError):
         return False  # active_engine handles missing/invalid engine manifests.
+    revision = manifest.get("vlm_prompt_version")
+    if revision:
+        return revision != VLM_PROMPT_VERSION
+    # beta.3 already ships this review fix; desktop-only updates need not
+    # reinstall its unchanged AI environment. Read the legacy worker revision.
+    constants = engine / "venv" / ("Lib/site-packages" if os.name == "nt" else "lib/python3.12/site-packages") / "landscape_culler/constants.py"
+    try:
+        match = re.search(r'^VLM_PROMPT_VERSION\s*=\s*[\"\']([^\"\']+)[\"\']', constants.read_text(encoding="utf-8"), re.MULTILINE)
+    except OSError:
+        match = None
+    if match:
+        return match.group(1) != VLM_PROMPT_VERSION
     return bool(version and version != PRODUCT_VERSION)
 
 
@@ -770,6 +784,7 @@ def install_ai_profile(
                 "python_version": PYTHON_RUNTIME_VERSION,
                 "worker_wheel": resources.worker_wheel.name,
                 "worker_wheel_sha256": resources.worker_wheel_sha256,
+                "vlm_prompt_version": VLM_PROMPT_VERSION,
                 "profile_id": profile_id,
                 "gpu": {
                     "name": gpu.name,

@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import threading
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -73,6 +74,44 @@ def ps_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def stage_installer(installer: Path, install_dir: Path, digest: str) -> Path:
+    """Keep the helper, installer and its TEMP outside the tree being renamed."""
+    install_dir = install_dir.resolve()
+    candidates = [install_dir.parent]
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        candidates.append(Path(local) / "Temp")
+    for parent in candidates:
+        parent = parent.resolve()
+        if parent.is_relative_to(install_dir):
+            continue
+        staging = None
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+            staging = Path(tempfile.mkdtemp(prefix=".photoai-update-", dir=parent))
+            target = staging / ASSET
+            shutil.copyfile(installer, target)
+            with target.open("rb") as handle:
+                copied_digest = hashlib.file_digest(handle, "sha256").hexdigest()
+            if copied_digest != digest:
+                raise ValueError("安装包校验失败，请重新下载。")
+            return target
+        except OSError:
+            # Remove only files created here; never recursively clean a data root.
+            if staging is not None:
+                try:
+                    target.unlink(missing_ok=True)
+                    staging.rmdir()
+                except OSError:
+                    pass
+            continue
+        except ValueError:
+            target.unlink(missing_ok=True)
+            staging.rmdir()
+            raise
+    raise ValueError("无法在程序目录外暂存更新安装包，请下载到“下载”目录后手动安装。")
+
+
 def installer_script(installer: Path, install_dir: Path, desktop_pid: int, digest: str, log: Path) -> str:
     # Wait for the desktop to exit before invoking the existing transactional NSIS installer.
     return f"""$ErrorActionPreference='Stop'
@@ -85,13 +124,21 @@ try {{
     Start-Sleep -Milliseconds 250
   }}
   if ((Get-FileHash -LiteralPath {ps_quote(str(installer))} -Algorithm SHA256).Hash.ToLower() -ne '{digest}') {{ throw '安装包校验失败' }}
-  $result=Start-Process -FilePath {ps_quote(str(installer))} -ArgumentList @('/S', {ps_quote('/D=' + str(install_dir))}) -Wait -PassThru
+  $result=Start-Process -FilePath {ps_quote(str(installer))} -ArgumentList @('/S', {ps_quote('/D=' + str(install_dir))}) -WorkingDirectory {ps_quote(str(installer.parent))} -WindowStyle Hidden -Wait -PassThru
   if ($result.ExitCode -ne 0) {{ throw ('安装失败，退出码：' + $result.ExitCode) }}
   '安装成功' | Set-Content -LiteralPath {ps_quote(str(log))} -Encoding UTF8
 }} catch {{
   $_.Exception.Message | Set-Content -LiteralPath {ps_quote(str(log))} -Encoding UTF8
 }}
-if (Test-Path -LiteralPath {ps_quote(str(install_dir / 'PhotoAI.exe'))}) {{ Start-Process -FilePath {ps_quote(str(install_dir / 'PhotoAI.exe'))} }}
+$env:TEMP=[System.IO.Path]::Combine([System.Environment]::GetFolderPath('LocalApplicationData'), 'Temp')
+$env:TMP=$env:TEMP
+[System.IO.Directory]::CreateDirectory($env:TEMP) | Out-Null
+if (Test-Path -LiteralPath {ps_quote(str(install_dir / 'PhotoAI.exe'))}) {{ Start-Process -FilePath {ps_quote(str(install_dir / 'PhotoAI.exe'))} -WorkingDirectory {ps_quote(str(install_dir))} }}
+try {{
+  Set-Location -LiteralPath $env:SystemRoot
+  [System.IO.File]::Delete({ps_quote(str(installer))})
+  [System.IO.Directory]::Delete({ps_quote(str(installer.parent))}, $false)
+}} catch {{ }}
 """
 
 
@@ -190,14 +237,21 @@ class AppUpdater:
             if desktop_pid <= 0 or not (install_dir / "PhotoAI.exe").is_file() or not (install_dir / ".photoai-install-marker").is_file():
                 raise ValueError("请从桌面安装版执行更新。")
             release = self.state["release"]
-            script = installer_script(self.root / release["version"] / ASSET, install_dir,
+            staged = stage_installer(self.root / release["version"] / ASSET, install_dir, release["sha256"])
+            script = installer_script(staged, install_dir,
                                       desktop_pid, release["sha256"], self.root / "install-result.txt")
             powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
-            process = subprocess.Popen([str(powershell), "-NoProfile", "-NonInteractive", "-EncodedCommand",
-                base64.b64encode(script.encode("utf-16-le")).decode()],
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                cwd=self.root)
+            try:
+                process = subprocess.Popen([str(powershell), "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                    base64.b64encode(script.encode("utf-16-le")).decode()],
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    cwd=staged.parent,
+                    env={**os.environ, "TEMP": str(staged.parent), "TMP": str(staged.parent)})
+            except OSError as exc:
+                staged.unlink(missing_ok=True)
+                staged.parent.rmdir()
+                raise ValueError("无法启动更新助手，请手动运行下载的安装包。") from exc
             self.installing = True
             self._set(phase="installing", message="正在关闭程序并安装更新…")
             def watch_helper():

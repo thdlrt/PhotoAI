@@ -16,6 +16,7 @@ Var PhotoAIInstallMarkerContents
 Var PhotoAIFreshInstall
 Var PhotoAISelfTestExit
 Var PhotoAINestedDataRelative
+Var PhotoAIRenameAttempts
 
 !macro NSIS_HOOK_PREINSTALL
   ; Keep the previous program tree beside the install directory until the new
@@ -65,10 +66,18 @@ Var PhotoAINestedDataRelative
   photoai_preinstall_backup:
   ReadRegStr $PhotoAIPreviousDisplayVersion SHCTX "${UNINSTKEY}" "DisplayVersion"
   SetOutPath "$TEMP"
+  StrCpy $PhotoAIRenameAttempts 0
+  photoai_preinstall_backup_retry:
   ClearErrors
   Rename "$INSTDIR" "$PhotoAIRollbackDir"
   ${If} ${Errors}
-    MessageBox MB_OK|MB_ICONSTOP "无法暂存当前版本，安装未修改。请关闭占用程序目录的应用后重试。"
+    IntOp $PhotoAIRenameAttempts $PhotoAIRenameAttempts + 1
+    ${If} $PhotoAIRenameAttempts < 10
+      Sleep 500
+      Goto photoai_preinstall_backup_retry
+    ${EndIf}
+    MessageBox MB_OK|MB_ICONSTOP "无法暂存当前版本，安装未修改。请关闭占用程序目录的应用，并将安装包保存到程序目录之外（例如“下载”目录）后重试。"
+    SetErrorLevel 1
     Abort
   ${EndIf}
   CreateDirectory "$INSTDIR"
