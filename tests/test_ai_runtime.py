@@ -50,6 +50,27 @@ def _gpu() -> NvidiaStatus:
     return NvidiaStatus(True, "RTX Test", 16_384, "580.10", True)
 
 
+def test_old_worker_requires_reconfiguration_without_changing_engine(tmp_path, monkeypatch):
+    layout = _layout(tmp_path)
+    resources = _release_resources(tmp_path)
+    monkeypatch.setattr(runtime, "detect_nvidia", _gpu)
+    install_ai_profile(layout, "16gb", resources_root=resources,
+                       runner=_successful_runner([]))
+    engine = active_engine(layout)
+    manifest_file = engine / runtime.ENGINE_MANIFEST
+    manifest = runtime.read_json(manifest_file)
+    manifest["product_version"] = "0.9.0-beta.2"
+    runtime.write_json(manifest_file, manifest)
+    before = manifest_file.read_bytes()
+    status = runtime.ai_runtime_status(layout)
+    assert status["worker_update_required"] and not status["ready"]
+    assert "重新配置当前档位" in status["message"]
+    assert active_engine(layout) == engine and manifest_file.read_bytes() == before
+    manifest["product_version"] = runtime.PRODUCT_VERSION
+    runtime.write_json(manifest_file, manifest)
+    assert runtime.ai_runtime_status(layout)["ready"]
+
+
 def _successful_runner(
     commands: list[list[str]], environments: list[dict[str, str]] | None = None
 ):

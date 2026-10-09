@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.0-beta.3
+
+- Clarified confidence as 0–1 separately from 0–100 photo scores. Invalid model
+  replies now receive the specific validation error on retry and leave bounded
+  local diagnostics containing the failed reply and received value.
+- Updated the visual-critique cache version and made older installed AI Workers
+  request reconfiguration before running the old review implementation.
+- Added confirmed source-file deletion for individual and batch photo selection,
+  using a same-volume recycle directory and preserving manual review records.
+
 ## 0.9.0-beta.1 — first public release
 
 - Windows desktop shell with a local service and isolated background workers.

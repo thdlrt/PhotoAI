@@ -16,6 +16,7 @@ const state = {
   jobNotice: null,
   jobRetryBusy: false,
   deleteProjectTarget: null,
+  deletePhotoTarget: null,
   currentProject: null,
   currentRun: null,
   groupingMode: false,
@@ -438,7 +439,7 @@ function projectRow(project) {
   const xmp = project.xmp_count ? ` · ${project.xmp_count} 个 XMP` : "";
   const excluded = Number(latest.excluded_count ?? project.excluded_count ?? 0);
   const active = Number(latest.active_image_count ?? project.active_image_count ?? project.image_count ?? 0);
-  const photoCount = hasRun ? (excluded ? `${active} 张 · 移出 ${excluded} 张` : `${project.image_count} 张`) : "尚未分析";
+  const photoCount = hasRun ? (excluded ? `${active} 张 · 移出 ${excluded} 张` : `${active} 张`) : "尚未分析";
   const status = !hasRun
     ? "待分组"
     : latest.workflow_state === "grouped"
@@ -818,6 +819,10 @@ function renderModelResources() {
     taskNote.classList.remove("warning");
     taskNote.classList.toggle("error", state.modelResourceMessage.kind === "error");
     taskNote.classList.toggle("success", state.modelResourceMessage.kind === "success");
+  } else if (data.engine?.worker_update_required) {
+    taskNote.textContent = data.engine.message;
+    taskNote.classList.remove("hidden", "error", "success");
+    taskNote.classList.add("warning");
   } else {
     taskNote.textContent = "";
     taskNote.classList.add("hidden");
@@ -1285,7 +1290,7 @@ function renderReview() {
   const scored = run.workflow_state === "scored";
   const grouping = state.groupingMode || !scored || run.needs_rescore;
   const activeItems = run.results.filter((item) => !item.excluded);
-  const excludedItems = run.results.filter((item) => item.excluded);
+  const excludedItems = run.results.filter((item) => item.excluded && !item.deleted);
   const activeIndexes = new Set(activeItems.map((item) => item.index));
   state.selectedIndices = new Set([...state.selectedIndices].filter((index) => activeIndexes.has(index)));
   const batch = grouping && state.batchGrouping;
@@ -1324,6 +1329,7 @@ function renderReview() {
   $("#selection-down").disabled = state.batchBusy || state.selectedIndices.size === 0 || [...selectedGroups].every((groupId) => groupId === lastGroup);
   $("#selection-new-group").disabled = state.batchBusy || state.selectedIndices.size === 0;
   $("#selection-remove").disabled = state.batchBusy || state.selectedIndices.size === 0;
+  $("#selection-delete").disabled = state.batchBusy || state.selectedIndices.size === 0;
   const notice = $("#grouping-notice");
   notice.classList.toggle("hidden", !grouping);
   notice.textContent = run.needs_rescore
@@ -1359,6 +1365,7 @@ function renderReview() {
         <button class="move-group-button" data-shift-index="${item.index}" data-shift-direction="next" ${actionDisabled || Number(item.group_id) === lastGroup ? "disabled" : ""}>下移</button>
         <button class="move-group-button" data-new-group-index="${item.index}" ${actionDisabled ? "disabled" : ""}>新建组</button>
         <button class="move-group-button remove-item-button" data-exclude-index="${item.index}" ${actionDisabled ? "disabled" : ""}>移出</button>
+        <button class="move-group-button delete-item-button" data-delete-photo-index="${item.index}" ${actionDisabled ? "disabled" : ""}>删除</button>
       </div>` : "";
       return `<article class="photo-card ${grouping ? "grouping-card" : ""} ${selected ? "selected" : ""} ${show ? "" : "hidden-by-filter"}" data-rating="${item.effective_rating}" data-index="${item.index}" aria-selected="${selected}">
         ${selector}
@@ -1382,7 +1389,7 @@ function renderReview() {
     <div class="excluded-head"><span>这些照片不参与评分或 XMP，RAW 文件仍在原处。</span><button class="text-button" data-restore-all>全部恢复</button></div>
     <div class="filmstrip">${excludedItems.map((item) => `<article class="photo-card removed-card" data-index="${item.index}">
       <button class="preview-button" data-open-photo="${item.index}"><img src="${item.preview_url}" loading="lazy" alt="${escapeHtml(item.filename)}"></button>
-      <div class="photo-meta"><div class="photo-line"><strong title="${escapeHtml(item.filename)}">${escapeHtml(item.filename)}</strong><button class="move-group-button" data-restore-index="${item.index}">恢复</button></div></div>
+      <div class="photo-meta"><div class="photo-line"><strong title="${escapeHtml(item.filename)}">${escapeHtml(item.filename)}</strong><button class="move-group-button" data-restore-index="${item.index}">恢复</button><button class="move-group-button delete-item-button" data-delete-photo-index="${item.index}" ${state.activeJob || state.batchBusy ? "disabled" : ""}>删除</button></div></div>
     </article>`).join("")}</div>
   </details>` : "";
   const activeMarkup = groupMarkup || (grouping ? `<div class="empty">当前没有参与评分的照片</div>` : "");
@@ -2907,6 +2914,56 @@ async function updateExcluded(indexes, excluded) {
   }
 }
 
+function openDeletePhotos(indexes) {
+  const run = state.currentRun;
+  if (!run || state.activeJob || state.batchBusy || !indexes.length) return;
+  const items = run.results.filter((item) => indexes.includes(item.index) && !item.deleted);
+  if (!items.length) return;
+  state.deletePhotoTarget = { runId: run.run_id, revision: Number(run.review_revision), indexes: items.map((item) => item.index) };
+  $("#delete-photos-copy").textContent = items.length === 1
+    ? `删除 ${items[0].filename}？源文件将移入照片目录内的 .photo-ai-trash/selection 回收区，并从工程中移除。`
+    : `删除所选 ${items.length} 张照片？源文件将移入照片目录内的 .photo-ai-trash/selection 回收区，并从工程中移除。`;
+  $("#delete-photos-dialog").showModal();
+}
+
+async function deletePhotos() {
+  const target = state.deletePhotoTarget;
+  if (!target || state.batchBusy || state.activeJob || target.runId !== state.currentRun?.run_id) return;
+  const button = $("#delete-photos-submit");
+  state.batchBusy = true;
+  button.disabled = true;
+  button.textContent = "正在删除…";
+  renderReview();
+  try {
+    const result = await api(`/api/runs/${target.runId}/photos/delete`, {
+      method: "POST", body: { indexes: target.indexes, base_revision: target.revision, confirmation: "delete-source-files" },
+    });
+    $("#delete-photos-dialog").close();
+    if ($("#photo-dialog").open) $("#photo-dialog").close();
+    state.dialogIndex = null;
+    state.deletePhotoTarget = null;
+    clearGroupingSelection();
+    const route = location.hash.replace(/^#/, "") || `review/${target.runId}`;
+    const batch = state.batchGrouping;
+    await openRun(target.runId, route);
+    state.groupingMode = true;
+    state.batchGrouping = batch;
+    toast(`已删除 ${result.deleted_count} 张，源文件已移入回收区`);
+  } catch (error) {
+    toast(error.message);
+    if (error.message.includes("刷新")) {
+      $("#delete-photos-dialog").close();
+      state.deletePhotoTarget = null;
+      await openRun(target.runId);
+    }
+  } finally {
+    state.batchBusy = false;
+    button.disabled = false;
+    button.textContent = "删除并移入回收区";
+    renderReview();
+  }
+}
+
 function toggleGrouping() {
   if (!state.currentRun || state.currentRun.needs_rescore) return;
   state.groupingMode = !state.groupingMode;
@@ -3594,6 +3651,8 @@ function bindEvents() {
   $("#selection-down").addEventListener("click", () => applyGroupChange([...state.selectedIndices], { direction: "next" }));
   $("#selection-new-group").addEventListener("click", () => applyGroupChange([...state.selectedIndices], { selected: "new" }));
   $("#selection-remove").addEventListener("click", () => updateExcluded([...state.selectedIndices], true));
+  $("#selection-delete").addEventListener("click", () => openDeletePhotos([...state.selectedIndices]));
+  $("#delete-photos-submit").addEventListener("click", deletePhotos);
   $("#score-run").addEventListener("click", () => scoreCurrentGroups().catch(() => {}));
   $("#group-submit").addEventListener("click", moveGroup);
   $("#rollback-submit").addEventListener("click", rollbackXmp);
@@ -3732,10 +3791,12 @@ function bindEvents() {
     }
     const excludeButton = event.target.closest("[data-exclude-index]");
     if (excludeButton) updateExcluded([Number(excludeButton.dataset.excludeIndex)], true);
+    const deletePhotoButton = event.target.closest("[data-delete-photo-index]");
+    if (deletePhotoButton) openDeletePhotos([Number(deletePhotoButton.dataset.deletePhotoIndex)]);
     const restoreButton = event.target.closest("[data-restore-index]");
     if (restoreButton) updateExcluded([Number(restoreButton.dataset.restoreIndex)], false);
     const restoreAllButton = event.target.closest("[data-restore-all]");
-    if (restoreAllButton) updateExcluded(state.currentRun?.results.filter((item) => item.excluded).map((item) => item.index) || [], false);
+    if (restoreAllButton) updateExcluded(state.currentRun?.results.filter((item) => item.excluded && !item.deleted).map((item) => item.index) || [], false);
     const rollbackButton = event.target.closest(".rollback-open");
     if (rollbackButton) { state.rollbackId = rollbackButton.dataset.transactionId; $("#rollback-dialog").showModal(); }
     const closeButton = event.target.closest("[data-close-dialog]");

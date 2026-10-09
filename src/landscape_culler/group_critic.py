@@ -268,7 +268,8 @@ class OllamaGroupCritic:
             "你是严谨的风光摄影选片编辑。图片顺序依次对应："
             f"{ids}。{comparison}"
             "评价构图组织、光线时机、主体与空间层次、色彩关系、技术画质、后期潜力，以及画面干扰。"
-            "所有分数使用 0–100；distraction 越高表示干扰越严重。"
+            f"仅这些评分字段使用 0–100：{', '.join(_SCORE_FIELDS)}；distraction 越高表示干扰越严重。"
+            "confidence 是置信度，必须使用 0–1 的数值，例如 90% 应写 0.9，不能写 90；它不是 0–100 的评分。"
             "summary 只写一条可观察、可核验的中文结论；strengths/issues 各不超过三条，禁止猜测地点、器材或拍摄者意图。"
             "严格按给定 JSON Schema 返回，不要输出 Markdown 或额外解释。"
         )
@@ -304,13 +305,19 @@ class OllamaGroupCritic:
                 raise ValueError("视觉评审字段不完整")
             record = {"id": str(item["id"]), "rank": int(item["rank"])}
             for name in _SCORE_FIELDS:
-                value = float(item[name])
+                try:
+                    value = float(item[name])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"{item['id']}.{name} 必须是 0–100 的数值，收到 {str(item[name])[:80]!r}") from exc
                 if not 0.0 <= value <= 100.0:
-                    raise ValueError(f"{name} 超出 0–100")
+                    raise ValueError(f"{item['id']}.{name} 超出 0–100，收到 {value!r}")
                 record[name] = value
-            confidence = float(item["confidence"])
+            try:
+                confidence = float(item["confidence"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{item['id']}.confidence 必须是 0–1 的数值，收到 {str(item['confidence'])[:80]!r}") from exc
             if not 0.0 <= confidence <= 1.0:
-                raise ValueError("confidence 超出 0–1")
+                raise ValueError(f"{item['id']}.confidence 超出 0–1，收到 {confidence!r}；例如 90% 应写 0.9，不能写 90")
             record["confidence"] = confidence
             for name in ("strengths", "issues"):
                 values = item[name]
@@ -383,6 +390,7 @@ class OllamaGroupCritic:
         }
         last_error: Exception | None = None
         for _attempt in range(2):
+            content: Any = None
             try:
                 response = self._request("/api/chat", request_payload, timeout=900.0)
                 content = response["message"]["content"]
@@ -407,6 +415,33 @@ class OllamaGroupCritic:
                 urllib.error.URLError,
             ) as exc:
                 last_error = exc
+                if content is not None:
+                    # Save only failed model text, never request images or provider keys.
+                    raw_text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+                    raw_text = raw_text[:16384]
+                    diagnostic = self.log_dir / "vlm-validation" / f"{cached_path.stem}-{time.time_ns()}-{_attempt + 1}.json"
+                    try:
+                        write_json(diagnostic, {
+                            "model": self.model, "prompt_version": VLM_PROMPT_VERSION,
+                            "context": context, "photo_count": len(paths),
+                            "attempt": _attempt + 1, "error": str(exc),
+                            "response_text": raw_text,
+                        })
+                    except OSError:
+                        pass  # A logging failure must not discard a repairable critique.
+                    if _attempt == 0:
+                        request_payload = {
+                            **request_payload,
+                            "messages": [
+                                request_payload["messages"][0],
+                                {"role": "assistant", "content": raw_text},
+                                {"role": "user", "content": (
+                                    f"上次结果未通过校验：{exc}。请修正此错误并重新返回全部照片的完整 JSON。"
+                                    "只有评分字段使用 0–100；confidence 必须使用 0–1（例如 0.9，不是 90）。"
+                                    "照片 ID 必须与原请求一致，严格遵守 JSON Schema，不输出其他内容。"
+                                )},
+                            ],
+                        }
         raise RuntimeError(f"Qwen3-VL 连续两次未返回有效评审：{last_error}")
 
     def critique_groups(

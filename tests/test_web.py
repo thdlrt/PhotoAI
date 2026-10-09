@@ -802,6 +802,18 @@ def test_frozen_application_reuses_its_own_executable_for_workers(
     ]
 
 
+def test_managed_ai_jobs_reject_outdated_worker_before_start(tmp_path, monkeypatch):
+    layout = ContentRootLayout.from_root(tmp_path / "content")
+    layout.state.mkdir(parents=True)
+    engine = layout.runtimes / "engines" / "old-worker"
+    write_json(engine / "engine.json", {"product_version": "0.9.0-beta.2"})
+    monkeypatch.setattr(web_module, "active_engine", lambda _layout: engine)
+    manager = JobManager(layout.state, Path(__file__).parents[1], layout)
+    with pytest.raises(RuntimeError, match="重新配置当前档位"):
+        manager._job_command("score", ["score"], "old-worker-job")
+    assert not (manager.jobs_dir / "old-worker-job.spec.json").exists()
+
+
 def test_managed_ai_jobs_use_versioned_worker_job_spec(
     tmp_path: Path, monkeypatch
 ) -> None:

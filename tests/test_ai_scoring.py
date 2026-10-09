@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from landscape_culler.constants import SCORING_PIPELINE_VERSION
@@ -239,6 +240,71 @@ def test_group_critic_rejects_duplicate_rank() -> None:
         assert "名次" in str(exc)
     else:
         raise AssertionError("重复名次应被拒绝")
+
+
+@pytest.mark.parametrize("context", ["group", "global"])
+def test_group_critic_retries_with_precise_confidence_error(tmp_path: Path, monkeypatch, context) -> None:
+    photo = tmp_path / "one.jpg"
+    Image.new("RGB", (64, 48), "#678a9a").save(photo)
+    critic = OllamaGroupCritic(tmp_path / "data")
+    invalid = {"items": [{**_critique("IMG_01", 1, 80), "confidence": 90}]}
+    valid = {"items": [{**_critique("IMG_01", 1, 80), "confidence": 0.9}]}
+    calls = []
+    def request(_path, body, **_kwargs):
+        calls.append(body)
+        return {"message": {"content": json.dumps(invalid if len(calls) == 1 else valid)}}
+    monkeypatch.setattr(critic, "_request", request)
+    result = critic.critique([photo], context=context)
+    assert result[0]["confidence"] == 0.9 and len(calls) == 2
+    assert "所有分数使用" not in calls[0]["messages"][0]["content"]
+    assert "confidence" in calls[0]["messages"][0]["content"]
+    assert "0–1" in calls[0]["messages"][0]["content"]
+    correction = calls[1]["messages"][-1]["content"]
+    assert "IMG_01.confidence" in correction and "90.0" in correction and "0.9" in correction
+    assert calls[1]["messages"][0]["images"] == calls[0]["messages"][0]["images"]
+    assert calls[1]["messages"][1]["role"] == "assistant"
+    diagnostic = json.loads(next(critic.log_dir.glob("vlm-validation/*.json")).read_text(encoding="utf-8"))
+    assert json.loads(diagnostic["response_text"]) == invalid
+    assert diagnostic["context"] == context and "IMG_01.confidence" in diagnostic["error"]
+    assert "images" not in diagnostic and "key" not in diagnostic
+    assert critic.critique([photo], context=context) == result and len(calls) == 2
+
+
+@pytest.mark.parametrize("confidence", [90, -0.1, float("nan"), float("inf"), None, "invalid"])
+def test_group_critic_keeps_strict_confidence_validation(confidence) -> None:
+    payload = {"items": [{**_critique("IMG_01", 1, 80), "confidence": confidence}]}
+    with pytest.raises(ValueError, match=r"IMG_01\.confidence"):
+        OllamaGroupCritic._validate(payload, 1, repair_ranks=True)
+
+
+def test_group_critic_logs_both_invalid_attempts_without_caching(tmp_path: Path, monkeypatch) -> None:
+    photo = tmp_path / "one.jpg"
+    Image.new("RGB", (64, 48)).save(photo)
+    critic = OllamaGroupCritic(tmp_path / "data")
+    invalid = {"items": [{**_critique("IMG_01", 1, 80), "confidence": 90}]}
+    monkeypatch.setattr(critic, "_request", lambda *_args, **_kwargs: {"message": {"content": json.dumps(invalid)}})
+    with pytest.raises(RuntimeError, match=r"confidence.*90"):
+        critic.critique([photo])
+    assert not critic._cache_path([photo]).exists()
+    logs = [json.loads(file.read_text(encoding="utf-8")) for file in critic.log_dir.glob("vlm-validation/*.json")]
+    assert sorted(item["attempt"] for item in logs) == [1, 2]
+
+
+def test_group_critic_repair_survives_diagnostic_write_failure(tmp_path: Path, monkeypatch) -> None:
+    photo = tmp_path / "one.jpg"
+    Image.new("RGB", (64, 48)).save(photo)
+    critic = OllamaGroupCritic(tmp_path / "data")
+    invalid = {"items": [{**_critique("IMG_01", 1, 80), "confidence": 90}]}
+    valid = {"items": [_critique("IMG_01", 1, 80)]}
+    replies = iter([invalid, valid])
+    monkeypatch.setattr(critic, "_request", lambda *_args, **_kwargs: {"message": {"content": json.dumps(next(replies))}})
+    from landscape_culler.util import write_json as save
+    def unavailable_log(path, payload):
+        if "vlm-validation" in path.parts:
+            raise PermissionError("read-only logs")
+        save(path, payload)
+    monkeypatch.setattr("landscape_culler.group_critic.write_json", unavailable_log)
+    assert critic.critique([photo])[0]["confidence"] == 0.8
 
 
 def test_group_critic_uses_only_content_root_ollama(

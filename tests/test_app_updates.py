@@ -7,7 +7,7 @@ from landscape_culler import app_updates as updates
 from test_web import _client, RUN_ID
 
 
-def release(tag="v0.9.0-beta.3", data=b"MZ installer", **changes):
+def release(tag="v0.9.0-beta.4", data=b"MZ installer", **changes):
     result = {"tag_name": tag, "prerelease": "-" in tag, "draft": False, "body": "notes",
               "assets": [{"name": updates.ASSET, "state": "uploaded", "size": len(data),
                           "digest": "sha256:" + hashlib.sha256(data).hexdigest(),
@@ -16,7 +16,7 @@ def release(tag="v0.9.0-beta.3", data=b"MZ installer", **changes):
 
 
 def test_release_selection():
-    assert updates.select_release([release(), release("v0.9.0-beta.1")])["version"] == "0.9.0-beta.3"
+    assert updates.select_release([release(), release("v0.9.0-beta.1")])["version"] == "0.9.0-beta.4"
     assert updates.select_release([release("v0.9.0-beta.1")]) is None
     assert updates.select_release([release("v0.9.0-beta.3")], "0.9.0") is None
     assert updates.select_release([release("v0.9.1")], "0.9.0")["version"] == "0.9.1"
@@ -38,7 +38,7 @@ def test_download_resume_and_integrity(tmp_path, monkeypatch):
     updater = updates.AppUpdater(tmp_path)
     payload = b"MZinstaller-content"
     updater.state["release"] = updates.select_release([release(data=payload)])
-    folder = updater.root / "0.9.0-beta.3"
+    folder = updater.root / "0.9.0-beta.4"
     folder.mkdir(parents=True)
     (folder / (updates.ASSET + ".part")).write_bytes(payload[:4])
     def request(url, headers=None):

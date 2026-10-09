@@ -225,6 +225,7 @@ input:focus, select:focus { border-color: #82663f; box-shadow: 0 0 0 2px rgb(214
 .move-group-button:disabled { opacity: .3; cursor: not-allowed; }
 .card-actions { margin-top: 5px; display: flex; flex-wrap: wrap; gap: 3px 9px; }
 .remove-item-button { color: #b9837d; }
+.delete-item-button { color: #e5837b; }
 .excluded-group { margin-top: 8px; padding-top: 12px; border-top: 1px solid var(--line); }
 .excluded-group summary { width: fit-content; color: var(--muted); cursor: pointer; font-size: 11px; }
 .excluded-head { margin: 9px 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 10px; }

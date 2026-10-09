@@ -219,6 +219,15 @@ def active_engine(layout: ContentRootLayout) -> Path | None:
     return engine
 
 
+def ai_worker_needs_update(engine: Path) -> bool:
+    """Published worker wheels are installed separately from desktop updates."""
+    try:
+        version = read_json(engine / ENGINE_MANIFEST).get("product_version")
+    except (OSError, ValueError):
+        return False  # active_engine handles missing/invalid engine manifests.
+    return bool(version and version != PRODUCT_VERSION)
+
+
 def ai_runtime_status(layout: ContentRootLayout) -> dict[str, Any]:
     gpu = detect_nvidia()
     engine = active_engine(layout)
@@ -228,10 +237,13 @@ def ai_runtime_status(layout: ContentRootLayout) -> dict[str, Any]:
             smoke = read_json(engine / SMOKE_RESULT)
         except (OSError, ValueError, json.JSONDecodeError):
             engine = None
+    worker_update_required = engine is not None and ai_worker_needs_update(engine)
     return {
         "schema_version": AI_RUNTIME_SCHEMA,
         "engine_version": AI_ENGINE_VERSION,
-        "ready": engine is not None,
+        "ready": engine is not None and not worker_update_required,
+        "worker_update_required": worker_update_required,
+        "message": "AI 评审计算环境需要更新，请在资源页重新配置当前档位（复用已下载模型）。" if worker_update_required else "",
         "engine_path": str(engine) if engine else None,
         "gpu": {
             "available": gpu.available,

@@ -29,7 +29,7 @@ assert.match(css, /\.path-picker\s*\{/);
 const remote = capabilities.find((item) => item.identifier === "main-window-loopback-folder-picker");
 assert.ok(remote);
 assert.deepEqual(remote.remote.urls, ["http://127.0.0.1:*/*"]);
-assert.deepEqual(new Set(remote.permissions), new Set(["allow-pick-folder", "allow-ensure-content-root", "allow-reconnect-content-root"]));
+assert.deepEqual(new Set(remote.permissions), new Set(["allow-pick-folder", "allow-ensure-content-root", "allow-reconnect-content-root", "allow-exit-for-update"]));
 assert.equal(remote.local, false);
 
 console.log("frontend desktop folder picker contract passed");

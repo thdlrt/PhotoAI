@@ -225,7 +225,11 @@ def test_nsis_fresh_install_requires_empty_root_and_cleans_known_payload_only() 
             "!macro NSIS_HOOK_PREUNINSTALL"
         )
     ]
-    assert "$PhotoAIContentRoot" not in install_hooks
+    # Updates must restore a nested Content Root before removing the old payload.
+    restore = 'Rename "$PhotoAIRollbackDir\\$PhotoAINestedDataRelative" "$INSTDIR\\$PhotoAINestedDataRelative"'
+    assert restore in install_hooks
+    assert install_hooks.index(restore) < install_hooks.rindex('RMDir /r /REBOOTOK "$PhotoAIRollbackDir"')
+    assert 'ReadRegStr $PhotoAIContentRoot HKCU "Software\\PhotoAI" "ContentRoot"' in install_hooks
 
     postuninstall = hooks[hooks.index("!macro NSIS_HOOK_POSTUNINSTALL") :]
     assert 'Delete "$INSTDIR\\.photoai-install-marker"' in postuninstall
@@ -234,6 +238,7 @@ def test_nsis_fresh_install_requires_empty_root_and_cleans_known_payload_only() 
 
 
 def test_all_release_surfaces_share_product_version() -> None:
+    from landscape_culler.version import PRODUCT_VERSION
     tauri = json.loads(
         (PROJECT_ROOT / "desktop/src-tauri/tauri.conf.json").read_text(
             encoding="utf-8"
@@ -263,8 +268,8 @@ def test_all_release_surfaces_share_product_version() -> None:
         npm["version"],
         cargo_version.group(1),
         product_version.group(1),
-    } == {"0.9.0-beta.1"}
-    assert pyproject["project"]["version"] == "0.9.0b1"
+    } == {PRODUCT_VERSION}
+    assert pyproject["project"]["version"] == PRODUCT_VERSION.replace("-beta.", "b")
 
 
 def test_release_manifests_are_fixed_and_hashed() -> None:

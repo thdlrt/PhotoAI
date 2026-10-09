@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>照片选片</title>
-  <link rel="stylesheet" href="/static/app.css?v=56">
+  <link rel="stylesheet" href="/static/app.css?v=57">
 </head>
 <body>
   <header class="app-header">
@@ -183,6 +183,7 @@
             <button id="selection-down" class="button" type="button" title="移到当前组的下一组">下移</button>
             <button id="selection-new-group" class="button" type="button">新建组</button>
             <button id="selection-remove" class="button danger-quiet" type="button">移出工程</button>
+            <button id="selection-delete" class="button danger-quiet" type="button">删除</button>
           </div>
         </div>
         <div id="review-toolbar" class="review-toolbar panel">
@@ -401,6 +402,12 @@
     <div class="dialog-actions"><button class="button" data-close-dialog="rollback-dialog">取消</button><button id="rollback-submit" class="button danger">撤销 XMP</button></div>
   </dialog>
 
+  <dialog id="delete-photos-dialog" class="confirm-dialog" aria-labelledby="delete-photos-title">
+    <h2 id="delete-photos-title">删除照片</h2>
+    <p id="delete-photos-copy"></p>
+    <div class="dialog-actions"><button class="button" data-close-dialog="delete-photos-dialog">取消</button><button id="delete-photos-submit" class="button danger">删除并移入回收区</button></div>
+  </dialog>
+
   <dialog id="delete-project-dialog" class="confirm-dialog">
     <form method="dialog"><button class="dialog-close" value="cancel" aria-label="关闭">×</button></form>
     <h2>删除工程</h2>
@@ -454,6 +461,6 @@
   </dialog>
 
   <div id="toast" class="toast hidden" aria-live="polite"></div>
-  <script src="/static/app.js?v=76" defer></script>
+  <script src="/static/app.js?v=77" defer></script>
 </body>
 </html>

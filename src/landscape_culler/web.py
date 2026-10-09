@@ -27,7 +27,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 
-from .ai_runtime import active_engine, ai_resources_status
+from .ai_runtime import active_engine, ai_resources_status, ai_worker_needs_update
 from .constants import (
     OLLAMA_ENDPOINT,
     PROPRIETARY_RAW_EXTENSIONS,
@@ -820,6 +820,8 @@ class JobManager:
             engine = active_engine(self.content_layout)
             if engine is None:
                 raise RuntimeError("AI 计算环境尚未完整安装或自检未通过。")
+            if ai_worker_needs_update(engine):
+                raise RuntimeError("AI 评审计算环境需要更新，请在资源页重新配置当前档位（复用已下载模型）后再重试。")
             python = (
                 engine
                 / "venv"
@@ -1626,6 +1628,12 @@ class ExcludeItemsBody(BaseModel):
     base_revision: int = Field(0, ge=0)
 
 
+class DeletePhotosBody(BaseModel):
+    indexes: list[int] = Field(min_length=1, max_length=5000)
+    base_revision: int = Field(ge=0)
+    confirmation: Literal["delete-source-files"]
+
+
 class RawJpegPreviewBody(BaseModel):
     layout: Literal["mixed", "separate"] = "mixed"
     direction: Literal["jpeg", "raw", "both"] = "jpeg"
@@ -1873,12 +1881,14 @@ def _apply_review(payload: dict[str, Any], review: dict[str, Any]) -> dict[str, 
     effective_exclusion_changes: dict[str, bool] = {}
     for index, item in enumerate(cloned.get("results", [])):
         key = str(index)
+        item["deleted"] = key in review.get("deleted", {})
         original_excluded = bool(item.get("excluded", False))
         excluded = (
             bool(excluded_overrides[key])
             if key in excluded_overrides
             else original_excluded
         )
+        excluded = excluded or item["deleted"]
         item["ai_excluded"] = original_excluded
         item["excluded"] = excluded
         item["manual_excluded_override"] = excluded != original_excluded
@@ -1938,7 +1948,8 @@ def _apply_review(payload: dict[str, Any], review: dict[str, Any]) -> dict[str, 
     cloned["review_revision"] = int(review.get("revision", 0))
     cloned["image_count"] = len(cloned.get("results", []))
     cloned["active_image_count"] = len(active_results)
-    cloned["excluded_count"] = cloned["image_count"] - cloned["active_image_count"]
+    cloned["deleted_count"] = sum(bool(item.get("deleted")) for item in cloned.get("results", []))
+    cloned["excluded_count"] = cloned["image_count"] - cloned["active_image_count"] - cloned["deleted_count"]
     cloned["candidate_count"] = sum(
         1 for item in active_results if int(item.get("rating", 0)) >= 3
     )
@@ -1994,6 +2005,7 @@ def _run_summary(run_file: Path) -> dict[str, Any]:
         "image_count": payload.get("image_count", len(ratings)),
         "active_image_count": len(ratings),
         "excluded_count": payload.get("excluded_count", 0),
+        "deleted_count": payload.get("deleted_count", 0),
         "candidate_count": sum(value >= 3 for value in ratings),
         "strong_count": sum(value >= 4 for value in ratings),
         "rejected_count": sum(value == 0 for value in ratings),
@@ -2487,6 +2499,8 @@ def _edit_excluded(
         review = _review(run_file)
         if int(review["revision"]) != revision:
             raise HTTPException(409, "分组已在别处更新，请刷新后重试。")
+        if any(str(index) in review.get("deleted", {}) for index in indexes):
+            raise HTTPException(422, "已删除的照片不能从移出列表恢复，请先从回收区找回文件后重新分析。")
         overrides = dict(review.get("excluded", {}))
         for index in indexes:
             original = bool(results[index].get("excluded", False))
@@ -2516,6 +2530,89 @@ def _edit_excluded(
         "group_count": applied["group_count"],
         "needs_rescore": applied["needs_rescore"],
     }
+
+
+def _delete_photos(data_dir: Path, run_id: str, indexes: list[int], revision: int,
+                   lock: threading.RLock) -> dict[str, Any]:
+    """Recycle selected source files on the same volume; retain stable review indexes."""
+    run_file = _run_file(data_dir, run_id)
+    with lock:
+        payload = read_json(run_file)
+        review = _review(run_file)
+        if int(review["revision"]) != revision:
+            raise HTTPException(409, "分组已在别处更新，请刷新后重试。")
+        results = payload.get("results", [])
+        indexes = list(dict.fromkeys(indexes))
+        if any(index < 0 or index >= len(results) for index in indexes):
+            raise HTTPException(404, "照片序号不存在。")
+        if any(str(index) in review.get("deleted", {}) for index in indexes):
+            raise HTTPException(409, "照片已删除，请刷新后重试。")
+        try:
+            root = Path(payload.get("input_root", "")).resolve(strict=True)
+        except OSError as exc:
+            raise HTTPException(422, "工程照片目录不可用，请重新连接后重试。") from exc
+        transaction = uuid.uuid4().hex
+        recycle = root / ".photo-ai-trash" / "selection" / transaction
+        records: list[tuple[Path, Path]] = []
+        paths: set[Path] = set()
+        for index in indexes:
+            source = Path(results[index].get("path", ""))
+            if not source.is_absolute() or source.is_symlink() or not source.is_file():
+                raise HTTPException(422, "源文件不存在或属于链接，请刷新后重试。")
+            resolved = source.resolve(strict=True)
+            if not _inside(resolved, root) or ".photo-ai-trash" in resolved.relative_to(root).parts:
+                raise HTTPException(422, "源文件超出工程照片目录。")
+            if resolved not in paths:
+                paths.add(resolved)
+                records.append((resolved, recycle / resolved.relative_to(root)))
+        # A duplicate result must never offer a now-missing source as an active photo.
+        affected = [index for index, item in enumerate(results)
+                    if Path(item.get("path", "")).resolve() in paths]
+        updated = {**review, "deleted": dict(review.get("deleted", {})),
+                   "revision": revision + 1, "updated_at": _now()}
+        for index in affected:
+            updated["deleted"][str(index)] = transaction
+        applied = _apply_review(payload, updated)
+        if applied["active_image_count"] <= 0:
+            raise HTTPException(422, "工程至少需要保留一张照片。")
+        # Refuse redirected trash directories, including Windows junctions.
+        for parent in (recycle, *recycle.parents):
+            if parent == root:
+                break
+            if parent.exists() and (parent.is_symlink() or parent.is_junction()):
+                raise HTTPException(422, "回收路径经过链接或目录联接点。")
+        manifest = {"run_id": run_id, "created_at": _now(), "status": "planned",
+                    "files": [{"original_path": str(src), "trash_path": str(dst)}
+                              for src, dst in records]}
+        moved: list[tuple[Path, Path]] = []
+        manifest_file = recycle / "deletion-manifest.json"
+        try:
+            recycle.mkdir(parents=True, exist_ok=False)
+            write_json(manifest_file, manifest)
+            for source, target in records:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source.rename(target)
+                moved.append((source, target))
+            manifest["status"] = "completed"
+            write_json(manifest_file, manifest)
+            write_json(_review_path(run_file), updated)
+        except OSError as exc:
+            rollback_errors = []
+            for source, target in reversed(moved):
+                try:
+                    if source.exists():
+                        raise OSError("原位置已存在文件")
+                    target.rename(source)
+                except OSError as rollback_error:
+                    rollback_errors.append(str(rollback_error))
+            manifest.update(status="rollback_failed" if rollback_errors else "rolled_back",
+                            error=str(exc), rollback_errors=rollback_errors)
+            if manifest_file.exists():
+                write_json(manifest_file, manifest)
+            raise HTTPException(409, f"删除失败：{exc}。" +
+                                (f"部分文件需从回收区找回：{recycle}" if rollback_errors else "文件已保留在原处。")) from exc
+        return {"deleted_count": len(affected), "recycle_path": str(recycle),
+                "review_revision": updated["revision"]}
 
 
 def _transaction_id(data_dir: Path, path: Path) -> str:
@@ -6280,6 +6377,13 @@ def create_app(
                 body.base_revision,
                 review_lock,
             )
+
+    @app.post("/api/runs/{run_id}/photos/delete", dependencies=[Depends(mutate_token)])
+    def delete_photos(run_id: str, body: DeletePhotosBody) -> dict[str, Any]:
+        with review_lock:
+            if jobs.active():
+                raise HTTPException(409, "有任务正在处理照片，请等待完成后再删除。")
+            return _delete_photos(data_dir, run_id, body.indexes, body.base_revision, review_lock)
 
     @app.post("/api/runs/{run_id}/score", dependencies=[Depends(mutate_token)])
     def score_run(run_id: str, body: RunScoreBody) -> dict[str, Any]:
