@@ -327,7 +327,7 @@ def test_inventory_exposes_two_vram_profiles_and_all_active_models(
     assert len(status["resources"]) == 8
     complete = next(item for item in status["profiles"] if item["id"] == "16gb")
     assert complete["ready"] is True
-    assert complete["installed_count"] == complete["model_count"] == 7
+    assert complete["installed_count"] == complete["model_count"] == 3
 
 
 def test_configuring_ready_profile_publishes_resolved_ollama_alias(
@@ -378,6 +378,22 @@ def test_profiles_use_one_shared_stack_and_distinct_vlm_sizes() -> None:
     assert light["model_ids"][:-1] == full["model_ids"][:-1]
     assert light["vlm_model_id"] == "qwen3-vl-4b"
     assert full["vlm_model_id"] == "qwen3-vl-8b"
+
+
+def test_culling_profiles_do_not_require_removed_crop_or_style_models(tmp_path, monkeypatch):
+    for resource_id in resources.COMMON_MODEL_IDS:
+        _install_hf(tmp_path, resource_id)
+    _install_ollama(tmp_path, MODEL_SPECS["qwen3-vl-8b"]["ollama_name"])
+    _install_hf(tmp_path, "clip-vit-b32")
+    legacy = resources._hf_cache_path(tmp_path, MODEL_SPECS["clip-vit-b32"]["repo_id"])
+    before = {p: p.read_bytes() for p in legacy.rglob("*") if p.is_file()}
+    monkeypatch.setattr(resources, "_gpu_status", lambda: {"available": False})
+    monkeypatch.setattr(resources, "_download_hf", lambda *_: pytest.fail("no additional model download"))
+    status = configure_model_profile("16gb", tmp_path, tmp_path / "state")
+    profile = next(p for p in status["profiles"] if p["id"] == "16gb")
+    assert profile["ready"] is True and profile["model_count"] == 3
+    assert not set(profile["model_ids"]) & resources.LEGACY_OPTIONAL_MODEL_IDS
+    assert all(p.read_bytes() == content for p, content in before.items())
 
 
 def test_deleting_one_profile_preserves_models_shared_with_installed_other_profile(

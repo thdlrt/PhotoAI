@@ -61,26 +61,43 @@ def test_old_worker_requires_reconfiguration_without_changing_engine(tmp_path, m
     manifest = runtime.read_json(manifest_file)
     manifest["product_version"] = "0.9.0-beta.2"
     manifest.pop("vlm_prompt_version", None)
+    manifest.pop("worker_code_version", None)
     runtime.write_json(manifest_file, manifest)
     before = manifest_file.read_bytes()
     status = runtime.ai_runtime_status(layout)
     assert status["worker_update_required"] and not status["ready"]
-    assert "重新配置当前档位" in status["message"]
+    assert "现有 Python、依赖和已校验模型会复用" in status["message"]
     assert active_engine(layout) == engine and manifest_file.read_bytes() == before
     manifest["product_version"] = runtime.PRODUCT_VERSION
+    manifest["vlm_prompt_version"] = runtime.VLM_PROMPT_VERSION
+    manifest["worker_code_version"] = runtime.AI_WORKER_CODE_VERSION
     runtime.write_json(manifest_file, manifest)
     assert runtime.ai_runtime_status(layout)["ready"]
 
 
-def test_beta3_worker_remains_usable_for_desktop_only_update(tmp_path):
+def test_worker_update_checks_code_revision_even_with_same_product_version(tmp_path):
     engine = tmp_path / "engine"
     runtime.write_json(engine / runtime.ENGINE_MANIFEST, {"product_version": "0.9.0-beta.3"})
     constants = engine / "venv" / "Lib/site-packages/landscape_culler/constants.py"
     constants.parent.mkdir(parents=True)
     constants.write_text(f'VLM_PROMPT_VERSION = "{runtime.VLM_PROMPT_VERSION}"\n', encoding="utf-8")
+    assert runtime.ai_worker_needs_update(engine)
+    constants.write_text(f'VLM_PROMPT_VERSION = "{runtime.VLM_PROMPT_VERSION}"\n'
+                         f'AI_WORKER_CODE_VERSION = "{runtime.AI_WORKER_CODE_VERSION}"\n', encoding="utf-8")
     assert not runtime.ai_worker_needs_update(engine)
     constants.write_text('VLM_PROMPT_VERSION = "landscape-group-critic-v1"\n', encoding="utf-8")
     assert runtime.ai_worker_needs_update(engine)
+
+
+def test_worker_manifest_requires_progress_fix_even_if_review_prompt_matches(tmp_path):
+    engine = tmp_path / "engine"
+    manifest = {"product_version": runtime.PRODUCT_VERSION,
+                "vlm_prompt_version": runtime.VLM_PROMPT_VERSION}
+    runtime.write_json(engine / runtime.ENGINE_MANIFEST, manifest)
+    assert runtime.ai_worker_needs_update(engine)
+    manifest["worker_code_version"] = runtime.AI_WORKER_CODE_VERSION
+    runtime.write_json(engine / runtime.ENGINE_MANIFEST, manifest)
+    assert not runtime.ai_worker_needs_update(engine)
 
 
 def _successful_runner(
@@ -385,3 +402,148 @@ def test_verbose_install_output_is_not_throttled_by_cache_scans(
     )
 
     assert scans == 1
+
+
+def _reusable_engine(tmp_path, monkeypatch, *, old_worker=True):
+    from landscape_culler import model_resources
+
+    layout = _layout(tmp_path)
+    resources = _release_resources(tmp_path)
+    monkeypatch.setattr(runtime, "detect_nvidia", _gpu)
+    install_ai_profile(layout, "16gb", resources_root=resources,
+                       runner=_successful_runner([]))
+    engine = active_engine(layout)
+    site = runtime._worker_site_packages(engine)
+    package = site / "landscape_culler"
+    package.mkdir(parents=True)
+    (package / "old.py").write_bytes(b"original code")
+    metadata = site / "landscape_ai_culler-0.9.0.dist-info"
+    metadata.mkdir()
+    (metadata / "RECORD").write_bytes(b"original metadata")
+    dependency = site / "torch" / "keep.bin"
+    dependency.parent.mkdir()
+    dependency.write_bytes(b"existing dependency")
+    (layout.models / "keep.bin").write_bytes(b"already verified model")
+    validation = layout.state / "model-resources" / "validation.json"
+    validation.write_bytes(b"existing validation")
+    runtime.write_json(engine / runtime.SMOKE_RESULT, {
+        "status": "passed", "profile_id": "16gb", "checks": {"cloud_vision": False},
+        "completed_at": "previous full GPU test",
+    })
+    if old_worker:
+        manifest = runtime.read_json(engine / runtime.ENGINE_MANIFEST)
+        manifest["worker_code_version"] = "old-worker"
+        runtime.write_json(engine / runtime.ENGINE_MANIFEST, manifest)
+    monkeypatch.setattr(model_resources, "model_resources_status", lambda *_args: {
+        "cloud_vision": False,
+        "profiles": [{"id": "16gb", "ready": True, "configured": True}],
+    })
+    stable_paths = [runtime._engine_pointer(layout),
+                    layout.state / "model-resources" / "settings.json",
+                    engine / runtime.SMOKE_RESULT, runtime._venv_python(engine),
+                    dependency, layout.models / "keep.bin", validation]
+    snapshots = {path: path.read_bytes() for path in stable_paths}
+    return layout, resources, engine, snapshots
+
+
+def _refresh_runner(engine, commands, *, fail_at=None):
+    def run(command, environment, _cwd):
+        commands.append(command)
+        assert environment["HF_HUB_OFFLINE"] == "1"
+        assert environment["UV_OFFLINE"] == "1"
+        if command[1:3] == ["pip", "install"]:
+            assert "--offline" in command and "--no-deps" in command
+            assert command[command.index("--python") + 1] == str(runtime._venv_python(engine))
+            site = runtime._worker_site_packages(engine)
+            runtime._remove_worker_tree(site / "landscape_culler", engine)
+            runtime._remove_worker_tree(site / "landscape_ai_culler-0.9.0.dist-info", engine)
+            (site / "landscape_culler").mkdir()
+            (site / "landscape_culler" / "new.py").write_bytes(b"new worker")
+            (site / "landscape_ai_culler-0.9.0b4.dist-info").mkdir()
+            if fail_at == "install":
+                raise AiRuntimeError("partial wheel install failed")
+        else:
+            assert "--worker-only" in command
+            result = Path(command[command.index("--smoke-result") + 1])
+            runtime.write_json(result, {
+                "status": "failed" if fail_at == "check" else "passed",
+                "worker_code_version": runtime.AI_WORKER_CODE_VERSION,
+                "vlm_prompt_version": runtime.VLM_PROMPT_VERSION,
+            })
+    return run
+
+
+def test_worker_update_reuses_python_dependencies_models_and_validation(tmp_path, monkeypatch):
+    layout, resources, engine, snapshots = _reusable_engine(tmp_path, monkeypatch)
+    commands = []
+    # A small code update must not require space for a second complete AI environment.
+    monkeypatch.setattr(runtime.shutil, "disk_usage", lambda _path: type(
+        "Disk", (), {"free": 128 * 1024**2})())
+    status = install_ai_profile(layout, "16gb", resources_root=resources,
+                                runner=_refresh_runner(engine, commands))
+    assert status["ready"] and active_engine(layout) == engine
+    assert len(commands) == 2
+    assert list((layout.runtimes / "engines").iterdir()) == [engine]
+    assert not list(engine.glob(".worker-backup-*"))
+    for path, before in snapshots.items():
+        assert path.read_bytes() == before
+    assert not (runtime._worker_site_packages(engine) / "landscape_culler" / "old.py").exists()
+
+
+def test_unchanged_ai_contract_after_desktop_reinstall_does_nothing(tmp_path, monkeypatch):
+    layout, resources, engine, snapshots = _reusable_engine(tmp_path, monkeypatch, old_worker=False)
+    snapshots[engine / runtime.ENGINE_MANIFEST] = (engine / runtime.ENGINE_MANIFEST).read_bytes()
+    monkeypatch.setattr(runtime, "PRODUCT_VERSION", "new-desktop-version")
+    commands = []
+    status = install_ai_profile(layout, "16gb", resources_root=resources,
+                                runner=_successful_runner(commands))
+    assert status["ready"] and commands == []
+    for path, before in snapshots.items():
+        assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("fail_at", ["install", "check"])
+def test_failed_worker_only_update_restores_old_code_and_keeps_ai_state(tmp_path, monkeypatch, fail_at):
+    layout, resources, engine, snapshots = _reusable_engine(tmp_path, monkeypatch)
+    manifest_path = engine / runtime.ENGINE_MANIFEST
+    snapshots[manifest_path] = manifest_path.read_bytes()
+    check_path = engine / "worker-check.json"
+    check_path.write_bytes(b"previous worker check")
+    snapshots[check_path] = check_path.read_bytes()
+    with pytest.raises(AiRuntimeError):
+        install_ai_profile(layout, "16gb", resources_root=resources,
+                           runner=_refresh_runner(engine, [], fail_at=fail_at))
+    site = runtime._worker_site_packages(engine)
+    assert (site / "landscape_culler" / "old.py").read_bytes() == b"original code"
+    assert (site / "landscape_ai_culler-0.9.0.dist-info" / "RECORD").read_bytes() == b"original metadata"
+    assert not list(site.glob("landscape_ai_culler-0.9.0b4.dist-info"))
+    assert not list(engine.glob(".worker-backup-*"))
+    assert active_engine(layout) == engine
+    for path, before in snapshots.items():
+        assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("changed", ["dependencies", "models", "vision_mode", "profile"])
+def test_incompatible_ai_state_is_not_silently_reused(tmp_path, monkeypatch, changed):
+    from landscape_culler import model_resources
+    layout, resources, engine, snapshots = _reusable_engine(tmp_path, monkeypatch)
+    if changed == "dependencies":
+        (resources / "ai-requirements.lock").write_bytes(b"changed requirements")
+    elif changed == "models":
+        monkeypatch.setattr(model_resources, "model_resources_status", lambda *_args: {
+            "profiles": [{"id": "16gb", "ready": False, "configured": True}]})
+    elif changed == "vision_mode":
+        monkeypatch.setattr(model_resources, "model_resources_status", lambda *_args: {
+            "cloud_vision": True,
+            "profiles": [{"id": "16gb", "ready": True, "configured": True}]})
+    profile = "8gb" if changed == "profile" else "16gb"
+    assert runtime._reusable_worker_engine(layout, profile, resources) is None
+    # Insufficient room for a full install must fail before touching the old runtime.
+    monkeypatch.setattr(runtime.shutil, "disk_usage", lambda _path: type(
+        "Disk", (), {"free": 128 * 1024**2})())
+    commands = []
+    with pytest.raises(AiRuntimeError, match="空间"):
+        install_ai_profile(layout, profile, resources_root=resources, runner=_successful_runner(commands))
+    assert commands == [] and active_engine(layout) == engine
+    for path, before in snapshots.items():
+        assert path.read_bytes() == before

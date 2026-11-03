@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import threading
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,7 @@ from pydantic import ValidationError
 
 import landscape_culler.lightroom_bridge as bridge
 import landscape_culler.web as web_module
-from landscape_culler.content_root import ContentRootLayout, initialize_content_root
+from landscape_culler.content_root import ContentRootLayout, initialize_content_root, runtime_environment
 from landscape_culler.creative_lut import CreativeLutEngine
 from landscape_culler.lightroom_bridge import (
     LightroomTask,
@@ -139,16 +140,21 @@ def test_minimal_page_and_bootstrap(tmp_path: Path, monkeypatch) -> None:
     assert 'id="score-settings"' in page.text
     assert 'id="score-run"' in page.text
     assert 'id="selection-toolbar"' in page.text
-    assert 'id="develop-open"' in page.text
-    assert 'id="view-develop"' in page.text
+    assert 'id="selection-export-open"' in page.text
+    assert 'id="develop-open"' not in page.text
+    assert 'id="view-develop"' not in page.text
     assert 'id="view-export"' in page.text
-    assert 'id="export-action"' in page.text
-    assert 'data-color-mode="auto"' in page.text
-    assert 'data-color-mode="skip"' in page.text
-    assert 'data-style-scope="global"' in page.text
-    assert 'data-style-scope="group"' in page.text
-    for stage in ("review", "crop", "base", "style", "export"):
+    assert 'id="selection-output-root"' in page.text
+    assert 'data-color-mode="auto"' not in page.text
+    assert 'data-color-mode="skip"' not in page.text
+    assert 'data-style-scope="global"' not in page.text
+    assert 'data-style-scope="group"' not in page.text
+    for stage in ("review", "export"):
         assert f'data-workflow-stage="{stage}"' in page.text
+    for stage in ("crop", "base", "style"):
+        assert f'data-workflow-stage="{stage}"' not in page.text
+    assert 'id="collaborative-review-root"' in page.text
+    assert 'id="timelapse-root"' in page.text
     assert page.text.count('id="job-progress-track"') == 1
     assert 'id="job-progress-fill"' in page.text
     assert 'id="job-nodes"' in page.text
@@ -161,14 +167,10 @@ def test_minimal_page_and_bootstrap(tmp_path: Path, monkeypatch) -> None:
     assert 'id="lightroom-refresh"' in page.text
     assert 'id="lightroom-auto-configure"' in page.text
     assert 'id="lightroom-config-status"' in page.text
-    assert 'id="style-library-files"' in page.text
-    assert 'id="style-library-import"' in page.text
-    assert 'id="style-library-manage"' in page.text
-    assert 'id="style-library-manager-dialog"' in page.text
-    assert 'data-style-source-open="lightroom"' in page.text
-    assert 'data-style-source-open="user"' in page.text
-    assert 'id="style-library-source-toggle"' in page.text
-    assert 'id="style-library-source-rescan"' in page.text
+    assert 'id="style-library-files"' not in page.text
+    assert 'id="style-library-import"' not in page.text
+    assert 'id="style-library-manage"' not in page.text
+    assert 'id="style-library-manager-dialog"' not in page.text
     assert 'id="model-resource-open"' in page.text
     assert 'id="model-setup-gate"' in page.text
     assert 'id="project-model-setup-gate"' in page.text
@@ -188,10 +190,9 @@ def test_minimal_page_and_bootstrap(tmp_path: Path, monkeypatch) -> None:
     assert "data-new-group-index=" in script.text
     assert "function goWorkflowStage" in script.text
     assert "function renderExport" in script.text
-    assert "function recommendStyles" in script.text
+    assert "function recommendStyles" not in script.text
     assert "function submitProjectGroup" in script.text
-    assert "/api/style-library/import" in script.text
-    assert "data-style-library-toggle" in script.text
+    assert "/api/style-library/import" not in script.text
     assert "function requireModelSetupUi" in script.text
     assert "function retryFailedJob" in script.text
     assert "/retry`" in script.text
@@ -199,7 +200,7 @@ def test_minimal_page_and_bootstrap(tmp_path: Path, monkeypatch) -> None:
     assert "function exportSettingsFile" in script.text
     assert "function importSettingsFile" in script.text
     assert "/api/settings-transfer/import" in script.text
-    assert "data-style-recommend-group" in script.text
+    assert "data-style-recommend-group" not in script.text
     assert "saveXmpAtStage" not in script.text
     assert "function openXmpDialog" not in script.text
     assert "X: 照片盘当前不可用" not in script.text
@@ -729,7 +730,7 @@ def test_clean_content_root_can_build_non_ai_worker_environment(
     assert "PHOTO_AI_LEGACY_RUNTIME_ROOT" not in environment
 
 
-@pytest.mark.parametrize("kind", sorted(JobManager.AI_KINDS))
+@pytest.mark.parametrize("kind", sorted(JobManager.MODEL_KINDS))
 def test_ai_worker_environment_still_requires_models(tmp_path, monkeypatch, kind):
     layout = initialize_content_root(
         tmp_path / "content", apply_environment=False, persist_registry=False,
@@ -1302,6 +1303,40 @@ def test_develop_worker_cancellation_is_reported_and_input_snapshot_is_removed(
     progress = read_json(data_dir / "runs" / RUN_ID / "develop-progress.json")
     assert progress["status"] == "cancelled"
     assert not list((data_dir / "web" / "jobs").glob("develop-input-*.json"))
+
+
+def test_restart_reads_durable_crop_progress_without_rewriting_legacy_project(tmp_path, monkeypatch):
+    from landscape_culler import develop
+    client, data_dir, _raw = _client(tmp_path, monkeypatch)
+    run_dir = data_dir / "runs" / RUN_ID
+    payload = web_module._apply_review(read_json(run_dir / "results.json"), web_module._review(run_dir / "results.json"))
+    develop.create_develop_plan(payload, run_dir, 0)
+    before = {path: path.read_bytes() for path in [run_dir / "results.json", run_dir / "develop.json", *run_dir.glob("develop-checkpoints/*/*.json")]}
+    write_json(run_dir / "develop-progress.json", {"status": "running", "completed": 0, "total": 1})
+    client.app.state.jobs.jobs["old-crop"] = {
+        "id": "old-crop", "kind": "develop", "status": "interrupted", "created_at": "2026-10-09",
+        "context": {"run_id": RUN_ID}, "retry_spec": {},
+    }
+    monkeypatch.setattr(client.app.state.jobs, "list", lambda *_a, **_k: pytest.fail("progress poll must not enrich job history"))
+    progress = client.get(f"/api/runs/{RUN_ID}/develop/progress").json()
+    assert progress["status"] == "interrupted" and progress["completed"] == 1
+    assert progress["overall_percent"] == 100
+    assert all(path.read_bytes() == content for path, content in before.items())
+
+
+def test_failed_develop_start_keeps_saved_completion_count(tmp_path, monkeypatch):
+    from landscape_culler import develop
+    client, data_dir, _raw = _client(tmp_path, monkeypatch)
+    token = client.get("/api/bootstrap").json()["token"]
+    run_dir = data_dir / "runs" / RUN_ID
+    develop.create_develop_plan(read_json(run_dir / "results.json"), run_dir, 0)
+    def fail(*_args):
+        raise RuntimeError("other task is running")
+    monkeypatch.setattr(client.app.state.jobs, "start", fail)
+    response = client.post(f"/api/runs/{RUN_ID}/develop", json={"base_revision": 0},
+                           headers={"X-Photo-AI-Token": token})
+    assert response.status_code == 409
+    assert read_json(run_dir / "develop-progress.json")["completed"] == 1
 
 
 def test_develop_skip_crop_options_and_plan_identity_are_persisted(
@@ -3565,6 +3600,48 @@ def test_project_attaches_dry_run_and_commit_to_source_version(
     assert version["transactions"][0]["kind"] == "commit"
     assert version["transactions"][0]["remaining_count"] == 1
     assert detail["orphan_transactions"] == []
+
+
+@pytest.mark.parametrize("installed", [False, True])
+@pytest.mark.parametrize("record_status", ["created", "failed_removed"])
+def test_bootstrap_and_project_reopen_after_xmp_transaction(tmp_path, monkeypatch, installed, record_status):
+    client, data_dir, raw = _client(tmp_path, monkeypatch)
+    run_dir = data_dir / "runs" / RUN_ID
+    if installed:
+        layout = initialize_content_root(tmp_path / "content", apply_environment=False, persist_registry=False)
+        shutil.copytree(run_dir, layout.projects / RUN_ID)
+        for key, value in runtime_environment(layout).items():
+            monkeypatch.setenv(key, value)
+        data_dir = layout.state
+        run_dir = layout.projects / RUN_ID
+        client = TestClient(create_app(data_dir=data_dir, content_root=layout.root,
+                                       project_root=Path(__file__).parents[1]))
+    sidecar = raw.with_suffix(".xmp")
+    if record_status == "created":
+        sidecar.write_text("test sidecar", encoding="utf-8")
+    manifest = run_dir / "xmp-commit-manifest-reopen.json"
+    write_json(manifest, {"schema_version": 2, "commit": True,
+        "source_results": str(run_dir / "selection-export-test.json"),
+        "created_at": "2026-10-31T12:00:00+00:00", "skipped_count": 0,
+        "records": [{"status": record_status, "raw_path": str(raw), "xmp_path": str(sidecar)}]})
+    before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in run_dir.iterdir() if p.is_file()}
+    expected_id = hashlib.sha256(f"runs/{RUN_ID}/{manifest.name}".encode()).hexdigest()[:20]
+    for _ in range(2):
+        with client:
+            bootstrap = client.get("/api/bootstrap")
+            assert bootstrap.status_code == 200, bootstrap.text
+            transactions = client.get("/api/transactions").json()
+            assert transactions[0]["id"] == expected_id
+            assert transactions[0]["rollbackable"] == (record_status == "created")
+            project = client.get("/api/projects").json()[0]
+            detail = client.get(f"/api/projects/{project['project_id']}")
+            assert detail.status_code == 200
+            assert detail.json()["versions"][0]["transactions"][0]["id"] == expected_id
+            assert client.get(f"/api/runs/{RUN_ID}/selection-export").status_code == 200
+        client = TestClient(create_app(data_dir=data_dir, project_root=Path(__file__).parents[1],
+                                      **({"content_root": layout.root} if installed else {})))
+    assert all((p.read_bytes(), p.stat().st_mtime_ns) == value for p, value in before.items())
+    assert raw.read_bytes() == b"raw"
 
 
 def test_project_keeps_unmatched_commit_as_orphan(tmp_path: Path, monkeypatch) -> None:

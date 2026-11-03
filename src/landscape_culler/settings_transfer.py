@@ -93,7 +93,13 @@ def _normal_ui(value: Any, fallback: Mapping[str, Any]) -> dict[str, Any]:
     theme = source.get("theme", fallback.get("theme", "dark"))
     if theme != "dark":
         raise SettingsTransferError("首版界面主题仅支持 dark。")
-    return {"theme": theme}
+    result = {"theme": theme}
+    size = source.get("thumbnail_size", fallback.get("thumbnail_size"))
+    if size is not None:
+        if isinstance(size, bool) or not isinstance(size, int) or not 160 <= size <= 420 or size % 10:
+            raise SettingsTransferError("缩略图大小必须是 160–420 之间、以 10 为步长的整数。")
+        result["thumbnail_size"] = size
+    return result
 
 
 def _normal_workflow(value: Any, fallback: Mapping[str, Any]) -> dict[str, Any]:

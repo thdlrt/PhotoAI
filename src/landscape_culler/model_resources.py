@@ -190,7 +190,7 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
     },
     "qrealign-mini": {
         "label": "Q-ReAlign Mini 0.8B",
-        "purpose": "审美评分与风格复评",
+        "purpose": "照片审美与技术质量评分",
         "provider": "huggingface",
         "repo_id": "q-future/Q-ReAlign-Mini-0.8B",
         "revision": "fe1f45a7574c9e9d908875af9f7e90cb946aa19f",
@@ -303,11 +303,12 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
 COMMON_MODEL_IDS = [
     "dinov2-base",
     "qrealign-mini",
-    "grounding-dino-tiny",
-    "sam2-hiera-tiny",
-    "segformer-b2",
-    "clip-vit-b32",
 ]
+# Retain descriptors and on-disk resources for older installations, but do not
+# download or require removed crop/colour features for a culling profile.
+LEGACY_OPTIONAL_MODEL_IDS = frozenset({
+    "grounding-dino-tiny", "sam2-hiera-tiny", "segformer-b2", "clip-vit-b32",
+})
 PROFILE_SPECS: dict[ProfileId, dict[str, Any]] = {
     "8gb": {
         "label": "8GB 显存",

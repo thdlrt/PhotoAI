@@ -643,6 +643,7 @@ const selectedStylePlan = {
 resetStyleActions(selectedStylePlan);
 let previewJobNumber = 0;
 apiHandler = (path, options) => {
+  if (path === "/api/style-runtime") return {ready:true,managed:true};
   if (path === "/api/runs/run-1/style-preview" && options.method === "POST") {
     previewJobNumber += 1;
     return {
@@ -699,6 +700,7 @@ assert.deepEqual(clone(previewRequest.options.body), {
 
 resetStyleActions(globalStylePlan);
 apiHandler = (path, options) => {
+  if (path === "/api/style-runtime") return {ready:true,managed:true};
   if (path === "/api/runs/run-1/style-preview" && options.method === "POST") {
     return { id: "job-global-preview", kind: "style_preview", title: "统一外观预览", status: "queued", context: { run_id: "run-1" } };
   }
@@ -728,6 +730,7 @@ assert.deepEqual(clone(requests.at(-1).options.body), { base_revision: 11, statu
 resetStyleActions(globalStylePlan);
 run("state.styleScope = 'global'");
 apiHandler = (path, options) => {
+  if (path === "/api/style-runtime") return {ready:true,managed:true};
   if (path === "/api/runs/run-1/style-preview" && options.method === "POST") return { id: "job-global-adopt", kind: "style_preview", status: "queued", context: { run_id: "run-1" } };
   throw new Error(`unexpected API request: ${options.method || "GET"} ${path}`);
 };

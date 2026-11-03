@@ -15,6 +15,7 @@ from PIL import Image
 from .constants import MODEL_ID, VLM_MODEL_ID
 from .features import TECHNICAL_NAMES, FeatureExtractor
 from .group_critic import OllamaGroupCritic
+from .vision_provider import model_label
 from .preview import load_preview
 from .style_library import managed_style_root
 from .util import cache_key, read_json, write_json
@@ -265,12 +266,12 @@ def _scene_schema() -> dict[str, Any]:
 
 def _validate_scene(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict) or set(payload) != _SCENE_FIELDS:
-        raise ValueError("Qwen3-VL 场景字段不完整。")
+        raise ValueError("视觉模型场景字段不完整。")
     result: dict[str, Any] = {}
     for key in ("scene", "weather", "time_of_day", "summary"):
         value = payload[key]
         if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"Qwen3-VL {key} 不能为空。")
+            raise ValueError(f"视觉模型 {key} 不能为空。")
         result[key] = value.strip()[:240]
     for key in (
         "subjects",
@@ -281,13 +282,13 @@ def _validate_scene(payload: Any) -> dict[str, Any]:
     ):
         value = payload[key]
         if not isinstance(value, list) or len(value) > 8:
-            raise ValueError(f"Qwen3-VL {key} 必须是短列表。")
+            raise ValueError(f"视觉模型 {key} 必须是短列表。")
         if not all(isinstance(item, str) for item in value):
-            raise ValueError(f"Qwen3-VL {key} 包含无效值。")
+            raise ValueError(f"视觉模型 {key} 包含无效值。")
         result[key] = [item.strip()[:80] for item in value if item.strip()]
     confidence = float(payload["confidence"])
     if not 0.0 <= confidence <= 1.0:
-        raise ValueError("Qwen3-VL confidence 超出 0–1。")
+        raise ValueError("视觉模型 confidence 超出 0–1。")
     result["confidence"] = confidence
     return result
 
@@ -344,7 +345,7 @@ class QwenStyleSceneAnalyzer:
                 seen.add(key)
                 unique.append(path)
         if not unique:
-            raise ValueError("Qwen3-VL 没有收到代表图。")
+            raise ValueError("视觉模型没有收到代表图。")
         unique = unique[:3]
         cached_path = self._cache_path(unique)
         if cached_path.is_file():
@@ -402,7 +403,10 @@ class QwenStyleSceneAnalyzer:
                 urllib.error.URLError,
             ) as exc:
                 last_error = exc
-        raise RuntimeError(f"Qwen3-VL 连续两次未返回有效风格场景：{last_error}")
+                if getattr(exc, "finish_reason", None) == "length":
+                    payload["options"] = {**payload["options"],
+                        "num_predict": min(16384, payload["options"]["num_predict"] * 2)}
+        raise RuntimeError(f"{model_label(self.data_dir)} 连续两次未返回有效风格场景：{last_error}")
 
     def release(self) -> None:
         if self._ready:
@@ -846,7 +850,7 @@ def run_style_ai_cascade(
                     fallback="existing_scene_metadata" if fallback else "none",
                 )
             if progress:
-                progress("scene", "Qwen3-VL 分析场景与禁用效果", index, len(ordered_ids))
+                progress("scene", f"{getattr(analyzer, 'model', '视觉模型')} 分析场景与禁用效果", index, len(ordered_ids))
     finally:
         analyzer.release()
 

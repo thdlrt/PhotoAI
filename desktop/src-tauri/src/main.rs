@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 #[cfg(not(target_os = "windows"))]
-compile_error!("照片选片桌面版首发仅支持 Windows x64。");
+compile_error!("摄影后期工具箱桌面版首发仅支持 Windows x64。");
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -28,7 +28,8 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use url::Host;
 use uuid::Uuid;
 use windows_sys::Win32::Storage::FileSystem::{
-    GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW, GetVolumePathNameW,
+    GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
+    GetVolumePathNameW, MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
 };
 use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
 use winreg::{enums::HKEY_CURRENT_USER, RegKey};
@@ -61,7 +62,11 @@ const CONTENT_DIRECTORIES: &[&str] = &[
 ];
 
 #[tauri::command]
-fn exit_for_update(window: WebviewWindow, app: AppHandle, state: State<'_, DesktopState>) -> Result<(), String> {
+fn exit_for_update(
+    window: WebviewWindow,
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<(), String> {
     validate_service_window_origin(&window, &state)?;
     app.exit(0);
     Ok(())
@@ -150,6 +155,16 @@ struct ContentMarker {
     layout_version: u32,
     root_id: String,
     created_utc: String,
+}
+
+// Kept outside the program payload and bound to the portable data identity.
+// Reinstallation must not silently create a new, empty library.
+#[derive(Serialize, Deserialize)]
+struct ContentRootRecord {
+    application: String,
+    version: u32,
+    path: PathBuf,
+    root_id: String,
 }
 
 #[tauri::command]
@@ -340,18 +355,12 @@ fn main() {
             app.deep_link().register_all()?;
 
             cleanup_stale_bootstrap_roots();
-            let stored_root = load_content_root();
-            let (root, configured, bootstrap_root) = match stored_root {
-                Some(path) if validate_existing_content_root(&path).is_ok() => (path, true, None),
-                Some(_) => match pick_content_root(true)? {
-                    Some(path) => (path, true, None),
-                    None => {
-                        app.handle().exit(0);
-                        return Ok(());
-                    }
-                },
-                None => (default_content_root()?, true, None),
+            let Some(root) = select_startup_content_root()? else {
+                app.handle().exit(0);
+                return Ok(());
             };
+            let configured = true;
+            let bootstrap_root = None;
 
             initialize_content_root(&root)?;
             if configured {
@@ -378,7 +387,7 @@ fn main() {
 
             let window =
                 WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-                    .title("照片选片")
+                    .title("摄影后期工具箱")
                     .inner_size(1280.0, 820.0)
                     .min_inner_size(900.0, 620.0)
                     .visible(false)
@@ -428,9 +437,16 @@ fn run_desktop_self_test(resource_root: &Path) -> Result<(), String> {
         .join("core")
         .join("worker")
         .join("PhotoAI.CoreWorker.exe");
+    let cli = resource_root
+        .join("core")
+        .join("service")
+        .join("PhotoToolbox.CLI.exe");
     let required = vec![
+        resource_root.join("tools").join("framepick").join("FramePick.exe"),
+        resource_root.join("tools").join("framepick").join("LICENSE"),
         service.clone(),
         worker.clone(),
+        cli.clone(),
         resource_root.join("tools").join("uv.exe"),
         resource_root.join("manifests").join("ai-requirements.lock"),
         resource_root.join("manifests").join("model-manifest.json"),
@@ -455,6 +471,25 @@ fn run_desktop_self_test(resource_root: &Path) -> Result<(), String> {
     }
     run_sidecar_self_test(&service, SERVICE_HANDSHAKE_PREFIX.trim_end())?;
     run_sidecar_self_test(&worker, "PHOTO_AI_WORKER/1")?;
+    run_cli_self_test(&cli)?;
+    Ok(())
+}
+
+fn run_cli_self_test(executable: &Path) -> Result<(), String> {
+    let output = Command::new(executable)
+        .args(["schema", "--command", "review.decide"])
+        .current_dir(executable.parent().ok_or("CLI 目录无效。")?)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| format!("无法运行摄影工具箱 CLI 自检：{error}"))?;
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| "CLI 自检未返回单个有效 JSON 对象。")?;
+    if !output.status.success()
+        || payload.get("protocol").and_then(|value| value.as_str()) != Some("photography-toolbox/1")
+        || payload.get("ok").and_then(|value| value.as_bool()) != Some(true)
+    {
+        return Err("摄影工具箱 CLI 协议自检失败。".into());
+    }
     Ok(())
 }
 
@@ -1011,24 +1046,224 @@ fn validate_service_window_origin(
     Ok(())
 }
 
-fn load_content_root() -> Option<PathBuf> {
+fn load_content_root() -> Result<Option<PathBuf>, String> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let key = hkcu.open_subkey(REGISTRY_KEY).ok()?;
-    let value: String = key.get_value("ContentRoot").ok()?;
+    let key = match hkcu.open_subkey(REGISTRY_KEY) {
+        Ok(key) => key,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("无法读取数据目录记录：{error}")),
+    };
+    let value: String = match key.get_value("ContentRoot") {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("无法读取数据目录指针：{error}")),
+    };
     let trimmed = value.trim();
-    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+    Ok((!trimmed.is_empty()).then(|| expand_root_pointer(trimmed)))
+}
+
+fn expand_root_pointer(value: &str) -> PathBuf {
+    let mut expanded = String::new();
+    let mut rest = value;
+    while let Some(start) = rest.find('%') {
+        expanded.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let Some(end) = rest[1..].find('%').map(|index| index + 1) else {
+            break;
+        };
+        let variable = &rest[1..end];
+        expanded.push_str(&std::env::var(variable).unwrap_or_else(|_| rest[..=end].into()));
+        rest = &rest[end + 1..];
+    }
+    expanded.push_str(rest);
+    normalize_verbatim_disk_path(PathBuf::from(expanded))
+}
+
+fn content_root_record_path() -> Result<PathBuf, String> {
+    std::env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .map(|base| {
+            PathBuf::from(base)
+                .join("com.photoai.culler")
+                .join("content-root.json")
+        })
+        .ok_or_else(|| "无法定位用户数据目录恢复记录。".into())
+}
+
+fn read_root_record(path: &Path) -> Result<Option<ContentRootRecord>, String> {
+    reject_reparse_components(path)?;
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("无法读取数据目录恢复记录：{error}")),
+    };
+    let record: ContentRootRecord =
+        serde_json::from_slice(&bytes).map_err(|_| "数据目录恢复记录已损坏。")?;
+    if record.application != "PhotoAI"
+        || record.version != 1
+        || !record.path.is_absolute()
+        || Uuid::parse_str(&record.root_id).is_err()
+    {
+        return Err("数据目录恢复记录无效。".into());
+    }
+    Ok(Some(record))
+}
+
+fn resolve_saved_content_root(
+    registered: Option<&Path>,
+    record: Option<&ContentRootRecord>,
+) -> Result<Option<PathBuf>, String> {
+    let mut errors = Vec::new();
+    if let Some(path) = registered {
+        match validate_existing_content_root(path) {
+            Ok(()) => {
+                if let Some(record) = record.filter(|record| paths_equal(&record.path, path)) {
+                    validate_record_identity(record)?;
+                }
+                return Ok(Some(canonical_or_original(path)));
+            }
+            Err(error) => errors.push(format!("原目录 {}：{error}", path.display())),
+        }
+    }
+    if let Some(record) = record {
+        match validate_existing_content_root(&record.path)
+            .and_then(|_| validate_record_identity(record))
+        {
+            Ok(()) => return Ok(Some(canonical_or_original(&record.path))),
+            Err(error) => errors.push(format!("恢复目录 {}：{error}", record.path.display())),
+        }
+    }
+    if errors.is_empty() {
+        Ok(None)
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+fn paths_equal(first: &Path, second: &Path) -> bool {
+    path_is_prefix(first, second) && path_is_prefix(second, first)
+}
+
+fn validate_record_identity(record: &ContentRootRecord) -> Result<(), String> {
+    let bytes = fs::read(record.path.join("marker.json")).map_err(|error| error.to_string())?;
+    let marker: ContentMarker =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if marker.root_id != record.root_id {
+        return Err("数据目录标识发生变化，已停止自动连接以避免打开错误的工程库。".into());
+    }
+    Ok(())
+}
+
+fn load_saved_content_root() -> Result<Option<PathBuf>, String> {
+    let registered = load_content_root();
+    let record = content_root_record_path().and_then(|path| read_root_record(&path));
+    // A valid registry selection can repair a missing/corrupt secondary record.
+    // When neither record can be read, never fall back to a fresh data directory.
+    let resolved = resolve_saved_content_root(
+        registered.as_ref().ok().and_then(|value| value.as_deref()),
+        record.as_ref().ok().and_then(|value| value.as_ref()),
+    )?;
+    if resolved.is_some() {
+        return Ok(resolved);
+    }
+    registered?;
+    record?;
+    Ok(None)
+}
+
+fn select_startup_content_root() -> Result<Option<PathBuf>, String> {
+    loop {
+        match load_saved_content_root() {
+            Ok(Some(path)) => return Ok(Some(path)),
+            Ok(None) => return default_content_root().map(Some),
+            Err(error) => {
+                let action = rfd::MessageDialog::new()
+                    .set_title("暂时无法连接原数据目录")
+                    .set_description(format!(
+                        "{error}\n\n接回数据盘或恢复目录访问权限后，可重试原目录。"
+                    ))
+                    .set_level(rfd::MessageLevel::Warning)
+                    .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
+                        "重试原目录".into(),
+                        "选择原数据目录".into(),
+                        "退出".into(),
+                    ))
+                    .show();
+                match action {
+                    rfd::MessageDialogResult::Yes => continue,
+                    rfd::MessageDialogResult::No => return pick_content_root(true),
+                    rfd::MessageDialogResult::Custom(label) if label == "重试原目录" => {
+                        continue
+                    }
+                    rfd::MessageDialogResult::Custom(label) if label == "选择原数据目录" => {
+                        return pick_content_root(true)
+                    }
+                    _ => return Ok(None),
+                }
+            }
+        }
+    }
+}
+
+fn write_root_record(destination: &Path, root: &Path) -> Result<(), String> {
+    reject_reparse_components(destination)?;
+    let marker: ContentMarker = serde_json::from_slice(
+        &fs::read(root.join("marker.json")).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let record = ContentRootRecord {
+        application: "PhotoAI".into(),
+        version: 1,
+        path: canonical_or_original(root),
+        root_id: marker.root_id,
+    };
+    let parent = destination.parent().ok_or("恢复记录路径无效。")?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary = parent.join(format!(".content-root-{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let bytes = serde_json::to_vec_pretty(&record).map_err(|error| error.to_string())?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| error.to_string())?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|error| error.to_string())?;
+        drop(file);
+        let ok = unsafe {
+            MoveFileExW(
+                wide_null(temporary.as_os_str()).as_ptr(),
+                wide_null(destination.as_os_str()).as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(())
+    })();
+    let _ = fs::remove_file(&temporary);
+    result
 }
 
 fn save_content_root(path: &Path) -> Result<(), String> {
+    validate_existing_content_root(path)?;
+    let backup =
+        content_root_record_path().and_then(|destination| write_root_record(&destination, path));
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let (key, _) = hkcu
-        .create_subkey(REGISTRY_KEY)
-        .map_err(|error| format!("无法保存数据目录：{error}"))?;
-    key.set_value("ContentRoot", &path.to_string_lossy().as_ref())
-        .map_err(|error| format!("无法保存数据目录：{error}"))?;
-    key.set_value("InstallVersion", &env!("CARGO_PKG_VERSION"))
-        .map_err(|error| format!("无法保存安装版本：{error}"))?;
-    Ok(())
+    let registry: Result<(), String> = (|| {
+        let (key, _) = hkcu
+            .create_subkey(REGISTRY_KEY)
+            .map_err(|error| format!("无法保存数据目录：{error}"))?;
+        key.set_value("ContentRoot", &path.to_string_lossy().as_ref())
+            .map_err(|error| format!("无法保存数据目录：{error}"))?;
+        key.set_value("InstallVersion", &env!("CARGO_PKG_VERSION"))
+            .map_err(|error| format!("无法保存安装版本：{error}"))?;
+        Ok(())
+    })();
+    // One durable pointer is enough to start. A later launch repairs the other.
+    registry.or(backup)
 }
 
 fn save_pending_model_profile(profile_id: &str) -> Result<(), String> {
@@ -1061,11 +1296,11 @@ fn pick_content_root(reconnect: bool) -> Result<Option<PathBuf>, String> {
     loop {
         let title = match recommendation.as_ref() {
             Some(path) if reconnect => {
-                format!("重新连接照片选片数据目录（推荐位置：{}）", path.display())
+                format!("重新连接摄影后期工具箱数据目录（推荐位置：{}）", path.display())
             }
-            Some(path) => format!("选择照片选片数据目录（推荐位置：{}）", path.display()),
-            None if reconnect => "重新连接照片选片数据目录".to_string(),
-            None => "选择照片选片数据目录".to_string(),
+            Some(path) => format!("选择摄影后期工具箱数据目录（推荐位置：{}）", path.display()),
+            None if reconnect => "重新连接摄影后期工具箱数据目录".to_string(),
+            None => "选择摄影后期工具箱数据目录".to_string(),
         };
         let mut dialog = rfd::FileDialog::new().set_title(&title);
         if let Some(parent) = recommendation.as_deref().and_then(Path::parent) {
@@ -1106,12 +1341,13 @@ fn initialize_content_root(path: &Path) -> Result<(), String> {
         let mut entries =
             fs::read_dir(&canonical).map_err(|error| format!("无法检查数据目录：{error}"))?;
         if entries.next().is_some() {
-            return Err("请选择一个空目录，或选择原有的照片选片数据目录。".into());
+            return Err("请选择一个空目录，或选择原有的摄影后期工具箱／照片选片数据目录。".into());
         }
         write_marker(&canonical)?;
     }
 
     for name in CONTENT_DIRECTORIES {
+        reject_reparse_components(&canonical.join(name))?;
         fs::create_dir_all(canonical.join(name))
             .map_err(|error| format!("无法创建 {name} 目录：{error}"))?;
     }
@@ -1130,6 +1366,13 @@ fn validate_existing_content_root(path: &Path) -> Result<(), String> {
     validate_local_filesystem(&canonical)?;
     validate_not_install_directory(&canonical)?;
     validate_marker(&canonical.join("marker.json"))?;
+    for name in CONTENT_DIRECTORIES {
+        let directory = canonical.join(name);
+        reject_reparse_components(&directory)?;
+        if directory.exists() && !directory.is_dir() {
+            return Err(format!("数据目录结构无效：{name}"));
+        }
+    }
     verify_writable(&canonical)
 }
 
@@ -1258,7 +1501,11 @@ fn volume_root(path: &Path) -> Result<PathBuf, String> {
 }
 
 fn verify_writable(path: &Path) -> Result<(), String> {
-    let probe = path.join(format!(".photoai-write-test-{}", std::process::id()));
+    let probe = path.join(format!(
+        ".photoai-write-test-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
     let result = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1272,7 +1519,8 @@ fn verify_writable(path: &Path) -> Result<(), String> {
 }
 
 fn validate_marker(path: &Path) -> Result<(), String> {
-    let bytes = fs::read(path).map_err(|_| "所选目录不是有效的照片选片数据目录。")?;
+    reject_reparse_components(path)?;
+    let bytes = fs::read(path).map_err(|_| "所选目录不是有效的摄影后期工具箱数据目录。")?;
     let marker: ContentMarker =
         serde_json::from_slice(&bytes).map_err(|_| "数据目录标记已损坏。")?;
     if marker.application != "PhotoAI"
@@ -1477,6 +1725,139 @@ fn normalize_verbatim_disk_path(path: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RootFixture(PathBuf);
+    impl RootFixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("PhotoAI-root-QA-{}", Uuid::new_v4()));
+            initialize_content_root(&path).expect("isolated owned root");
+            Self(path)
+        }
+        fn record(&self) -> ContentRootRecord {
+            let marker: ContentMarker =
+                serde_json::from_slice(&fs::read(self.0.join("marker.json")).unwrap()).unwrap();
+            ContentRootRecord {
+                application: "PhotoAI".into(),
+                version: 1,
+                path: self.0.clone(),
+                root_id: marker.root_id,
+            }
+        }
+    }
+    impl Drop for RootFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn recovers_same_library_when_registry_is_missing_or_stale() {
+        let root = RootFixture::new();
+        let record = root.record();
+        let stale = root.0.join("old-install").join("data");
+        let expected = Some(canonical_or_original(&root.0));
+        assert_eq!(
+            resolve_saved_content_root(None, Some(&record)).unwrap(),
+            expected
+        );
+        assert_eq!(
+            resolve_saved_content_root(Some(&stale), Some(&record)).unwrap(),
+            expected
+        );
+        assert!(!stale.exists());
+        assert_eq!(resolve_saved_content_root(None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn explicit_valid_registry_selection_wins_over_old_recovery_record() {
+        let old = RootFixture::new();
+        let selected = RootFixture::new();
+        assert_eq!(
+            resolve_saved_content_root(Some(&selected.0), Some(&old.record())).unwrap(),
+            Some(canonical_or_original(&selected.0))
+        );
+    }
+
+    #[test]
+    fn unavailable_saved_library_never_becomes_a_new_empty_directory() {
+        let root = RootFixture::new();
+        let mut record = root.record();
+        record.path = root.0.join("disconnected");
+        assert!(resolve_saved_content_root(Some(&record.path), Some(&record)).is_err());
+        assert!(!record.path.exists());
+    }
+
+    #[test]
+    fn rejects_changed_identity_even_with_a_valid_marker_at_the_same_path() {
+        let root = RootFixture::new();
+        let mut record = root.record();
+        record.root_id = Uuid::new_v4().to_string();
+        assert!(resolve_saved_content_root(Some(&root.0), Some(&record)).is_err());
+        assert!(resolve_saved_content_root(None, Some(&record)).is_err());
+    }
+
+    #[test]
+    fn reopen_repairs_missing_layout_without_rewriting_user_data() {
+        let root = RootFixture::new();
+        let project = root.0.join("projects").join("old-project.json");
+        fs::write(&project, b"manual grouping and stars").unwrap();
+        let marker = fs::read(root.0.join("marker.json")).unwrap();
+        fs::remove_dir(root.0.join("backups")).unwrap();
+        fs::remove_dir(root.0.join("downloads")).unwrap();
+        let path = resolve_saved_content_root(Some(&root.0), Some(&root.record()))
+            .unwrap()
+            .unwrap();
+        initialize_content_root(&path).unwrap();
+        assert!(root.0.join("backups").is_dir());
+        assert_eq!(fs::read(project).unwrap(), b"manual grouping and stars");
+        assert_eq!(fs::read(root.0.join("marker.json")).unwrap(), marker);
+    }
+
+    #[test]
+    fn recovery_record_is_atomic_and_tracks_library_identity() {
+        let root = RootFixture::new();
+        let destination = root.0.join("qa-recovery").join("content-root.json");
+        write_root_record(&destination, &root.0).unwrap();
+        let saved = read_root_record(&destination).unwrap().unwrap();
+        assert_eq!(saved.root_id, root.record().root_id);
+        assert_eq!(saved.path, canonical_or_original(&root.0));
+        write_root_record(&destination, &root.0).unwrap();
+        assert_eq!(
+            fs::read_dir(destination.parent().unwrap()).unwrap().count(),
+            1
+        );
+        fs::write(&destination, b"{}").unwrap();
+        assert!(read_root_record(&destination).is_err());
+    }
+
+    #[test]
+    fn stale_write_probe_from_reused_pid_does_not_force_reconnect() {
+        let root = RootFixture::new();
+        let stale = root
+            .0
+            .join(format!(".photoai-write-test-{}", std::process::id()));
+        fs::write(&stale, b"old probe").unwrap();
+        assert!(validate_existing_content_root(&root.0).is_ok());
+        assert_eq!(fs::read(&stale).unwrap(), b"old probe");
+    }
+
+    #[test]
+    fn expands_existing_windows_registry_pointer_variables() {
+        let base = std::env::var("LOCALAPPDATA").unwrap();
+        assert_eq!(
+            expand_root_pointer(r"%LOCALAPPDATA%\照片选片\data"),
+            PathBuf::from(base).join("照片选片").join("data")
+        );
+    }
+
+    #[test]
+    fn rejects_owned_directory_replaced_by_a_file_before_mutation() {
+        let root = RootFixture::new();
+        fs::remove_dir(root.0.join("models")).unwrap();
+        fs::write(root.0.join("models"), b"user file").unwrap();
+        assert!(resolve_saved_content_root(Some(&root.0), Some(&root.record())).is_err());
+        assert_eq!(fs::read(root.0.join("models")).unwrap(), b"user file");
+    }
 
     #[test]
     fn accepts_exact_loopback_handshake() {

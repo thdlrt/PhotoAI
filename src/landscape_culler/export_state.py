@@ -28,6 +28,39 @@ def export_spec_path(data_dir: Path, export_spec_id: str) -> Path:
     return export_specs_root(data_dir) / f"{export_spec_id}.json"
 
 
+def latest_export_for_run(data_dir: Path, run_id: str) -> dict[str, Any] | None:
+    """Find the newest valid frozen export without creating or rewriting state."""
+    latest = None
+    latest_order = None
+    for path in export_specs_root(data_dir).glob("export-*.json"):
+        if not _EXPORT_SPEC_ID.fullmatch(path.stem):
+            continue
+        try:
+            spec = read_json(path)
+            if not isinstance(spec, dict) or spec.get("run_id") != run_id or spec.get("export_spec_id") != path.stem:
+                continue
+            if not isinstance(spec.get("created_at"), str):
+                continue
+            if spec.get("schema_version") != EXPORT_SPEC_SCHEMA_VERSION or not isinstance(spec.get("targets"), dict):
+                continue
+            items = spec.get("items")
+            executions = spec.get("executions", [])
+            if not isinstance(items, list) or not all(isinstance(item, dict) and isinstance(item.get("targets"), dict)
+                and all(isinstance(value, dict) for value in item["targets"].values()) for item in items):
+                continue
+            if not isinstance(executions, list) or not all(isinstance(item, dict) for item in executions):
+                continue
+            created = datetime.fromisoformat(spec["created_at"])
+            created = created.replace(tzinfo=UTC) if created.tzinfo is None else created.astimezone(UTC)
+            order = (created, path.stem)
+            if latest_order is None or order > latest_order:
+                latest = spec
+                latest_order = order
+        except (OSError, ValueError, TypeError):
+            continue
+    return latest
+
+
 def export_attempt_root(
     data_dir: Path, export_spec_id: str, attempt_id: str
 ) -> Path:

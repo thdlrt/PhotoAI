@@ -1,9 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""Build the two lightweight console-enabled PhotoAI sidecars.
+"""Build lightweight Service, CLI and CoreWorker executables.
 
-This spec is deliberately a *core* build. AI/image packages are installed
-later into the user-selected CONTENT_ROOT and must never leak into either
-PyInstaller onedir tree.
+AI packages stay in the managed environment. The Service also needs Pillow
+and NumPy for image review and timelapse frames; CoreWorker remains dependency-light.
 """
 
 from pathlib import Path
@@ -73,7 +72,7 @@ core_excludes = [
 ]
 
 
-def core_analysis(entrypoint, extra_hiddenimports=None):
+def core_analysis(entrypoint, extra_hiddenimports=None, preview_dependencies=False):
     return Analysis(
         [str(project_root / "packaging" / entrypoint)],
         pathex=[str(package_root)],
@@ -83,13 +82,35 @@ def core_analysis(entrypoint, extra_hiddenimports=None):
         hookspath=[],
         hooksconfig={},
         runtime_hooks=[],
-        excludes=list(core_excludes),
+        excludes=[name for name in core_excludes
+                  if not (preview_dependencies and name in {"PIL", "numpy"})],
         noarchive=False,
         optimize=1,
     )
 
 
-service_analysis = core_analysis("service_entry.py")
+service_analysis = core_analysis(
+    "service_entry.py",
+    [
+        "PIL.Image", "PIL.ImageEnhance", "PIL.ImageOps", "numpy",
+        "landscape_culler.timelapse",
+        "landscape_culler.timelapse_api",
+        "landscape_culler.framepick",
+        "landscape_culler._vendor.lrtlite.analysis",
+        "landscape_culler._vendor.lrtlite.sequence",
+        "landscape_culler._vendor.lrtlite.exif",
+        "landscape_culler._vendor.lrtlite.xmp",
+        "landscape_culler.collaborative_review",
+        "landscape_culler.collaborative_review_api",
+        "landscape_culler.collaborative_review_vision",
+        "landscape_culler.collaborative_review_proxy",
+        "landscape_culler.selection_export",
+        "landscape_culler.toolbox_cli",
+        "landscape_culler.toolbox_legacy_schemas",
+        "landscape_culler.agent_connection",
+    ],
+    preview_dependencies=True,
+)
 service_pyz = PYZ(service_analysis.pure)
 service_exe = EXE(
     service_pyz,
@@ -104,8 +125,33 @@ service_exe = EXE(
     console=True,
     version=str(service_version_file),
 )
+# The CLI uses the same PYZ and _internal directory as the service. Replace
+# only the application entry script; keep PyInstaller's required runtime hooks.
+# This avoids a second Python/Pillow/NumPy runtime while remaining a real
+# console executable for machines that do not have Python installed.
+cli_scripts = [
+    ("toolbox_cli_entry", str(project_root / "packaging" / "toolbox_cli_entry.py"), kind)
+    if name == "service_entry" else (name, path, kind)
+    for name, path, kind in service_analysis.scripts
+]
+if not any(name == "toolbox_cli_entry" for name, _path, _kind in cli_scripts):
+    raise RuntimeError("The CLI application entrypoint could not replace service_entry")
+cli_exe = EXE(
+    service_pyz,
+    cli_scripts,
+    [],
+    exclude_binaries=True,
+    name="PhotoToolbox.CLI",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=True,
+    version=str(project_root / "packaging" / "version_info_cli.txt"),
+)
 service_collect = COLLECT(
     service_exe,
+    cli_exe,
     service_analysis.binaries,
     service_analysis.datas,
     strip=False,

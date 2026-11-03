@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image, ImageOps
 
 from .constants import PREVIEW_VERSION, READABLE_RAW_EXTENSIONS
-from .util import cache_key
+from .util import atomic_write_bytes, cache_key
 
 
 def _load_raw_thumbnail(path: Path) -> Image.Image:
@@ -38,18 +38,28 @@ def load_preview(path: Path, cache_dir: Path, max_size: int = 1280) -> Image.Ima
     key = _preview_key(path)
     cached = cache_dir / key[:2] / f"{key}.jpg"
     if cached.exists():
-        with Image.open(cached) as image:
-            return image.convert("RGB")
+        try:
+            with Image.open(cached) as image:
+                return image.convert("RGB")
+        except (OSError, ValueError):
+            # A truncated JPEG is disposable cache, not a damaged source RAW.
+            # Leave it in place until a replacement has been fully generated.
+            pass
 
     if path.suffix.lower() in READABLE_RAW_EXTENSIONS:
         image = _load_raw_thumbnail(path)
     else:
         with Image.open(path) as source:
             image = ImageOps.exif_transpose(source).convert("RGB")
-    image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-    cached.parent.mkdir(parents=True, exist_ok=True)
-    image.save(cached, "JPEG", quality=88, optimize=True)
-    return image
+    try:
+        image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+        with io.BytesIO() as buffer:
+            image.save(buffer, "JPEG", quality=88, optimize=True)
+            atomic_write_bytes(cached, buffer.getvalue())
+        return image
+    except BaseException:
+        image.close()
+        raise
 
 
 def preview_cache_path(path: Path, cache_dir: Path) -> Path:

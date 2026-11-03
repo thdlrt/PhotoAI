@@ -18,10 +18,10 @@ jobs:
         with:
           node-version: '22'
       - name: Install lightweight test dependencies
-        run: python -m pip install -e . pytest
+        run: python -m pip install -e . pytest httpx pillow numpy
       - name: Syntax checks
         run: |
           python -m compileall -q src
           node --check src/landscape_culler/static/app.js
       - name: File safety and packaging contracts
-        run: python -m pytest tests/test_xmp_cleanup.py tests/test_toolbox.py tests/test_packaging_contract.py -q
+        run: python -m pytest tests/test_xmp_cleanup.py tests/test_toolbox.py tests/test_packaging_contract.py tests/test_framepick_integration.py tests/test_photo_toolbox_integration.py -q

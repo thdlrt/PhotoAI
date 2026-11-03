@@ -10,6 +10,36 @@ from PIL import Image
 from landscape_culler.preview import _load_raw_thumbnail
 
 
+def test_corrupted_cached_jpeg_is_repaired_from_source(tmp_path):
+    from landscape_culler.preview import load_preview, preview_cache_path
+    source = tmp_path / "original.png"
+    Image.new("RGB", (120, 80), "green").save(source)
+    before = source.read_bytes()
+    cached = preview_cache_path(source, tmp_path / "cache")
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(b"truncated jpeg")
+    with load_preview(source, tmp_path / "cache") as image:
+        assert image.size == (120, 80)
+    with Image.open(cached) as image:
+        image.load()
+    assert source.read_bytes() == before
+
+
+def test_failed_preview_publish_preserves_previous_cache(tmp_path, monkeypatch):
+    import pytest
+    from landscape_culler import preview
+    source = tmp_path / "original.png"
+    Image.new("RGB", (120, 80)).save(source)
+    cached = preview.preview_cache_path(source, tmp_path / "cache")
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(b"old broken cache")
+    def full_disk(*args): raise OSError("disk full")
+    monkeypatch.setattr(preview, "atomic_write_bytes", full_disk)
+    with pytest.raises(OSError, match="disk full"):
+        preview.load_preview(source, tmp_path / "cache")
+    assert cached.read_bytes() == b"old broken cache"
+
+
 def test_raw_embedded_jpeg_respects_exif_orientation(monkeypatch) -> None:
     source = Image.new("RGB", (80, 40), "green")
     exif = Image.Exif()

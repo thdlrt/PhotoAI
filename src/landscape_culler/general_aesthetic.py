@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import gc
 import hashlib
-import math
 import os
 from pathlib import Path
 from typing import Any, Iterable
@@ -10,6 +9,7 @@ from typing import Any, Iterable
 from tqdm import tqdm
 
 from .constants import AESTHETIC_MODEL_ID, AESTHETIC_PIPELINE_VERSION, PREVIEW_VERSION
+from .aesthetic_scores import qrealign_score, qrealign_scores
 from .preview import load_preview, preview_cache_path
 from .progress import emit_progress, phase_end, phase_start, progress_enabled
 from .util import cache_key, read_json, write_json
@@ -47,12 +47,10 @@ class GeneralAestheticScorer:
         ):
             return False
         try:
-            values = (float(payload["quality"]), float(payload["aesthetic"]))
-        except (KeyError, TypeError, ValueError):
+            qrealign_scores(payload)
+        except ValueError:
             return False
-        return all(
-            math.isfinite(value) and -100.0 <= value <= 100.0 for value in values
-        )
+        return True
 
     def _cached(self, path: Path) -> dict[str, Any] | None:
         cached = self._cache_path(path)
@@ -62,7 +60,9 @@ class GeneralAestheticScorer:
             payload = read_json(cached)
         except (OSError, ValueError):
             return None
-        return payload if self._valid(payload) else None
+        # Normalize floating-point endpoint noise only in memory. A valid old
+        # cache remains byte-for-byte unchanged and needs no new inference.
+        return {**payload, **qrealign_scores(payload)} if self._valid(payload) else None
 
     def _ensure_metric(self) -> None:
         if self._metric is not None:
@@ -92,11 +92,11 @@ class GeneralAestheticScorer:
     @staticmethod
     def _scalar(value: Any) -> float:
         if hasattr(value, "detach"):
-            value = value.detach().float().cpu().reshape(-1)[0].item()
-        result = float(value)
-        if not math.isfinite(result):
-            raise RuntimeError("Q-ReAlign 返回了无效数值。")
-        return result
+            value = value.detach().cpu()
+            if value.numel() != 1:
+                raise RuntimeError("Q-ReAlign 单张照片必须返回一个评分。")
+            value = value.item()
+        return qrealign_score(value)
 
     def score(self, paths: Iterable[Path]) -> list[dict[str, Any]]:
         ordered = list(paths)
@@ -130,8 +130,8 @@ class GeneralAestheticScorer:
                 start=1,
             ):
                 preview = preview_cache_path(path, self.preview_dir)
-                if not preview.is_file():
-                    load_preview(path, self.preview_dir)
+                with load_preview(path, self.preview_dir):
+                    pass  # Validates or repairs the preview and closes its pixels.
                 try:
                     quality = self._scalar(self._metric(str(preview), task_="quality"))
                     aesthetic = self._scalar(

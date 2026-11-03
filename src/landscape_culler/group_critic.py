@@ -106,7 +106,7 @@ class OllamaGroupCritic:
             from .vision_provider import chat
             if path != "/api/chat" or payload is None:
                 raise ValueError("云端不支持此本地模型操作。")
-            return chat(self.cloud_config, payload)
+            return chat(self.cloud_config, payload, data_dir=self.data_dir)
         data = (
             None
             if payload is None
@@ -235,17 +235,16 @@ class OllamaGroupCritic:
         return self.cache_dir / key[:2] / f"{key}.json"
 
     def _image(self, path: Path) -> str:
-        preview = preview_cache_path(path, self.preview_dir)
-        if not preview.is_file():
-            load_preview(path, self.preview_dir)
-        with Image.open(preview) as source:
-            image = source.convert("RGB")
-            image.thumbnail(
-                (self.max_pixels, self.max_pixels), Image.Resampling.LANCZOS
-            )
-            buffer = io.BytesIO()
-            image.save(buffer, format="JPEG", quality=86, optimize=True)
-        return base64.b64encode(buffer.getvalue()).decode("ascii")
+        with load_preview(path, self.preview_dir):
+            pass
+        # Use the persisted JPEG on both cold and warm cache paths, preserving
+        # the image contract used by existing VLM response caches.
+        with Image.open(preview_cache_path(path, self.preview_dir)) as source:
+            with source.convert("RGB") as image:
+                image.thumbnail((self.max_pixels, self.max_pixels), Image.Resampling.LANCZOS)
+                with io.BytesIO() as buffer:
+                    image.save(buffer, format="JPEG", quality=86, optimize=True)
+                    return base64.b64encode(buffer.getvalue()).decode("ascii")
 
     @staticmethod
     def _prompt(count: int, context: str = "group") -> str:
@@ -385,7 +384,8 @@ class OllamaGroupCritic:
             "stream": False,
             "think": False,
             "format": schema,
-            "options": {"temperature": 0, "num_ctx": 8192, "num_predict": 1400},
+            "options": {"temperature": 0, "num_ctx": 8192,
+                        "num_predict": max(1400, 1024 + 768 * len(paths)) if self.cloud else 1400},
             "keep_alive": "2m",
         }
         last_error: Exception | None = None
@@ -415,6 +415,11 @@ class OllamaGroupCritic:
                 urllib.error.URLError,
             ) as exc:
                 last_error = exc
+                if getattr(exc, "finish_reason", None) == "length" and _attempt == 0:
+                    request_payload["options"] = {**request_payload["options"],
+                        "num_predict": min(16384, request_payload["options"]["num_predict"] * 2)}
+                if content is None and getattr(exc, "response_text", ""):
+                    content = exc.response_text
                 if content is not None:
                     # Save only failed model text, never request images or provider keys.
                     raw_text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
@@ -425,6 +430,7 @@ class OllamaGroupCritic:
                             "model": self.model, "prompt_version": VLM_PROMPT_VERSION,
                             "context": context, "photo_count": len(paths),
                             "attempt": _attempt + 1, "error": str(exc),
+                            "response_metadata": getattr(exc, "diagnostics", {}),
                             "response_text": raw_text,
                         })
                     except OSError:
@@ -442,7 +448,8 @@ class OllamaGroupCritic:
                                 )},
                             ],
                         }
-        raise RuntimeError(f"Qwen3-VL 连续两次未返回有效评审：{last_error}")
+        label = self.model if self.cloud else "Qwen3-VL"
+        raise RuntimeError(f"{label} 连续两次未返回有效评审：{last_error}")
 
     def critique_groups(
         self,
@@ -451,7 +458,7 @@ class OllamaGroupCritic:
         fast_scores: list[float] | None = None,
         context: str = "group",
     ) -> dict[int, dict[str, Any]]:
-        description = "候选跨组评审" if context == "global" else "构图组内评审"
+        description = "全批视觉评审" if context == "global" else "构图组内评审"
         phase = "global_vlm" if context == "global" else "local_vlm"
         expected = {index for indices in groups for index in indices}
         phase_start(phase, description, len(expected), unit="张")

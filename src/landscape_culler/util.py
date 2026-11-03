@@ -4,9 +4,38 @@ import hashlib
 import json
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any
+from .constants import READABLE_RAW_EXTENSIONS
+
+PHOTO_TRASH_DIRECTORY = ".photo-ai-trash"
+
+
+def is_photo_trash_path(path: Path) -> bool:
+    return any(part.casefold() == PHOTO_TRASH_DIRECTORY for part in path.parts)
+
+
+def raw_photo_paths(input_root: Path) -> list[Path]:
+    if is_photo_trash_path(input_root):
+        return []
+    paths: list[Path] = []
+
+    def scan_error(error: OSError) -> None:
+        raise error
+
+    for current, directories, filenames in os.walk(input_root, onerror=scan_error):
+        parent = Path(current)
+        directories[:] = [name for name in directories
+                          if name.casefold() != PHOTO_TRASH_DIRECTORY
+                          and not (parent / name).is_symlink()
+                          and not (parent / name).is_junction()]
+        for name in filenames:
+            path = parent / name
+            if path.suffix.lower() in READABLE_RAW_EXTENSIONS and path.is_file() and not path.is_symlink():
+                paths.append(path)
+    return sorted(paths, key=lambda path: str(path).lower())
 
 
 def runs_root(data_dir: Path) -> Path:
@@ -68,13 +97,44 @@ def full_fingerprint(path: Path, block_size: int = 4 * 1024 * 1024) -> dict[str,
 
 def atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
         temp.write_text(text, encoding="utf-8", newline="\n")
-        os.replace(temp, path)
+        _replace_with_retry(temp, path)
     finally:
-        if temp.exists():
-            temp.unlink()
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass  # Cleanup must not hide the original write error.
+
+
+def _replace_with_retry(source: Path, destination: Path) -> None:
+    # Readers and antivirus on Windows can briefly deny delete sharing.
+    for attempt in range(10):
+        try:
+            os.replace(source, destination)
+            return
+        except OSError as exc:
+            if getattr(exc, "winerror", None) not in {5, 32, 33} or attempt == 9:
+                raise
+            time.sleep(min(0.02 * 2**attempt, 0.25))
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Publish a complete binary cache; never expose a partially written file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temp.open("xb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _replace_with_retry(temp, path)
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def atomic_create_text(path: Path, text: str) -> None:

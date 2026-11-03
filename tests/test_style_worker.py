@@ -1980,13 +1980,13 @@ def test_forced_lut_preview_uses_existing_lightroom_base_and_persists_capability
     assert result["develop"]["revision"] == 5
 
 
-def test_forced_lut_preview_requires_existing_lightroom_base(
+def test_forced_lut_preview_checks_lut_before_building_missing_base(
     tmp_path: Path,
 ) -> None:
     runtime_root = tmp_path / "project" / ".runtime"
     data_dir, run_dir, _raw = _run(runtime_root)
 
-    with pytest.raises(StyleWorkerError, match="Lightroom.*sRGB 预览"):
+    with pytest.raises(StyleWorkerError, match="LUT 版本已经变化"):
         run_style_worker(
             run_dir,
             data_dir,
@@ -1997,11 +1997,9 @@ def test_forced_lut_preview_requires_existing_lightroom_base(
             lut_hash="lut-hash",
             preview_only=True,
             bridge_status_reader=lambda _path: pytest.fail(
-                "missing base must fail before checking Lightroom"
+                "invalid LUT must fail before checking Lightroom"
             ),
-            lut_engine_factory=lambda _root: pytest.fail(
-                "missing base must fail before opening the LUT engine"
-            ),
+            lut_engine_factory=lambda root: _FakeLutEngine(root, lut_hash="changed"),
         )
 
     failed = read_json(run_dir / "develop.json")

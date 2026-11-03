@@ -1,0 +1,17 @@
+bin/
+obj/
+output/
+.vs/
+.idea/
+*.user
+*.suo
+Data/
+Cache/
+*.framepick
+*.framepick.bak
+*.framepick.*.tmp
+*.log
+*.zip
+.env
+.env.*
+!.env.example

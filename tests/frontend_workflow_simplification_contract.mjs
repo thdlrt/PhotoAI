@@ -97,8 +97,7 @@ assert.match(app, /scope: resolvedScope,[\s\S]*group_id: resolvedScope === "grou
 assert.match(app, /function recommendStylesForAllGroups\(\)/);
 assert.match(app, /\/style-recommendations\/groups/);
 assert.match(app, /body:\s*\{\s*base_revision: Number\(state\.developPlan\.revision\)\s*\}/);
-assert.match(app, /develop\/style\/global/);
-assert.match(app, /body: \{ base_revision: Number\(state\.developPlan\.revision\), scope: state\.styleScope \}/);
+// Style endpoint/revision behavior is exercised by frontend_project_ownership_contract.mjs.
 assert.match(app, /completedXmp = Boolean\(spec\.targets\?\.xmp\)/);
 assert.match(app, /completedJpeg = Boolean\(spec\.targets\?\.jpeg\)/);
 assert.match(app, /const selectedExportTargets = \{ \.\.\.state\.exportTargets \}/);

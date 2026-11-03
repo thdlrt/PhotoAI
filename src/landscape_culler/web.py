@@ -44,7 +44,10 @@ from .develop import (
     STYLE_PRESETS,
     confirm_all,
     confirm_recommended_styles,
+    create_original_develop_plan,
     develop_summary,
+    develop_resume_summary,
+    develop_resume_percent,
     load_develop_plan,
     merge_confirmed_develop,
     skip_all_crops,
@@ -53,7 +56,9 @@ from .develop import (
     update_develop_options,
     update_style_global,
     update_style_group,
+    update_style_scope,
 )
+from .style_state import active_selections
 from .export_state import (
     abandon_export_attempt,
     activate_export_attempt,
@@ -63,6 +68,7 @@ from .export_state import (
     export_summary,
     finish_export_attempt,
     load_export_spec,
+    latest_export_for_run,
     record_export_result,
 )
 from .lightroom_bridge import (
@@ -76,7 +82,7 @@ from .lightroom_bridge import (
     write_lightroom_look_descriptor,
     write_lightroom_plugin_config,
 )
-from .lut_export_worker import LUT_EXPORT_PROTOCOL
+from .lut_export_worker import LUT_EXPORT_PROTOCOL, reusable_export_lut_inputs, verified_export_lut_results
 from .model_resources import (
     MODEL_SPECS,
     PROFILE_SPECS,
@@ -89,6 +95,7 @@ from .model_resources import (
 )
 from .progress import parse_progress_line
 from .settings_transfer import (
+    read_local_preferences,
     SETTINGS_TRANSFER_FILENAME,
     SETTINGS_TRANSFER_MEDIA_TYPE,
     SettingsTransferError,
@@ -123,7 +130,9 @@ from .toolbox import (
 from .util import (
     cache_key,
     full_fingerprint,
+    is_photo_trash_path,
     quick_fingerprint,
+    raw_photo_paths,
     read_json,
     runs_root,
     write_json,
@@ -159,26 +168,25 @@ MAX_STYLE_IMPORT_BYTES = 96 * 1024 * 1024
 
 
 GROUP_PROGRESS_PLAN = [
-    {"key": "previews", "label": "读取照片", "weight": 15},
-    {"key": "features", "label": "生成相似特征", "weight": 65},
+    {"key": "previews", "label": "检查照片缓存", "weight": 15},
+    {"key": "features", "label": "读取照片与相似特征", "weight": 65},
     {"key": "grouping", "label": "自动整理分组", "weight": 10},
     {"key": "finalize", "label": "保存分组工程", "weight": 10},
 ]
 FAST_SCORE_PROGRESS_PLAN = [
-    {"key": "previews", "label": "读取照片", "weight": 5},
-    {"key": "features", "label": "读取相似特征", "weight": 5},
+    {"key": "previews", "label": "检查照片缓存", "weight": 5},
+    {"key": "features", "label": "读取照片与相似特征", "weight": 5},
     {"key": "aesthetic", "label": "通用审美评分", "weight": 60},
-    {"key": "local_rank", "label": "组内综合排名", "weight": 10},
+    {"key": "local_rank", "label": "初步质量排序", "weight": 10},
     {"key": "global_rank", "label": "跨组统一排名", "weight": 10},
     {"key": "finalize", "label": "生成选片结果", "weight": 10},
 ]
 DEEP_SCORE_PROGRESS_PLAN = [
-    {"key": "previews", "label": "读取照片", "weight": 3},
-    {"key": "features", "label": "读取相似特征", "weight": 3},
+    {"key": "previews", "label": "检查照片缓存", "weight": 3},
+    {"key": "features", "label": "读取照片与相似特征", "weight": 3},
     {"key": "aesthetic", "label": "通用审美评分", "weight": 14},
-    {"key": "local_vlm", "label": "构图组内评审", "weight": 43},
-    {"key": "local_rank", "label": "组内综合排名", "weight": 4},
-    {"key": "global_vlm", "label": "候选跨组评审", "weight": 23},
+    {"key": "local_rank", "label": "初步质量排序", "weight": 4},
+    {"key": "global_vlm", "label": "全批视觉评审", "weight": 66},
     {"key": "global_rank", "label": "跨组统一排名", "weight": 5},
     {"key": "finalize", "label": "生成选片结果", "weight": 5},
 ]
@@ -227,6 +235,13 @@ STYLE_PREVIEW_PROGRESS_PLAN = [
 STYLE_LUT_PREVIEW_PROGRESS_PLAN = [
     {"key": "lut", "label": "渲染创意 LUT 预览", "weight": 85},
     {"key": "finalize", "label": "保存 LUT 与强度", "weight": 15},
+]
+STYLE_LUT_REFRESH_PROGRESS_PLAN = [
+    {"key": "launch", "label": "检查基础预览", "weight": 10},
+    {"key": "process", "label": "Lightroom 基础预览", "weight": 60},
+    {"key": "collect", "label": "校验基础预览", "weight": 5},
+    {"key": "lut", "label": "渲染创意 LUT 预览", "weight": 20},
+    {"key": "finalize", "label": "保存 LUT 与强度", "weight": 5},
 ]
 LUT_EXPORT_PROGRESS_PLAN = [
     {"key": "verify", "label": "核对基础 JPEG 与 LUT", "weight": 15},
@@ -339,6 +354,8 @@ def _job_progress_plan(kind: str, context: dict[str, Any]) -> list[dict[str, Any
     if kind == "style_recommend":
         return STYLE_RECOMMEND_PROGRESS_PLAN
     if kind == "style_preview":
+        if context.get("may_rebuild_neutral"):
+            return STYLE_LUT_REFRESH_PROGRESS_PLAN
         if context.get("requires_lightroom") is False or context.get("lut_id"):
             return STYLE_LUT_PREVIEW_PROGRESS_PLAN
         return STYLE_PREVIEW_PROGRESS_PLAN
@@ -680,6 +697,7 @@ class JobManager:
     AI_KINDS = frozenset({
         "group", "score", "develop", "style_recommend", "style_preview", "lut_export",
     })
+    MODEL_KINDS = frozenset({"group", "score", "develop", "style_recommend"})
 
     RETRYABLE_KINDS = frozenset({
         "group",
@@ -811,24 +829,39 @@ class JobManager:
                 process.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 process.kill()
+                process.wait(timeout=3)
+
+    def _managed_python(self, kind: str) -> Path:
+        engine = active_engine(self.content_layout)
+        inference = kind in self.MODEL_KINDS
+        if engine is None:
+            raise RuntimeError("AI 计算环境尚未完整安装或自检未通过。" if inference else
+                               "外观处理运行组件尚未就绪，请在资源页配置或修复运行组件。")
+        if ai_worker_needs_update(engine):
+            raise RuntimeError("AI 评审计算环境需要更新，请在资源页重新配置当前档位（复用已下载模型）后再重试。" if inference else
+                               "外观处理代码需要更新，请在资源页修复；已有运行环境和模型会复用。")
+        python = engine / "venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        if not python.is_file():
+            raise RuntimeError("处理运行组件缺少受管 Python，请在资源页修复。")
+        return python
+
+    def preview_runtime_status(self) -> dict[str, Any]:
+        # Source checkouts use their own interpreter/dependencies. Installed
+        # builds still require a verified, current Worker, never model weights.
+        if self.content_layout is None:
+            return {"ready": True, "managed": False}
+        try:
+            self._managed_python("style_preview")
+        except RuntimeError as exc:
+            return {"ready": False, "managed": True, "message": str(exc)}
+        return {"ready": True, "managed": True}
 
     def _job_command(self, kind: str, cli_args: list[str], job_id: str) -> list[str]:
         managed_ai = kind in self.AI_KINDS
         if self.content_layout is None:
             return _worker_command(cli_args)
         if managed_ai:
-            engine = active_engine(self.content_layout)
-            if engine is None:
-                raise RuntimeError("AI 计算环境尚未完整安装或自检未通过。")
-            if ai_worker_needs_update(engine):
-                raise RuntimeError("AI 评审计算环境需要更新，请在资源页重新配置当前档位（复用已下载模型）后再重试。")
-            python = (
-                engine
-                / "venv"
-                / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-            )
-            if not python.is_file():
-                raise RuntimeError("AI 计算环境缺少受管 Python。")
+            python = self._managed_python(kind)
             # The managed AI wheel carries the same versioned worker entrypoint
             # as CoreWorker.  Keep every installed job on PHOTO_AI_WORKER/1;
             # never bypass the job-spec/result boundary with a direct CLI call.
@@ -892,7 +925,55 @@ class JobManager:
             )
         )
         result["retry_mode"] = retry_mode if result["retryable"] else None
+        if job.get("status") in {"queued", "running", "cancelling"}:
+            result["context"] = self.photo_scope(job)
+        if (job.get("kind") == "score" and job.get("status") in {"failed", "interrupted"}
+                and re.search(r"照片目录内容已变化|照片在分类后发生变化", str(job.get("message") or ""))):
+            try:
+                source = _run_file(self.data_dir, str(job.get("context", {}).get("source_run_id") or ""))
+                payload = _apply_review(read_json(source), _review(source))
+                result["requires_reclassification"] = _grouping_sources_changed(payload)
+            except (OSError, ValueError, HTTPException):
+                result["requires_reclassification"] = True
         return result
+
+    def photo_scope(self, job: dict[str, Any]) -> dict[str, Any]:
+        """Resolve old and new job records without changing projects on disk."""
+        context = dict(job.get("context") or {})
+        if context.get("input_root"):
+            return context
+        run_id = context.get("run_id") or context.get("source_run_id")
+        try:
+            if run_id:
+                payload = read_json(_run_file(self.data_dir, str(run_id)))
+                context["input_root"] = payload.get("input_root")
+            elif context.get("project_id"):
+                context["input_root"] = _project_detail(self.data_dir, context["project_id"]).get("input_root")
+            elif job.get("kind") in {"group", "score"}:
+                args = (job.get("retry_spec") or {}).get("argv") or job.get("command") or []
+                if "--input" in args:
+                    context["input_root"] = args[args.index("--input") + 1]
+        except (OSError, ValueError, IndexError, HTTPException):
+            pass
+        return context
+
+    def blocks_photos(self, payload: dict[str, Any]) -> bool:
+        active = self.active()
+        if not active or active.get("kind") == "model_download":
+            return False
+        scope = self.photo_scope(active)
+        run_id = payload.get("run_id")
+        if run_id and run_id in {scope.get("run_id"), scope.get("source_run_id")}:
+            return True
+        if payload.get("project_id") and payload["project_id"] == scope.get("project_id"):
+            return True
+        source_root, target_root = scope.get("input_root"), payload.get("input_root")
+        if source_root and target_root:
+            source, target = Path(source_root).resolve(), Path(target_root).resolve()
+            # Different projects can refer to the same or overlapping folders.
+            return _inside(source, target) or _inside(target, source)
+        # Legacy filesystem jobs with unknown scope must remain protected.
+        return True
 
     def active(self) -> dict[str, Any] | None:
         with self.lock:
@@ -1254,7 +1335,7 @@ class JobManager:
             env[key] = str(resolved_path)
         # Only inference jobs need a CLIP snapshot. File tools, XMP operations,
         # Lightroom and the installer must also work without any AI models.
-        if job.get("kind") in self.AI_KINDS:
+        if job.get("kind") in self.MODEL_KINDS:
             env["PHOTO_AI_CLIP_MODEL"] = clip_model_reference(runtime_root)
         else:
             env.pop("PHOTO_AI_CLIP_MODEL", None)
@@ -1294,6 +1375,8 @@ class JobManager:
             env = self._job_environment(job)
         except Exception as exc:  # noqa: BLE001 - durable worker launch boundary
             with self.lock:
+                if job["status"] != "running":
+                    return
                 _fail_job_progress(job)
                 message = f"无法启动本机工作进程：{exc}"
                 job.update(
@@ -1447,7 +1530,9 @@ class JobManager:
                     job.update(
                         status="cancelled",
                         stage="已取消",
-                        message="任务已停止；已经移动的文件可在工具箱中撤销。",
+                        message=("智能构图已取消；已完成的构图和断点缓存会保留，可稍后继续。"
+                                 if job["kind"] == "develop"
+                                 else "任务已停止；已经移动的文件可在工具箱中撤销。"),
                         result=result,
                     )
                 else:
@@ -1460,6 +1545,11 @@ class JobManager:
                 self._save(job)
         except Exception as exc:
             with self.lock:
+                if (job.get("status") in {"cancelling", "cancelled"}
+                        and job.get("kind") not in {"lightroom_apply", "style_recommend", "style_preview"}):
+                    # The cancelling caller owns process shutdown and the final
+                    # status. A closing output pipe must not turn it into failure.
+                    return
                 cancellation_error: Exception | None = None
                 if job.get("kind") in {
                     "lightroom_apply",
@@ -1628,6 +1718,10 @@ class ExcludeItemsBody(BaseModel):
     base_revision: int = Field(0, ge=0)
 
 
+class ThumbnailSizeBody(BaseModel):
+    thumbnail_size: int = Field(ge=160, le=420, multiple_of=10, strict=True)
+
+
 class DeletePhotosBody(BaseModel):
     indexes: list[int] = Field(min_length=1, max_length=5000)
     base_revision: int = Field(ge=0)
@@ -1696,6 +1790,15 @@ class DevelopOptionsBody(BaseModel):
     base_revision: int = Field(ge=0)
     color_enabled: bool | None = None
     mode: Literal["skip", "auto", "style"] | None = None
+    stage: Literal["basic", "creative"] | None = None
+
+
+class StyleScopeBody(DevelopConfirmBody):
+    scope: Literal["global", "group"]
+
+
+class StyleConfirmBody(DevelopConfirmBody):
+    scope: Literal["global", "group"] | None = None
 
 
 class StyleLibrarySyncBody(BaseModel):
@@ -1881,7 +1984,8 @@ def _apply_review(payload: dict[str, Any], review: dict[str, Any]) -> dict[str, 
     effective_exclusion_changes: dict[str, bool] = {}
     for index, item in enumerate(cloned.get("results", [])):
         key = str(index)
-        item["deleted"] = key in review.get("deleted", {})
+        item["deleted"] = (bool(item.get("deleted")) or key in review.get("deleted", {})
+                           or is_photo_trash_path(Path(item.get("path", ""))))
         original_excluded = bool(item.get("excluded", False))
         excluded = (
             bool(excluded_overrides[key])
@@ -1986,6 +2090,20 @@ def _materialize_grouping(
     target = run_file.parent / f"grouping.snapshot-{uuid.uuid4().hex}.json"
     write_json(target, payload)
     return target
+
+
+def _grouping_sources_changed(payload: dict[str, Any]) -> bool:
+    def identity(path: Path) -> str:
+        value = str(path.resolve())
+        return value.casefold() if os.name == "nt" else value
+    records = [item for item in payload.get("results", [])
+               if not item.get("deleted") and not is_photo_trash_path(Path(item.get("path", "")))]
+    expected = {identity(Path(item["path"])): item for item in records}
+    current = raw_photo_paths(Path(payload.get("input_root", "")))
+    if len(expected) != len(records) or set(expected) != {identity(path) for path in current}:
+        return True
+    return any(expected[identity(path)].get("source_key")
+               and expected[identity(path)]["source_key"] != cache_key(path) for path in current)
 
 
 def _run_summary(run_file: Path) -> dict[str, Any]:
@@ -2183,6 +2301,7 @@ def _run_detail(data_dir: Path, run_id: str) -> dict[str, Any]:
             }
         )
     payload["results"] = results
+    payload["project_id"] = _project_id(payload.get("input_root"), run_id)
     payload["review_revision"] = review["revision"]
     payload["dry_run"] = _json(run_file.parent / "xmp-dry-run.json", None)
     payload["develop"] = develop_summary(
@@ -2501,6 +2620,8 @@ def _edit_excluded(
             raise HTTPException(409, "分组已在别处更新，请刷新后重试。")
         if any(str(index) in review.get("deleted", {}) for index in indexes):
             raise HTTPException(422, "已删除的照片不能从移出列表恢复，请先从回收区找回文件后重新分析。")
+        if not excluded and any(results[index].get("read_error") for index in indexes):
+            raise HTTPException(422, "照片读取失败，请修复源文件后重新分类。")
         overrides = dict(review.get("excluded", {}))
         for index in indexes:
             original = bool(results[index].get("excluded", False))
@@ -2616,7 +2737,9 @@ def _delete_photos(data_dir: Path, run_id: str, indexes: list[int], revision: in
 
 
 def _transaction_id(data_dir: Path, path: Path) -> str:
-    relative = str(path.relative_to(data_dir)).replace("\\", "/")
+    # Installed projects are siblings of state, while source runs live below
+    # data_dir. Keep the legacy logical name in both storage layouts.
+    relative = "runs/" + path.relative_to(runs_root(data_dir)).as_posix()
     return hashlib.sha256(relative.encode()).hexdigest()[:20]
 
 
@@ -3578,12 +3701,12 @@ def _export_style_catalog_by_id(catalog: dict[str, Any]) -> dict[str, dict[str, 
 
 
 def _selected_rendered_luts(plan: dict[str, Any]) -> list[dict[str, Any]]:
-    groups = (plan.get("creative_style") or {}).get("groups", {})
-    if not isinstance(groups, dict):
+    creative = plan.get("creative_style") or {}
+    if creative.get("status") in {"pending", "skipped"}:
         return []
     return [
         group
-        for group in groups.values()
+        for group in active_selections(plan)
         if isinstance(group, dict)
         and str(group.get("status") or "") == "confirmed"
         and (
@@ -3727,11 +3850,100 @@ def _rendered_lut_recipe(item: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _reuse_lut_export_bases(data_dir: Path, spec: dict[str, Any], execution: dict[str, Any]) -> bool:
+    """Replace an all-LUT JPEG retry with frozen, verified existing bases."""
+    work = execution.get("work", [])
+    if not work or any(row.get("target") != "jpeg" for row in work):
+        return False
+    ids = {str(row["item_id"]) for row in work}
+    by_id = {str(item["item_id"]): item for item in spec.get("items", [])}
+    if any(_rendered_lut_recipe(by_id.get(item_id, {})) is None for item_id in ids):
+        return False
+    reusable = {}
+    for previous in reversed(spec.get("executions", [])):
+        if previous is execution:
+            continue
+        path_value = (previous.get("lut_postprocess") or {}).get("task_path")
+        if not path_value:
+            continue
+        try:
+            task = reusable_export_lut_inputs(Path(path_value))
+            if task.get("export_spec_id") != spec["export_spec_id"]:
+                continue
+            if task.get("attempt_id") != previous.get("attempt_id"):
+                continue
+            for item in task["items"]:
+                item_id = str(item["item_id"])
+                if item_id not in ids or item_id in reusable:
+                    continue
+                creative = _rendered_lut_recipe(by_id[item_id]) or {}
+                if (item.get("lut_id") == creative.get("lut_id")
+                    and item.get("lut_hash") == creative.get("lut_hash")
+                    and item.get("strength", 100) == creative.get("strength", creative.get("amount", 100))
+                    and _inside(Path(item["jpeg_path"]), Path(spec["output_dir"]))):
+                    reusable[item_id] = dict(item)
+        except (OSError, TypeError, ValueError):
+            continue
+    if set(reusable) != ids:
+        return False
+    task_path = Path(execution["spec_path"]).parent / "lut-export-task.json"
+    write_json(task_path, {"protocol": LUT_EXPORT_PROTOCOL, "export_spec_id": spec["export_spec_id"],
+        "attempt_id": execution["attempt_id"], "output_root": spec["output_dir"],
+        "jpeg_quality": int((spec.get("jpeg_settings") or {}).get("quality", 90)),
+        "items": [reusable[key] for key in sorted(ids)]})
+    execution["engine"] = "lut_only"
+    execution["lut_postprocess"] = {"task_path": str(task_path), "expected_item_ids": sorted(ids)}
+    write_json(export_spec_path(data_dir, spec["export_spec_id"]), spec)
+    return True
+
+
+def _verified_lut_rows(task_path: Any, result: Any, expected_ids: list[str], fallback: str) -> list[dict[str, Any]]:
+    try:
+        recovered = verified_export_lut_results(Path(str(task_path)), result)
+        verified = {str(row["item_id"]): row for row in recovered["items"]}
+    except (OSError, TypeError, ValueError):
+        verified = {}
+    errors = {str(row.get("item_id")): row.get("error") for row in (result or {}).get("items", [])
+              if isinstance(row, dict)} if isinstance(result, dict) else {}
+    return [verified.get(str(item_id)) or {"item_id": str(item_id), "succeeded": False,
+            "error": errors.get(str(item_id)) or fallback} for item_id in expected_ids]
+
+
 def _prepare_lut_export_task(
     spec: dict[str, Any],
     execution: dict[str, Any],
     batch: dict[str, Any],
 ) -> tuple[Path | None, list[str], list[dict[str, Any]]]:
+    task_path = Path(str(execution["spec_path"])).resolve().parent / "lut-export-task.json"
+    # The worker may finish before Service saves lut_postprocess. Never freeze
+    # the current output bytes again: they may already have the LUT applied.
+    if task_path.exists():
+        items = {str(item.get("item_id")): item for item in spec.get("items", [])}
+        expected = [str(work["item_id"]) for work in execution.get("work", [])
+                    if work.get("target") == "jpeg" and _rendered_lut_recipe(items.get(str(work["item_id"]), {}))]
+        try:
+            frozen = read_json(task_path)
+            if (frozen.get("protocol") != LUT_EXPORT_PROTOCOL
+                or frozen.get("export_spec_id") != spec.get("export_spec_id")
+                or frozen.get("attempt_id") != execution.get("attempt_id")
+                or Path(frozen["output_root"]).resolve() != Path(spec["output_dir"]).resolve()):
+                raise ValueError("冻结任务身份不一致")
+            present = set()
+            for row in frozen["items"]:
+                item_id = str(row["item_id"])
+                creative = _rendered_lut_recipe(items.get(item_id, {})) or {}
+                if (item_id not in expected or item_id in present
+                    or row.get("lut_id") != creative.get("lut_id")
+                    or row.get("lut_hash") != creative.get("lut_hash")
+                    or row.get("strength", 100) != creative.get("strength", creative.get("amount", 100))
+                    or not _inside(Path(row["jpeg_path"]), Path(spec["output_dir"]))):
+                    raise ValueError("冻结任务与导出外观不一致")
+                present.add(item_id)
+            return task_path, expected, [dict(item_id=item_id, succeeded=False, error="原批次未生成基础 JPEG。")
+                                         for item_id in expected if item_id not in present]
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            return None, expected, [dict(item_id=item_id, succeeded=False, error=f"冻结 LUT 任务无法恢复：{exc}")
+                                    for item_id in expected]
     task_by_path = {
         os.path.normcase(str(Path(str(row.get("photo_path") or "")).resolve())): row
         for row in batch.get("tasks", [])
@@ -3961,6 +4173,17 @@ def _reconcile_export_spec(
                 )
             continue
         fallback = str(job.get("message") or "导出任务未完成。")
+        if execution.get("engine") == "lut_only":
+            state = execution.get("lut_postprocess") or {}
+            rows = _verified_lut_rows(state.get("task_path"), job.get("result"),
+                                      state.get("expected_item_ids", []), fallback)
+            for row in rows:
+                record_export_result(data_dir, spec, item_id=row["item_id"], target="jpeg",
+                    succeeded=bool(row.get("succeeded")), output=row.get("output"), error=row.get("error"))
+            success = bool(rows) and all(row.get("succeeded") for row in rows)
+            finish_export_attempt(data_dir, spec, attempt_id=execution["attempt_id"],
+                status="completed" if success else "failed", error=None if success else fallback)
+            continue
         if execution.get("engine") == "direct_xmp":
             _reconcile_direct_xmp_export(data_dir, spec, execution, fallback)
             continue
@@ -3995,6 +4218,8 @@ def _reconcile_export_spec(
                     }
                     if task_path is not None:
                         try:
+                            if job_status == "cancelled" or batch.get("status") == "cancelled":
+                                raise RuntimeError("导出已取消；重试时可继续处理已生成的基础 JPEG。")
                             job = jobs.start(
                                 "lut_export",
                                 [
@@ -4007,6 +4232,7 @@ def _reconcile_export_spec(
                                 {
                                     "title": f"渲染创意 LUT · {len(expected_ids)} 张",
                                     "export_spec_id": spec.get("export_spec_id"),
+                                    "run_id": spec.get("run_id"),
                                     "attempt_id": execution.get("attempt_id"),
                                     "task_path": str(task_path),
                                 },
@@ -4048,16 +4274,17 @@ def _reconcile_export_spec(
                             )
                         continue
                     result = lut_job.get("result")
+                    verified_rows = _verified_lut_rows(
+                        lut_state.get("task_path"), result, lut_state.get("expected_item_ids", []),
+                        str(lut_job.get("message") or "创意 LUT 成片未通过校验，请重试。"),
+                    )
                     if (
                         isinstance(result, dict)
                         and result.get("protocol") == LUT_EXPORT_PROTOCOL
                     ):
-                        worker_rows.extend(
-                            row
-                            for row in result.get("items", [])
-                            if isinstance(row, dict)
-                        )
+                        worker_rows.extend(verified_rows)
                     else:
+                        worker_rows.extend(row for row in verified_rows if row.get("succeeded"))
                         known = {str(row.get("item_id")) for row in worker_rows}
                         error = str(
                             lut_job.get("message")
@@ -4168,10 +4395,12 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         yield
+        review_router.review_jobs.shutdown()
+        timelapse_router.timelapse_manager.close()
         jobs.shutdown()
 
     app = FastAPI(
-        title="光影拣选台",
+        title="摄影后期工具箱",
         version=PRODUCT_VERSION,
         docs_url=None,
         redoc_url=None,
@@ -4197,7 +4426,19 @@ def create_app(
 
     @app.get("/api/app-updates")
     def app_update_status() -> dict[str, Any]:
-        return updater.status()
+        from .diagnostics import build_identity
+        return {**updater.status(), "build": build_identity()}
+
+    @app.get("/api/diagnostics")
+    def get_diagnostics() -> dict[str, Any]:
+        from .diagnostics import diagnostic_report
+        with jobs.lock:
+            counts: dict[str, int] = {}
+            for job in jobs.jobs.values():
+                status = str(job.get("status", ""))
+                counts[status] = counts.get(status, 0) + 1
+        return diagnostic_report(data_dir, content_layout,
+            configured=not bootstrap_storage, job_counts=counts)
 
     @app.post("/api/app-updates/{action}", dependencies=[Depends(mutate_token)])
     def app_update_action(action: str) -> dict[str, Any]:
@@ -4363,6 +4604,17 @@ def create_app(
             },
         )
 
+    @app.patch("/api/preferences/ui", dependencies=[Depends(mutate_token)])
+    def set_ui_preferences(body: ThumbnailSizeBody) -> dict[str, Any]:
+        with settings_transfer_lock:
+            try:
+                preferences = read_local_preferences(data_dir)
+                preferences["ui"] = {**preferences["ui"], "thumbnail_size": body.thumbnail_size}
+                write_local_preferences(data_dir, preferences)
+            except (OSError, SettingsTransferError) as exc:
+                raise HTTPException(409, f"无法保存缩略图大小：{exc}") from exc
+            return preferences["ui"]
+
     @app.post(
         "/api/settings-transfer/import",
         dependencies=[Depends(mutate_token)],
@@ -4473,11 +4725,23 @@ def create_app(
             )
         return readiness
 
+    @app.get("/api/style-runtime")
+    def style_runtime_status() -> dict[str, Any]:
+        return jobs.preview_runtime_status()
+
+    def require_style_runtime_ready() -> None:
+        status = jobs.preview_runtime_status()
+        if not status["ready"]:
+            raise HTTPException(409, {"code": "style_runtime_incomplete", "message": status["message"]})
+
     def start_job(
         kind: str, args: list[str], context: dict[str, Any]
     ) -> dict[str, Any]:
-        if kind in {"group", "score", "develop", "style_recommend", "style_preview"}:
+        if kind in JobManager.MODEL_KINDS:
             require_model_profile_ready()
+        elif kind == "style_preview":
+            require_style_runtime_ready()
+        context = jobs.photo_scope({"kind": kind, "context": context, "retry_spec": {"argv": args}})
         try:
             return jobs.start(kind, args, context)
         except RuntimeError as exc:
@@ -4494,6 +4758,10 @@ def create_app(
             raise HTTPException(404, "任务不存在。") from exc
         kind = str(previous.get("kind") or "")
         context = previous.get("context") or {}
+        if (kind in {"develop", "style_recommend", "style_preview", "lut_export", "lightroom_apply"}
+            or context.get("export_spec_id")
+            or (kind == "xmp_commit" and context.get("selection_only") is not True)):
+            raise HTTPException(410, "自动构图与自动调色已移除；请从选片页导出选择。")
         partial_style = (
             kind in {"style_recommend", "style_preview"}
             and previous.get("status") == "completed"
@@ -4501,8 +4769,12 @@ def create_app(
         )
         if previous.get("status") not in {"failed", "interrupted"} and not partial_style:
             raise HTTPException(409, "只有失败或意外中断的任务可以重试。")
-        if kind in {"group", "score", "style_recommend", "style_preview"}:
+        if context.get("export_spec_id") and kind in {"lightroom_apply", "xmp_commit", "lut_export"}:
+            return execute_export(str(context["export_spec_id"]), ExportExecuteBody(retry_failed_only=True))
+        if kind in {"group", "score", "style_recommend"}:
             require_model_profile_ready()
+        elif kind == "style_preview":
+            require_style_runtime_ready()
         if kind in {
             "xmp_commit",
             "rollback",
@@ -4547,6 +4819,10 @@ def create_app(
                     return recommend_styles(run_id, StyleRecommendationBody(
                         base_revision=revision, scope=scope, group_id=context.get("group_id")
                     ))
+            if kind == "develop" and context.get("run_id"):
+                run_id = str(context["run_id"])
+                revision = int(_review(_run_file(data_dir, run_id))["revision"])
+                return generate_develop(run_id, DevelopGenerateBody(base_revision=revision))
             return jobs.retry(job_id)
         except KeyError as exc:
             raise HTTPException(404, "任务不存在。") from exc
@@ -4558,6 +4834,11 @@ def create_app(
         from .vision_provider import public_config
         return public_config(data_dir)
 
+    @app.get("/api/vision-provider/thinking-options")
+    def vision_thinking_options(base_url: str = "", model: str = "") -> dict[str, Any]:
+        from .vision_provider import thinking_capabilities
+        return thinking_capabilities({"base_url": base_url, "model": model})
+
     @app.put("/api/vision-provider", dependencies=[Depends(mutate_token)])
     def configure_vision_provider(body: dict[str, Any]) -> dict[str, Any]:
         from .vision_provider import save_config
@@ -4565,8 +4846,10 @@ def create_app(
             raise HTTPException(409, "请等待当前任务结束后再切换模型。")
         try:
             return save_config(data_dir, body)
-        except (ValueError, OSError):
-            raise HTTPException(422, "请检查 HTTPS 地址、模型名、API Key、超时时间及预览图发送授权。") from None
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        except OSError:
+            raise HTTPException(422, "保存云端设置失败，请检查数据目录写入权限。") from None
 
     @app.post("/api/vision-provider/test", dependencies=[Depends(mutate_token)])
     def test_vision_provider() -> dict[str, Any]:
@@ -4576,8 +4859,9 @@ def create_app(
             raise HTTPException(422, "请先保存云端配置。")
         try:
             # Synthetic image only: testing never sends a user's photograph.
-            result = chat(config, {"messages": [{"role": "user", "content": "Name the color of this image.",
-                "images": [TEST_IMAGE]}], "options": {"num_predict": 64}})
+            result = chat(config, {"think": False,
+                "messages": [{"role": "user", "content": "Name the color of this image. Answer with one color word only.",
+                "images": [TEST_IMAGE]}], "options": {"num_predict": 256}}, data_dir=data_dir)
             description = result["message"]["content"].casefold()
             if "red" not in description and "红" not in description:
                 raise ValueError("接口已响应，但未正确识别红色色块，请确认所选模型支持图片输入。")
@@ -5051,6 +5335,13 @@ def create_app(
             "library": library,
         }
 
+    @app.get("/api/runs/{run_id}/exports/latest")
+    def latest_run_export(run_id: str) -> dict[str, Any] | None:
+        _run_file(data_dir, run_id)
+        with export_lock:
+            spec = latest_export_for_run(data_dir, run_id)
+            return _public_export_spec(spec) if spec else None
+
     @app.post(
         "/api/runs/{run_id}/exports/prepare",
         dependencies=[Depends(mutate_token)],
@@ -5059,7 +5350,9 @@ def create_app(
         if not body.xmp and not body.jpeg:
             raise HTTPException(422, "请至少选择保存 XMP 或导出 JPEG。")
         run_file = _run_file(data_dir, run_id)
-        with review_lock, develop_lock, export_lock:
+        with review_lock, develop_lock, export_lock, jobs.lock:
+            if jobs.blocks_photos(read_json(run_file)):
+                raise HTTPException(409, "这个工程正在处理照片，请完成或取消任务后再准备导出。")
             review = _review(run_file)
             if int(review["revision"]) != int(body.base_revision):
                 raise HTTPException(409, "审片已变化，请刷新后重新准备导出。")
@@ -5092,6 +5385,8 @@ def create_app(
             creative_status = str(
                 (plan.get("creative_style") or {}).get("status") or "pending"
             )
+            if creative_status == "pending" and color_mode != "style":
+                raise HTTPException(409, "请先确认创意外观，或选择保持自然并跳过。")
             if color_mode == "skip":
                 if basic_status != "skipped":
                     raise HTTPException(409, "不调色步骤尚未保存，请重新选择。")
@@ -5099,7 +5394,7 @@ def create_app(
                 if basic_status != "enabled":
                     raise HTTPException(409, "Lightroom 基础调色尚未确认。")
             elif color_mode == "style":
-                if basic_status != "enabled" or creative_status != "confirmed":
+                if basic_status not in {"enabled", "skipped"} or creative_status != "confirmed":
                     raise HTTPException(
                         409, "请先确认每个照片组的风格，或选择保持自然。"
                     )
@@ -5260,9 +5555,19 @@ def create_app(
                 raise HTTPException(409, str(exc)) from exc
             if execution is None:
                 return _public_export_spec(spec)
+            _reuse_lut_export_bases(data_dir, spec, execution)
             attempt_id = str(execution["attempt_id"])
             try:
-                if execution["engine"] == "lightroom":
+                if execution["engine"] == "lut_only":
+                    batch_id = None
+                    task_path = execution["lut_postprocess"]["task_path"]
+                    job = start_job("lut_export", ["render-export-luts", "--task", task_path,
+                        "--project-root", str(project_root)], {
+                        "title": f"继续渲染创意 LUT · {len(execution['work'])} 张",
+                        "run_id": spec["run_id"], "export_spec_id": spec["export_spec_id"],
+                        "attempt_id": attempt_id, "task_path": task_path,
+                    })
+                elif execution["engine"] == "lightroom":
                     try:
                         bridge_status = _lightroom_status(data_dir, project_root)
                     except (OSError, ValueError, TypeError) as exc:
@@ -5614,6 +5919,7 @@ def create_app(
                     "scope": body.scope,
                     "base_revision": int(plan.get("revision", 0)),
                     "requires_lightroom": requires_lightroom,
+                    "may_rebuild_neutral": bool(body.lut_id),
                     "lightroom_state": (
                         str((bridge.get("heartbeat") or {}).get("state") or "unknown")
                         if requires_lightroom
@@ -5875,9 +6181,10 @@ def create_app(
     def delete_project(project_id: str, body: DeleteProjectBody) -> dict[str, Any]:
         if body.confirmation != "删除工程":
             raise HTTPException(422, "请输入“删除工程”确认。")
-        if jobs.active():
-            raise HTTPException(409, "有任务正在运行，请完成或取消后再删除工程。")
-        return _trash_project(data_dir, project_id, project_lock)
+        with jobs.lock:
+            if jobs.blocks_photos(_project_detail(data_dir, project_id)):
+                raise HTTPException(409, "这个工程有任务正在运行，请完成或取消后再删除工程。")
+            return _trash_project(data_dir, project_id, project_lock)
 
     @app.get("/api/runs")
     def list_runs(limit: int = Query(50, ge=1, le=200)) -> list[dict[str, Any]]:
@@ -5916,7 +6223,7 @@ def create_app(
     def get_develop_progress(run_id: str) -> dict[str, Any]:
         run_file = _run_file(data_dir, run_id)
         progress_file = run_file.parent / "develop-progress.json"
-        return _json(
+        progress = _json(
             progress_file,
             {
                 "status": "idle",
@@ -5927,6 +6234,55 @@ def create_app(
                 "nodes": [],
             },
         )
+        def resume_summary() -> dict[str, int]:
+            review = _review(run_file)
+            return develop_resume_summary(_apply_review(read_json(run_file), review), run_file.parent)
+        with jobs.lock:
+            latest = dict(max((job for job in jobs.jobs.values() if job.get("kind") == "develop"
+                              and job.get("context", {}).get("run_id") == run_id),
+                             key=lambda job: str(job.get("created_at", "")), default={}))
+        if latest.get("id"):
+            progress = {**progress, "job_id": latest["id"], "run_id": run_id}
+        if progress.get("status") in {"idle", "failed", "cancelled", "interrupted"}:
+            resume = resume_summary()
+            progress = {**progress, **resume, "current": resume["completed"],
+                        "overall_percent": develop_resume_percent(resume)}
+        if progress.get("status") in {"running", "cancelling"}:
+            # The 650ms progress poll must not enrich every historic job (which
+            # can rescan photo directories for failed scoring jobs).
+            latest_status = latest.get("status")
+            latest_id = latest.get("id")
+            if latest_status in {"queued", "running", "cancelling"}:
+                progress = {**progress, "job_id": latest_id, "run_id": run_id,
+                            "status": latest_status, "cancellable": True}
+            elif latest_status == "completed":
+                saved = _json(run_file.parent / "develop.json", {})
+                expected_plan = (latest.get("result") or {}).get("plan_id")
+                if expected_plan and saved.get("plan_id") == expected_plan:
+                    total = len(saved.get("items", []))
+                    progress = {**progress, "status": "completed", "cancellable": False,
+                                "job_id": latest_id, "run_id": run_id, "completed": total,
+                                "analyzed": total, "current": total, "total": total,
+                                "overall_percent": 100.0, "stage_label": "智能构图完成"}
+                else:
+                    resume = resume_summary()
+                    progress = {**progress, **resume, "status": "failed", "cancellable": False,
+                                "stage_label": "构图结果需要恢复", "message": "任务已结束，但结果文件不匹配，请继续构图。",
+                                "overall_percent": develop_resume_percent(resume)}
+            elif latest_status in {"interrupted", "cancelled", "failed"}:
+                resume = resume_summary()
+                progress = {**progress, "status": latest_status,
+                            "cancellable": False, "job_id": latest_id, "run_id": run_id,
+                            "stage_label": {"cancelled": "构图已取消，可继续", "failed": "构图分析失败"}.get(latest_status, "构图已中断，可继续"),
+                            "message": latest.get("message") or progress.get("message"),
+                            **resume, "current": resume["completed"],
+                            "overall_percent": develop_resume_percent(resume)}
+            elif not latest and progress_file.is_file() and time.time() - progress_file.stat().st_mtime > 30:
+                resume = resume_summary()
+                progress = {**progress, **resume, "status": "interrupted", "cancellable": False,
+                            "stage_label": "构图任务已中断，可继续", "current": resume["completed"],
+                            "overall_percent": develop_resume_percent(resume)}
+        return progress
 
     @app.post("/api/runs/{run_id}/develop", dependencies=[Depends(mutate_token)])
     def generate_develop(run_id: str, body: DevelopGenerateBody) -> dict[str, Any]:
@@ -5943,6 +6299,7 @@ def create_app(
                 not item.get("excluded") and int(item.get("rating", 0)) >= 3
                 for item in payload.get("results", [])
             )
+            resume = develop_resume_summary(payload, run_file.parent)
             input_path = jobs.jobs_dir / f"develop-input-{uuid.uuid4().hex}.json"
             write_json(
                 input_path,
@@ -5957,12 +6314,14 @@ def create_app(
                 {
                     "status": "running",
                     "phase": "subjects",
-                    "stage_label": "准备智能构图",
-                    "current": 0,
-                    "completed": 0,
+                    "stage_label": "继续未完成的构图" if resume["completed"] else "准备智能构图",
+                    "current": resume["completed"],
+                    "completed": resume["completed"],
+                    "analyzed": resume["analyzed"],
                     "total": total,
                     "filename": "",
-                    "overall_percent": 0.0,
+                    "resumed_count": resume["analyzed"],
+                    "overall_percent": develop_resume_percent(resume),
                     "nodes": [],
                     "updated_at": _now(),
                 },
@@ -5995,9 +6354,10 @@ def create_app(
                         "status": "failed",
                         "stage_label": "构图分析失败",
                         "message": str(exc.detail),
-                        "overall_percent": 0.0,
-                        "current": 0,
-                        "completed": 0,
+                        "overall_percent": develop_resume_percent(resume),
+                        "current": resume["completed"],
+                        "completed": resume["completed"],
+                        "analyzed": resume["analyzed"],
                         "total": total,
                         "nodes": [],
                         "updated_at": _now(),
@@ -6103,7 +6463,9 @@ def create_app(
     )
     def edit_develop(run_id: str, index: int, body: DevelopEditBody) -> dict[str, Any]:
         run_file = _run_file(data_dir, run_id)
-        with review_lock, develop_lock:
+        with review_lock, develop_lock, jobs.lock:
+            if jobs.blocks_photos(read_json(run_file)):
+                raise HTTPException(409, "这个工程正在处理照片，请完成或取消任务后再修改构图。")
             review = _review(run_file)
             plan = _require_current_develop(run_file, int(review["revision"]))
             if int(plan.get("revision", 0)) != int(body.base_revision):
@@ -6146,7 +6508,9 @@ def create_app(
     )
     def confirm_develop(run_id: str, body: DevelopConfirmBody) -> dict[str, Any]:
         run_file = _run_file(data_dir, run_id)
-        with review_lock, develop_lock:
+        with review_lock, develop_lock, jobs.lock:
+            if jobs.blocks_photos(read_json(run_file)):
+                raise HTTPException(409, "这个工程正在处理照片，请完成或取消任务后再确认构图。")
             review = _review(run_file)
             plan = _require_current_develop(run_file, int(review["revision"]))
             if int(plan.get("revision", 0)) != int(body.base_revision):
@@ -6155,11 +6519,42 @@ def create_app(
             return _public_develop_plan(run_file, plan, int(review["revision"]))
 
     @app.post(
+        "/api/runs/{run_id}/develop/skip-analysis", dependencies=[Depends(mutate_token)]
+    )
+    def skip_develop_analysis(run_id: str, body: DevelopGenerateBody) -> dict[str, Any]:
+        run_file = _run_file(data_dir, run_id)
+        with review_lock, develop_lock, jobs.lock:
+            review = _review(run_file)
+            if int(review["revision"]) != int(body.base_revision):
+                raise HTTPException(409, "审片已变化，请刷新后重试。")
+            payload = _apply_review(read_json(run_file), review)
+            _ensure_xmp_ready(payload)
+            if jobs.blocks_photos(payload):
+                raise HTTPException(409, "这个工程正在处理照片，请完成或取消任务后再跳过。")
+            for item in payload.get("results", []):
+                if item.get("excluded") or int(item.get("rating", 0)) < 3:
+                    continue
+                preview = Path(str(item.get("preview", "")))
+                if not preview.is_file() or not _inside(preview, runtime_cache_dir(data_dir) / "previews"):
+                    raise HTTPException(409, "原始预览不存在，请重新评分。")
+            previous = load_develop_plan(run_file.parent)
+            if previous and not any(develop_summary(previous, int(review["revision"])).get(key) for key in ("stale", "engine_outdated")):
+                # Keep the current plan's color/style edits and identity.
+                return skip_develop_crop(run_id, DevelopConfirmBody(base_revision=int(previous["revision"])))
+            try:
+                plan = create_original_develop_plan(payload, run_file.parent, int(review["revision"]), previous)
+            except (ValueError, OSError) as exc:
+                raise HTTPException(409, str(exc)) from None
+            return _public_develop_plan(run_file, plan, int(review["revision"]))
+
+    @app.post(
         "/api/runs/{run_id}/develop/skip-crop", dependencies=[Depends(mutate_token)]
     )
     def skip_develop_crop(run_id: str, body: DevelopConfirmBody) -> dict[str, Any]:
         run_file = _run_file(data_dir, run_id)
-        with review_lock, develop_lock:
+        with review_lock, develop_lock, jobs.lock:
+            if jobs.blocks_photos(read_json(run_file)):
+                raise HTTPException(409, "这个工程正在处理照片，请完成或取消任务后再跳过构图。")
             review = _review(run_file)
             plan = _require_current_develop(run_file, int(review["revision"]))
             if int(plan.get("revision", 0)) != int(body.base_revision):
@@ -6189,13 +6584,18 @@ def create_app(
     )
     def edit_develop_options(run_id: str, body: DevelopOptionsBody) -> dict[str, Any]:
         run_file = _run_file(data_dir, run_id)
-        with review_lock, develop_lock:
+        with review_lock, develop_lock, jobs.lock:
+            if jobs.blocks_photos(read_json(run_file)):
+                raise HTTPException(409, "这个工程正在处理照片，请完成或取消任务后再修改调色。")
             review = _review(run_file)
             plan = _require_current_develop(run_file, int(review["revision"]))
             if int(plan.get("revision", 0)) != int(body.base_revision):
                 raise HTTPException(409, "裁剪调色方案已更新，请刷新后重试。")
             if body.mode is not None:
-                update_color_mode(plan, run_file.parent, mode=body.mode)
+                try:
+                    update_color_mode(plan, run_file.parent, mode=body.mode, stage=body.stage)
+                except ValueError as exc:
+                    raise HTTPException(422, str(exc)) from exc
             elif body.color_enabled is not None:
                 update_develop_options(
                     plan, run_file.parent, color_enabled=body.color_enabled
@@ -6212,7 +6612,9 @@ def create_app(
         run_id: str, group_id: int, body: StyleGroupBody
     ) -> dict[str, Any]:
         run_file = _run_file(data_dir, run_id)
-        with review_lock, develop_lock:
+        with review_lock, develop_lock, jobs.lock:
+            if jobs.blocks_photos(read_json(run_file)):
+                raise HTTPException(409, "这个工程正在处理照片，请完成或取消任务后再修改外观。")
             review = _review(run_file)
             plan = _require_current_develop(run_file, int(review["revision"]))
             if int(plan.get("revision", 0)) != int(body.base_revision):
@@ -6241,7 +6643,9 @@ def create_app(
     )
     def edit_style_global(run_id: str, body: StyleGroupBody) -> dict[str, Any]:
         run_file = _run_file(data_dir, run_id)
-        with review_lock, develop_lock:
+        with review_lock, develop_lock, jobs.lock:
+            if jobs.blocks_photos(read_json(run_file)):
+                raise HTTPException(409, "这个工程正在处理照片，请完成或取消任务后再修改外观。")
             review = _review(run_file)
             plan = _require_current_develop(run_file, int(review["revision"]))
             if int(plan.get("revision", 0)) != int(body.base_revision):
@@ -6261,18 +6665,38 @@ def create_app(
                 raise HTTPException(422, str(exc)) from exc
             return _public_develop_plan(run_file, plan, int(review["revision"]))
 
+    @app.put(
+        "/api/runs/{run_id}/develop/style/scope",
+        dependencies=[Depends(mutate_token)],
+    )
+    def edit_style_scope(run_id: str, body: StyleScopeBody) -> dict[str, Any]:
+        run_file = _run_file(data_dir, run_id)
+        with review_lock, develop_lock, jobs.lock:
+            if jobs.blocks_photos(read_json(run_file)):
+                raise HTTPException(409, "这个工程正在处理照片，请完成或取消任务后再切换外观范围。")
+            review = _review(run_file)
+            plan = _require_current_develop(run_file, int(review["revision"]))
+            if int(plan.get("revision", 0)) != int(body.base_revision):
+                raise HTTPException(409, "调色方案已更新，请刷新后重试。")
+            update_style_scope(plan, run_file.parent, scope=body.scope)
+            return _public_develop_plan(run_file, plan, int(review["revision"]))
+
     @app.post(
         "/api/runs/{run_id}/develop/style/confirm-all",
         dependencies=[Depends(mutate_token)],
     )
-    def confirm_styles(run_id: str, body: DevelopConfirmBody) -> dict[str, Any]:
+    def confirm_styles(run_id: str, body: StyleConfirmBody) -> dict[str, Any]:
         run_file = _run_file(data_dir, run_id)
-        with review_lock, develop_lock:
+        with review_lock, develop_lock, jobs.lock:
+            if jobs.blocks_photos(read_json(run_file)):
+                raise HTTPException(409, "这个工程正在处理照片，请完成或取消任务后再确认外观。")
             review = _review(run_file)
             plan = _require_current_develop(run_file, int(review["revision"]))
             if int(plan.get("revision", 0)) != int(body.base_revision):
                 raise HTTPException(409, "调色方案已更新，请刷新后重试。")
             try:
+                if body.scope is not None:
+                    plan["creative_style"]["scope"] = body.scope
                 confirm_recommended_styles(plan, run_file.parent)
             except ValueError as exc:
                 raise HTTPException(409, str(exc)) from exc
@@ -6297,10 +6721,9 @@ def create_app(
 
     @app.patch("/api/runs/{run_id}/group-order", dependencies=[Depends(mutate_token)])
     def reorder_groups(run_id: str, body: GroupOrderBody) -> dict[str, Any]:
-        with review_lock:
-            active = jobs.active()
-            if active and active.get("kind") == "score" and active.get("context", {}).get("source_run_id") == run_id:
-                raise HTTPException(409, "这个分组正在评分，请等待完成后再调整。")
+        with review_lock, jobs.lock:
+            if jobs.blocks_photos(read_json(_run_file(data_dir, run_id))):
+                raise HTTPException(409, "这个工程正在处理照片，请完成或取消任务后再调整。")
             run_file = _run_file(data_dir, run_id)
             review = _review(run_file)
             if (int(review["revision"]) != body.base_revision
@@ -6320,14 +6743,9 @@ def create_app(
 
     @app.patch("/api/runs/{run_id}/groups", dependencies=[Depends(mutate_token)])
     def move_groups(run_id: str, body: BulkGroupEditBody) -> dict[str, Any]:
-        with review_lock:
-            active = jobs.active()
-            if (
-                active
-                and active.get("kind") == "score"
-                and active.get("context", {}).get("source_run_id") == run_id
-            ):
-                raise HTTPException(409, "这个分组正在评分，请等待完成后再调整。")
+        with review_lock, jobs.lock:
+            if jobs.blocks_photos(read_json(_run_file(data_dir, run_id))):
+                raise HTTPException(409, "这个工程正在处理照片，请完成或取消任务后再调整。")
             if body.new_group and body.group_id is not None:
                 raise HTTPException(422, "新建分组时不能同时指定已有分组。")
             if body.direction and (body.new_group or body.group_id is not None):
@@ -6347,28 +6765,18 @@ def create_app(
         "/api/runs/{run_id}/groups/{index}", dependencies=[Depends(mutate_token)]
     )
     def move_group(run_id: str, index: int, body: GroupEditBody) -> dict[str, Any]:
-        with review_lock:
-            active = jobs.active()
-            if (
-                active
-                and active.get("kind") == "score"
-                and active.get("context", {}).get("source_run_id") == run_id
-            ):
-                raise HTTPException(409, "这个分组正在评分，请等待完成后再调整。")
+        with review_lock, jobs.lock:
+            if jobs.blocks_photos(read_json(_run_file(data_dir, run_id))):
+                raise HTTPException(409, "这个工程正在处理照片，请完成或取消任务后再调整。")
             return _edit_group(
                 data_dir, run_id, index, body.group_id, body.base_revision, review_lock
             )
 
     @app.patch("/api/runs/{run_id}/excluded", dependencies=[Depends(mutate_token)])
     def exclude_items(run_id: str, body: ExcludeItemsBody) -> dict[str, Any]:
-        with review_lock:
-            active = jobs.active()
-            if (
-                active
-                and active.get("kind") == "score"
-                and active.get("context", {}).get("source_run_id") == run_id
-            ):
-                raise HTTPException(409, "这个工程正在评分，请等待完成后再调整。")
+        with review_lock, jobs.lock:
+            if jobs.blocks_photos(read_json(_run_file(data_dir, run_id))):
+                raise HTTPException(409, "这个工程正在处理照片，请完成或取消任务后再调整。")
             return _edit_excluded(
                 data_dir,
                 run_id,
@@ -6380,9 +6788,9 @@ def create_app(
 
     @app.post("/api/runs/{run_id}/photos/delete", dependencies=[Depends(mutate_token)])
     def delete_photos(run_id: str, body: DeletePhotosBody) -> dict[str, Any]:
-        with review_lock:
-            if jobs.active():
-                raise HTTPException(409, "有任务正在处理照片，请等待完成后再删除。")
+        with review_lock, jobs.lock:
+            if jobs.blocks_photos(read_json(_run_file(data_dir, run_id))):
+                raise HTTPException(409, "这个工程的照片正在处理，请完成或取消任务后再删除。")
             return _delete_photos(data_dir, run_id, body.indexes, body.base_revision, review_lock)
 
     @app.post("/api/runs/{run_id}/score", dependencies=[Depends(mutate_token)])
@@ -6454,6 +6862,69 @@ def create_app(
             {"title": "回滚 XMP", "manifest_path": str(manifest)},
         )
 
+    # Retire authoring operations while keeping legacy records readable. A stale
+    # browser or historical job must not silently apply an old develop recipe.
+    @app.middleware("http")
+    async def retired_develop_operations(request: Request, call_next):
+        path = request.url.path
+        if request.method not in {"GET", "HEAD", "OPTIONS"} and (
+            re.match(r"^/api/runs/[^/]+/(develop(?:/|$)|style-|exports(?:/|$))", path)
+            or path.startswith("/api/style-library")
+            or re.match(r"^/api/exports/[^/]+/execute(?:/|$)", path)
+        ):
+            return JSONResponse(status_code=410, content={"detail": "自动构图与自动调色已移除；旧记录保留，请使用选片导出。"})
+        return await call_next(request)
+
+    from .collaborative_review_api import create_review_router
+    from .timelapse_api import create_timelapse_router
+    from .selection_export import make_selection_export_router
+    from .framepick import FramePickLauncher
+
+    framepick = FramePickLauncher(data_dir, project_root)
+
+    @app.get("/api/toolbox/framepick")
+    def framepick_status():
+        return framepick.status()
+
+    @app.post("/api/toolbox/framepick/launch", dependencies=[Depends(mutate_token)])
+    def framepick_launch():
+        try:
+            return framepick.launch()
+        except FileNotFoundError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.get("/api/agent-info")
+    def agent_info(request: Request) -> dict[str, Any]:
+        connection = data_dir / "cli-session.json"
+        cli_executable = Path(sys.executable).parent / "PhotoToolbox.CLI.exe"
+        python_executable = Path(sys.executable)
+        if python_executable.name.lower() == "pythonw.exe":
+            python_executable = python_executable.with_name("python.exe")
+        invocation = [str(cli_executable)] if cli_executable.is_file() else [str(python_executable), "-m", "landscape_culler.toolbox_cli"]
+        return {
+            "schema": "PHOTO_TOOLBOX_AGENT/1", "version": PRODUCT_VERSION,
+            "origin": str(request.base_url).rstrip("/"), "data_dir": str(data_dir),
+            "connection_file": str(connection) if connection.is_file() else None,
+            "invocation": invocation,
+            "workflow": ["读取素材与当前人工选择", "提交 AI 建议或剪辑草案", "用户在界面确认", "等待用户修订变化", "按批准版本继续制作"],
+            "revision_policy": "建议、人工决定、草案分别保存；写入必须携带相应修订号。",
+        }
+
+    review_router = create_review_router(data_dir, mutate_token)
+    timelapse_router = create_timelapse_router(data_dir, mutate_token)
+    app.include_router(review_router)
+    app.include_router(timelapse_router)
+    app.include_router(make_selection_export_router(
+        data_dir=data_dir,
+        mutate_token=mutate_token,
+        load_run=lambda run_id: _apply_review(read_json(_run_file(data_dir, run_id)), _review(_run_file(data_dir, run_id))),
+        run_file=lambda run_id: _run_file(data_dir, run_id),
+        jobs=jobs,
+        review_lock=review_lock,
+        start_job=start_job,
+    ))
     return app
 
 

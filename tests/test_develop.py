@@ -283,7 +283,7 @@ def test_confirm_recommended_styles_copies_exact_candidate_identity(tmp_path: Pa
     assert selected["selected_preview_key"] == "a" * 64
 
 
-def test_global_selection_is_saved_once_then_atomically_frozen_for_all_groups(
+def test_global_selection_is_frozen_for_all_groups_without_copying_choices(
     tmp_path: Path,
 ) -> None:
     plan = _style_plan()
@@ -317,9 +317,11 @@ def test_global_selection_is_saved_once_then_atomically_frozen_for_all_groups(
     assert plan["revision"] == 5
     assert plan["creative_style"]["scope"] == "global"
     assert plan["creative_style"]["status"] == "confirmed"
-    assert set(plan["creative_style"]["groups"]) == {"1", "2"}
-    for group_id, frozen in plan["creative_style"]["groups"].items():
-        assert frozen["group_id"] == int(group_id)
+    from landscape_culler.style_state import selection_for_group
+    assert plan["creative_style"]["groups"] == {}
+    for group_id in (1, 2):
+        frozen = selection_for_group(plan, group_id)
+        assert frozen["scope"] == "global"
         assert frozen["preset_id"] == "uuid:style-1"
         assert frozen["preset_hash"] == "hash-style-1"
         assert frozen["amount"] == 65

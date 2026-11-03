@@ -11,7 +11,8 @@ from pathlib import Path
 
 from .constants import PROPRIETARY_RAW_EXTENSIONS
 from .develop import xmp_settings_for_recipe
-from .util import atomic_create_text, quick_fingerprint, read_json, write_json
+from .timelapse import find_media_tool
+from .util import atomic_create_text, full_fingerprint, quick_fingerprint, read_json, write_json
 
 
 def assert_lightroom_not_running() -> None:
@@ -37,10 +38,10 @@ def assert_lightroom_not_running() -> None:
 
 
 def assert_exiftool_available() -> Path:
-    executable = Path(os.environ.get("PHOTO_AI_EXIFTOOL", ""))
-    if not executable.is_file():
+    executable = find_media_tool("exiftool")
+    if not executable:
         raise RuntimeError("ExifTool 不可用，已拒绝写入 XMP。")
-    return executable
+    return Path(executable)
 
 
 def build_xmp(rating: int, keywords: list[str], develop: dict | None = None) -> str:
@@ -93,14 +94,17 @@ def validate_xmp_with_exiftool(path: Path, expected_rating: int, develop: dict |
         [
             str(executable), "-j", "-G1", "-XMP:Rating", "-XMP:Subject", "-XMP:HierarchicalSubject",
             *(f"-XMP-crs:{key}" for key in develop_keys),
-            str(path),
+            "-",
         ],
-        check=True,
+        # Read through Python's Unicode-aware filesystem layer: the bundled
+        # Windows ExifTool cannot reliably open Unicode/extended UNC paths.
+        input=path.read_bytes(),
+        check=False,
         capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
     )
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip().splitlines()
+        raise RuntimeError(f"ExifTool 无法校验 XMP：{detail[-1] if detail else '未知错误'}")
     payload = json.loads(completed.stdout)
     rating = payload[0].get("XMP-xmp:Rating") if payload else None
     if rating != expected_rating:
@@ -171,6 +175,9 @@ def write_results_xmp(
         raw_path = Path(item["path"])
         if not raw_path.is_file():
             raise FileNotFoundError(f"RAW 不存在：{raw_path}")
+        frozen_source = item.get("source_fingerprint")
+        if isinstance(frozen_source, dict) and full_fingerprint(raw_path) != frozen_source:
+            raise RuntimeError(f"RAW 在准备导出后发生变化：{raw_path}")
         xmp_path = raw_path.with_suffix(".xmp")
         records.append({
             "raw_path": str(raw_path),
@@ -183,6 +190,7 @@ def write_results_xmp(
                 else None
             ),
             "raw_before": quick_fingerprint(raw_path),
+            "source_fingerprint": frozen_source,
             "status": "skipped_existing_xmp" if xmp_path.exists() else "planned",
         })
 
@@ -212,6 +220,9 @@ def write_results_xmp(
             continue
         raw_path = Path(record["raw_path"])
         xmp_path = Path(record["xmp_path"])
+        frozen_source = record.get("source_fingerprint")
+        if isinstance(frozen_source, dict) and full_fingerprint(raw_path) != frozen_source:
+            raise RuntimeError(f"RAW 在准备导出后发生变化：{raw_path}")
         assert_lightroom_not_running()
         xmp_text = build_xmp(record["rating"], record["keywords"], record.get("develop"))
         validate_xmp(xmp_text)
@@ -244,6 +255,8 @@ def write_results_xmp(
             record["raw_after"] = quick_fingerprint(raw_path)
             if record["raw_before"] != record["raw_after"]:
                 raise RuntimeError(f"RAW 指纹发生变化：{raw_path}")
+            if isinstance(frozen_source, dict) and full_fingerprint(raw_path) != frozen_source:
+                raise RuntimeError(f"RAW 在写入星级时发生变化：{raw_path}")
             record["status"] = "created"
             _save_manifest(manifest_path, manifest)
         except Exception as exc:

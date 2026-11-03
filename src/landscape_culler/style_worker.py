@@ -16,11 +16,13 @@ import numpy as np
 from PIL import Image
 
 from .constants import READABLE_RAW_EXTENSIONS
+from .aesthetic_scores import qrealign_scores
 from .creative_lut import ORDINARY_XMP_LUT_LIMITATION, CreativeLutEngine
 from .features import technical_features
 from .general_aesthetic import GeneralAestheticScorer
 from .lightroom_apply import (
     LightroomApplyError,
+    lightroom_recipe_settings,
     resolve_lightroom_executable,
     start_lightroom,
     wait_for_lightroom_batch,
@@ -583,25 +585,7 @@ def _enumerate_runtime_presets(
 
 
 def _selected_crop(item: Mapping[str, Any]) -> dict[str, float]:
-    crop_id = str(item.get("crop_id") or "")
-    selected = next(
-        (
-            value
-            for value in item.get("crop_candidates", [])
-            if isinstance(value, Mapping) and str(value.get("id") or "") == crop_id
-        ),
-        None,
-    )
-    bounds = selected.get("bounds") if isinstance(selected, Mapping) else None
-    if not isinstance(bounds, Mapping):
-        bounds = {"left": 0.0, "top": 0.0, "right": 1.0, "bottom": 1.0}
-    crop = {
-        "left": float(bounds.get("left", 0.0)),
-        "top": float(bounds.get("top", 0.0)),
-        "right": float(bounds.get("right", 1.0)),
-        "bottom": float(bounds.get("bottom", 1.0)),
-        "angle": float(item.get("angle", 0.0)),
-    }
+    crop = _recipe_settings(item)["crop"]
     if not (
         0.0 <= crop["left"] < crop["right"] <= 1.0
         and 0.0 <= crop["top"] < crop["bottom"] <= 1.0
@@ -611,14 +595,11 @@ def _selected_crop(item: Mapping[str, Any]) -> dict[str, float]:
     return crop
 
 
-def _base_style(item: Mapping[str, Any]) -> dict[str, Any]:
-    base = item.get("base") if isinstance(item.get("base"), Mapping) else {}
-    handled = {"AutoTone", "WhiteBalance", "AutoLateralCA", "LensProfileEnable"}
-    return {
-        str(key): value
-        for key, value in base.items()
-        if key not in handled and isinstance(value, (bool, int, float, str))
-    }
+def _recipe_settings(item: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        return lightroom_recipe_settings(item, photo_name=str(item.get("filename") or "照片"))
+    except LightroomApplyError as exc:
+        raise StyleWorkerError(str(exc)) from exc
 
 
 def _stable_hash(payload: Mapping[str, Any]) -> str:
@@ -631,7 +612,7 @@ def _stable_hash(payload: Mapping[str, Any]) -> str:
 def _base_hash(item: Mapping[str, Any]) -> str:
     payload = {
         "crop": _selected_crop(item),
-        "base": dict(item.get("base") or {}),
+        "settings": _recipe_settings(item),
     }
     return _stable_hash(payload)
 
@@ -748,7 +729,7 @@ def _recommendation_request_key(
             "sources": source_rows,
             "candidates": candidates,
             "runtime": dict(runtime),
-            "pipeline": "style-request-v6",
+            "pipeline": "style-request-v7-validated-scores",
         }
     )
 
@@ -773,6 +754,9 @@ def _group_inputs(
         if not isinstance(raw_item, dict):
             continue
         item = dict(raw_item)
+        item["basic_color_status"] = (develop.get("basic_color") or {}).get("status", "pending")
+        if (develop.get("basic_color") or {}).get("status") == "skipped":
+            item["base"] = {}
         current_group = int(item.get("group_id", -1))
         if current_group < 0 or (group_id is not None and current_group != group_id):
             continue
@@ -1262,7 +1246,7 @@ def _lightroom_task(
     data_dir: Path,
 ) -> LightroomTask:
     source = Path(str(task["source_path"])).resolve(strict=True)
-    style = _base_style(source_item)
+    fields = _recipe_settings(source_item)
     is_creative_look = (
         str(task.get("look_kind") or "lightroom_preset") == "lightroom_profile"
     )
@@ -1273,12 +1257,7 @@ def _lightroom_task(
         photo_path=source,
         task_type="preview",
         task_id=str(task["task_id"]),
-        auto_tone=True,
-        auto_white_balance=True,
-        lens_profile=True,
-        remove_chromatic_aberration=True,
-        crop=_selected_crop(source_item),
-        style=style,
+        **fields,
         preset_uuid=None if is_creative_look else task.get("preset_uuid"),
         preset_scope=str(task.get("preset_scope") or "catalog"),
         preset_amount=int(task.get("amount", 100)),
@@ -1660,17 +1639,6 @@ def start_style_preview_batch(
     }
 
 
-def _external_01(value: Any) -> float:
-    number = float(value)
-    if 0.0 <= number <= 1.05:
-        return _bounded(number)
-    if number <= 5.5:
-        return _bounded((number - 1.0) / 4.0)
-    if number <= 10.5:
-        return _bounded(number / 10.0)
-    return _bounded(number / 100.0)
-
-
 def _technical_score(path: Path) -> tuple[float, np.ndarray]:
     with Image.open(path) as source:
         features = technical_features(source.convert("RGB"))
@@ -1752,8 +1720,12 @@ def _score_group(
     scores = scorer.score(paths)
     if len(scores) != len(paths):
         raise StyleWorkerError("Q-ReAlign 没有返回完整的预览评分。")
+    try:
+        scores = [qrealign_scores(item) for item in scores]
+    except ValueError as exc:
+        raise StyleWorkerError(f"照片组 {group.get('group_id')} 的预览评分无效：{exc}") from exc
     aesthetic = [
-        0.55 * _external_01(item["aesthetic"]) + 0.45 * _external_01(item["quality"])
+        0.55 * item["aesthetic"] + 0.45 * item["quality"]
         for item in scores
     ]
     neutral_technical, neutral_features = _technical_score(paths[0])
@@ -1784,8 +1756,8 @@ def _score_group(
             "group_consistency": _appearance_consistency(neutral_features, features),
         }
         candidate["qrealign"] = {
-            "aesthetic": round(_external_01(scores[index]["aesthetic"]), 6),
-            "quality": round(_external_01(scores[index]["quality"]), 6),
+            "aesthetic": round(scores[index]["aesthetic"], 6),
+            "quality": round(scores[index]["quality"], 6),
         }
     ranking = rank_rendered_candidates(
         rendered,
@@ -1973,6 +1945,13 @@ def collect_style_preview_batch(
             if not isinstance(task, dict) or task.get("render_status") == "ready":
                 continue
             task_id = str(task.get("task_id") or "")
+            if task.get("source_fingerprint"):
+                try:
+                    unchanged = source_cache_key(Path(task["source_path"])) == task["source_fingerprint"]
+                except OSError:
+                    unchanged = False
+                if not unchanged:
+                    raise StyleWorkerError("基础预览原始照片已变化，已拒绝使用旧结果。")
             cache_target = style_preview_path(run_root, str(task["cache_key"]))
             if _valid_jpeg(cache_target):
                 # A process may be terminated after the atomic move but before
@@ -2001,6 +1980,11 @@ def collect_style_preview_batch(
                 group_errors.append("Lightroom 未返回任务结果")
                 continue
             try:
+                if task.get("source_fingerprint") and (
+                    Path(str(row.get("photo_path") or "")).resolve()
+                    != Path(task["source_path"]).resolve()
+                ):
+                    raise StyleWorkerError("Lightroom 基础预览来源照片不匹配。")
                 _secure_collect_jpeg(
                     result,
                     task,
@@ -2079,7 +2063,7 @@ def _recover_cancelled_multi_group_previews(
         source_revision = int(worker.get("source_develop_revision", -1))
         if (
             str(worker.get("scope") or plan.get("scope") or "") != "group"
-            or len(group_ids) <= 1
+            or (len(group_ids) <= 1 and not worker.get("neutral_only"))
             or int(base_revision) not in {source_revision, source_revision + 1}
             or not _BATCH_ID.fullmatch(previous_batch_id)
         ):
@@ -2209,7 +2193,7 @@ def _current_neutral_lut_input(
         raise StyleWorkerError(
             f"照片组 {group_id} 的代表图已经变化，请先重新生成 AI 风格预览。"
         )
-    runtime = (
+    runtime = group.get("neutral_runtime_identity") or (
         recommendation.get("runtime_identity")
         if isinstance(recommendation.get("runtime_identity"), Mapping)
         else {}
@@ -2245,6 +2229,94 @@ def _current_neutral_lut_input(
             "请先生成 AI 风格预览。"
         ) from exc
     return group, preview, expected_key
+
+
+def _rebuild_neutral_lut_input(
+    run_dir: Path,
+    data_dir: Path,
+    batch_id: str,
+    base_revision: int,
+    *,
+    develop: dict[str, Any],
+    results: dict[str, Any],
+    recommendation: dict[str, Any],
+    group_id: int,
+    lightroom_exe: Path | str | None,
+    startup_timeout: float,
+    batch_timeout: float,
+    bridge_status_reader: BridgeStatusReader,
+    batch_creator: BatchCreator,
+    batch_waiter: BatchWaiter,
+    batch_status_reader: BatchStatusReader,
+    progress: ProgressCallback | None,
+) -> dict[str, Any]:
+    """Refresh one neutral RAW render without recommending or scoring looks."""
+    groups, _scenes, items = _group_inputs(develop, results, group_id=group_id)
+    group_key = str(group_id)
+    old_groups = recommendation.get("groups", [])
+    previous = next((g for g in old_groups if str(g.get("group_id")) == group_key), {})
+    representative = str((previous.get("probes") or {}).get("representative") or "")
+    if (group_key, representative.casefold()) not in items:
+        representative = str(groups[group_key][0]["path"])
+    source_item = items[(group_key, representative.casefold())]
+    fingerprint = source_cache_key(Path(representative))
+    _notify(progress, "launch", "连接 Lightroom 重建基础预览", 0, 1)
+    status = ensure_lightroom_preview_plugin(
+        data_dir, lightroom_exe=lightroom_exe, startup_timeout=startup_timeout,
+        status_reader=bridge_status_reader,
+    )
+    runtime = _runtime_identity(status, {})
+    # This runtime belongs only to this base. Replacing the shared catalog
+    # identity would invalidate unaffected groups' exact preset previews.
+    group = {
+        "group_id": group_id, "probes": {"representative": representative},
+        "neutral_runtime_identity": runtime, "neutral_refreshed": True, "render_tasks": [],
+        "candidates": [], "top3": [], "recommendation_status": "stale",
+    }
+    task = _neutral_task(group, source_item, develop, runtime)
+    task["source_fingerprint"] = fingerprint
+    task["task_id"] = _task_id(group_key, "neutral", task["cache_key"])
+    task["render_status"] = "pending"
+    group["neutral_render_task"] = task
+    incoming = run_dir / STYLE_PREVIEW_DIRECTORY / "_incoming" / batch_id
+    target = style_preview_path(run_dir, task["cache_key"])
+    cached = _valid_jpeg(target)
+    if cached:
+        task.update(status="ready", render_status="ready", preview_key=task["cache_key"],
+                    preview_path=str(target), cached=True)
+    recommendation["groups"] = [
+        g for g in old_groups if str(g.get("group_id")) != group_key
+    ] + [group]
+    recommendation["worker"] = {
+        "status": "rendering", "batch_id": batch_id, "scope": "group",
+        "source_develop_revision": int(base_revision), "group_ids": [group_key],
+        "task_count": int(not cached), "cached_count": int(cached), "incoming_dir": str(incoming),
+        "published_count": int(not cached),
+        "preview_only": True, "neutral_only": True,
+    }
+    recommendation["status"] = "rendering"
+    write_json(run_dir / STYLE_RECOMMENDATION_PATH, recommendation)
+    _notify(progress, "launch", "Lightroom 基础预览已就绪", 1, 1)
+    if not cached:
+        incoming.mkdir(parents=True, exist_ok=True)
+        batch_creator(data_dir, [_lightroom_task(task, source_item, incoming, data_dir)], batch_id=batch_id)
+        status = batch_waiter(
+            data_dir, batch_id, batch_timeout, status_reader=batch_status_reader,
+            progress_phase="process", progress_label="重建 Lightroom 基础预览",
+            progress_unit="张", progress_offset=0, progress_total=1,
+        )
+    else:
+        status = {"batch_id": batch_id, "status": "complete", "tasks": []}
+    current = _read_mapping(run_dir / "develop.json", "裁剪调色方案")
+    if current != develop or source_cache_key(Path(representative)) != fingerprint:
+        raise StyleWorkerError("基础预览期间照片或调色方案发生变化，已拒绝使用旧结果。")
+    collected = collect_style_preview_batch(
+        run_dir, data_dir, batch_id, batch_status=status, progress=progress,
+    )
+    if collected["worker"].get("failed_group_ids"):
+        raise StyleWorkerError("Lightroom 未完成基础预览，请重试。")
+    _notify(progress, "process", "基础预览已完成", 1, 1)
+    return collected
 
 
 def _lut_candidate_payload(
@@ -2286,6 +2358,7 @@ def _merge_lut_preview_develop(
     *,
     group_id: int,
     base_revision: int,
+    base_refreshed: bool = False,
 ) -> dict[str, Any]:
     """Persist a rendered-LUT choice without claiming ordinary-XMP support."""
 
@@ -2303,6 +2376,8 @@ def _merge_lut_preview_develop(
     )
     group_key = str(group_id)
     previous = dict(groups.get(group_key) or {})
+    if base_refreshed:
+        previous = {key: value for key, value in previous.items() if not key.startswith("recommended_")}
     recommendation_group = next(
         (
             item
@@ -2318,6 +2393,11 @@ def _merge_lut_preview_develop(
         if isinstance(item, Mapping)
         and str(item.get("lut_id") or "") != str(candidate.get("lut_id") or "")
     ]
+    if base_refreshed:
+        visible = [
+            {**{key: value for key, value in item.items() if "preview" not in key}, "render_status": "stale"}
+            for item in visible
+        ]
     visible.insert(0, public_candidate)
     groups[group_key] = {
         **previous,
@@ -2353,6 +2433,7 @@ def _merge_lut_preview_develop(
         if isinstance(item, Mapping)
     }
     creative["groups"] = groups
+    creative["scope"] = "group"
     creative["status"] = (
         "confirmed"
         if all_group_ids
@@ -2365,8 +2446,6 @@ def _merge_lut_preview_develop(
     )
     creative["updated_at"] = _now()
     develop["creative_style"] = creative
-    develop["basic_color"] = {"status": "enabled"}
-    develop["color_enabled"] = True
     develop["color_mode"] = "style"
     develop["revision"] = int(base_revision) + 1
     develop["updated_at"] = _now()
@@ -2386,6 +2465,13 @@ def _run_lut_preview(
     amount: int,
     engine_factory: LutEngineFactory,
     progress: ProgressCallback | None,
+    lightroom_exe: Path | str | None,
+    startup_timeout: float,
+    batch_timeout: float,
+    bridge_status_reader: BridgeStatusReader,
+    batch_creator: BatchCreator,
+    batch_waiter: BatchWaiter,
+    batch_status_reader: BatchStatusReader,
 ) -> dict[str, Any]:
     """Render one .cube over a previously exported Lightroom base preview."""
 
@@ -2395,24 +2481,39 @@ def _run_lut_preview(
     if int(develop.get("revision", -1)) != int(base_revision):
         raise StyleWorkerError("调色方案已更新，请刷新后重试。")
     recommendation_path = run_dir / STYLE_RECOMMENDATION_PATH
-    if not recommendation_path.is_file():
-        raise StyleWorkerError(
-            f"照片组 {group_id} 缺少 Lightroom 自然/基础调色 sRGB 预览，"
-            "请先生成 AI 风格预览。"
-        )
-    recommendation = _read_mapping(recommendation_path, "风格推荐计划")
-    group, neutral_preview, neutral_key = _current_neutral_lut_input(
-        run_dir,
-        develop=develop,
-        results=results,
-        recommendation=recommendation,
-        group_id=group_id,
-    )
     project_root = _creative_lut_project_root(data_dir)
     engine = engine_factory(project_root)
     descriptor = engine.get_lut(lut_id)
     if str(descriptor.lut_hash) != str(lut_hash):
         raise StyleWorkerError("LUT 版本已经变化，请重新选择。")
+    _recover_cancelled_multi_group_previews(
+        run_dir, data_dir, base_revision=base_revision,
+        status_reader=batch_status_reader, progress=None,
+    )
+    recommendation = _read_mapping(recommendation_path, "风格推荐计划") if recommendation_path.is_file() else {"groups": []}
+    base_refreshed = False
+    try:
+        group, neutral_preview, neutral_key = _current_neutral_lut_input(
+            run_dir, develop=develop, results=results,
+            recommendation=recommendation, group_id=group_id,
+        )
+    except StyleWorkerError:
+        recommendation = _rebuild_neutral_lut_input(
+            run_dir, data_dir, batch_id, base_revision, develop=develop,
+            results=results, recommendation=recommendation, group_id=group_id,
+            lightroom_exe=lightroom_exe, startup_timeout=startup_timeout,
+            batch_timeout=batch_timeout, bridge_status_reader=bridge_status_reader,
+            batch_creator=batch_creator, batch_waiter=batch_waiter,
+            batch_status_reader=batch_status_reader, progress=progress,
+        )
+        base_refreshed = True
+        group, neutral_preview, neutral_key = _current_neutral_lut_input(
+            run_dir, develop=develop, results=results,
+            recommendation=recommendation, group_id=group_id,
+        )
+    else:
+        base_refreshed = bool(group.get("neutral_refreshed"))
+        _notify(progress, "process", "复用已校验基础预览", 1, 1)
 
     preview_key = engine.cache_key(
         neutral_preview,
@@ -2441,6 +2542,13 @@ def _run_lut_preview(
             raise StyleWorkerError("创意 LUT 没有生成有效的 JPEG 预览。")
         _notify(progress, "lut", "渲染创意 LUT 真实预览", 1, 1)
 
+    current = _read_mapping(run_dir / "develop.json", "裁剪调色方案")
+    if current != develop:
+        raise StyleWorkerError("预览期间调色方案发生变化，已拒绝覆盖，请重新运行。")
+    _current_neutral_lut_input(
+        run_dir, develop=current, results=results,
+        recommendation=recommendation, group_id=group_id,
+    )
     candidate = _lut_candidate_payload(
         descriptor,
         amount=int(amount),
@@ -2506,6 +2614,7 @@ def _run_lut_preview(
         candidate,
         group_id=group_id,
         base_revision=base_revision,
+        base_refreshed=base_refreshed,
     )
     _notify(progress, "finalize", "保存创意 LUT 预览", 1, 1)
     return {
@@ -2976,8 +3085,6 @@ def _merge_develop(
         )
     creative["updated_at"] = _now()
     develop["creative_style"] = creative
-    develop["basic_color"] = {"status": "enabled"}
-    develop["color_enabled"] = True
     develop["color_mode"] = "style"
     develop["revision"] = int(base_revision) + 1
     develop["updated_at"] = _now()
@@ -3115,6 +3222,10 @@ def run_style_worker(
                 amount=int(amount),
                 engine_factory=lut_engine_factory,
                 progress=progress,
+                lightroom_exe=lightroom_exe, startup_timeout=startup_timeout,
+                batch_timeout=batch_timeout, bridge_status_reader=bridge_status_reader,
+                batch_creator=batch_creator, batch_waiter=batch_waiter,
+                batch_status_reader=batch_status_reader,
             )
             if progress is not None:
                 progress(

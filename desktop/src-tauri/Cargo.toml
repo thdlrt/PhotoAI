@@ -1,7 +1,7 @@
 [package]
 name = "photoai-desktop"
-version = "0.9.0-beta.4"
-description = "照片选片 Windows 桌面应用"
+version = "0.10.0-beta.2"
+description = "摄影后期工具箱 Windows 桌面应用"
 authors = ["PhotoAI"]
 edition = "2021"
 rust-version = "1.77.2"

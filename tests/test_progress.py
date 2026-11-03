@@ -149,8 +149,8 @@ def test_deep_job_progress_has_nodes_and_never_moves_backwards() -> None:
         job,
         {
             "event": "progress",
-            "phase": "local_vlm",
-            "label": "构图组内评审",
+            "phase": "global_vlm",
+            "label": "全批视觉评审",
             "current": 20,
             "total": 40,
             "unit": "张",
@@ -163,8 +163,9 @@ def test_deep_job_progress_has_nodes_and_never_moves_backwards() -> None:
     assert job["progress"]["stage_percent"] == 50.0
     statuses = {node["key"]: node["status"] for node in job["progress"]["nodes"]}
     assert statuses["aesthetic"] == "completed"
-    assert statuses["local_vlm"] == "active"
-    assert statuses["global_vlm"] == "pending"
+    assert statuses["local_rank"] == "completed"
+    assert statuses["global_vlm"] == "active"
+    assert statuses["global_rank"] == "pending"
 
     # A delayed earlier event cannot make the visible total percentage regress.
     before = job["progress"]["overall_percent"]
@@ -181,7 +182,7 @@ def test_deep_job_progress_has_nodes_and_never_moves_backwards() -> None:
         },
     )
     assert job["progress"]["overall_percent"] == before
-    assert job["progress"]["stage_key"] == "local_vlm"
+    assert job["progress"]["stage_key"] == "global_vlm"
 
     _complete_job_progress(job)
     assert job["progress"]["overall_percent"] == 100.0
@@ -424,6 +425,11 @@ def test_feature_cache_hits_still_emit_complete_phases(
         cached = extractor._cached_path(path)
         cached.parent.mkdir(parents=True, exist_ok=True)
         np.save(cached, np.full(8, index, dtype=np.float32))
+        from PIL import Image
+        from landscape_culler.preview import preview_cache_path
+        preview = preview_cache_path(path, extractor.preview_dir)
+        preview.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (32, 32)).save(preview)
 
     matrix, extracted = extractor.extract(paths)
     events = _events(capsys.readouterr().out)

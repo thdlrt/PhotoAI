@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .constants import PROPRIETARY_RAW_EXTENSIONS
+from .develop import recipe_bool as _as_bool, xmp_settings_for_recipe
 from .lightroom_bridge import (
     LightroomTask,
     create_lightroom_batch,
@@ -30,6 +31,8 @@ SAFE_STYLE_SETTINGS = frozenset(
         "PerspectiveUpright",
         "ConstrainToWarp",
         "Exposure2012",
+        "Temperature",
+        "Tint",
         "Contrast2012",
         "Highlights2012",
         "Shadows2012",
@@ -85,16 +88,6 @@ SAFE_STYLE_SETTINGS = frozenset(
 
 class LightroomApplyError(RuntimeError):
     """An actionable failure while handing a reviewed run to Lightroom."""
-
-
-def _as_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    if isinstance(value, str):
-        return value.strip().casefold() in {"1", "true", "yes", "on", "auto", "enabled"}
-    return False
 
 
 def _auto_white_balance(base: Mapping[str, Any]) -> bool:
@@ -159,6 +152,35 @@ def _creative_profile_style(recipe: Mapping[str, Any]) -> dict[str, str | float]
     # is not a CameraProfile and its UUID is not an ordinary preset UUID.
     # Dedicated descriptor fields are validated by _creative_look_fields().
     return {}
+
+
+def lightroom_recipe_settings(recipe: Mapping[str, Any], *, photo_name: str) -> dict[str, Any]:
+    """One translation of saved crop/base choices for preview and final export.
+
+    Legacy style IDs are still part of saved recipes. Merge their scalar
+    adjustments exactly as the XMP writer does, then apply the bridge allowlist.
+    No photo, model, plan or sidecar is read or changed here.
+    """
+    if not isinstance(recipe.get("base"), Mapping):
+        raise LightroomApplyError(f"{photo_name} 缺少已确认的 Lightroom 基础方案。")
+    crop = _selected_crop(recipe, photo_name=photo_name)
+    try:
+        settings = xmp_settings_for_recipe(dict(recipe))
+    except (ValueError, TypeError, KeyError, OverflowError) as exc:
+        raise LightroomApplyError(f"{photo_name} 的已保存调色方案无效：{exc}") from exc
+    # Use the same coordinate precision as the saved XMP and on-screen crop.
+    crop = {key: float(settings[f"Crop{key.title()}"]) for key in crop}
+    style = _safe_style(settings)
+    if settings.get("WhiteBalance") and not _auto_white_balance(settings):
+        style["WhiteBalance"] = str(settings["WhiteBalance"])
+    return {
+        "auto_tone": _as_bool(settings.get("AutoTone")),
+        "auto_white_balance": _auto_white_balance(settings),
+        "lens_profile": _as_bool(settings.get("LensProfileEnable")),
+        "remove_chromatic_aberration": _as_bool(settings.get("AutoLateralCA")),
+        "crop": crop,
+        "style": style,
+    }
 
 
 def _creative_look_fields(recipe: Mapping[str, Any]) -> dict[str, Any]:
@@ -234,21 +256,13 @@ def lightroom_tasks_from_payload(payload: Mapping[str, Any]) -> list[LightroomTa
             raise LightroomApplyError(
                 f"为保证 RAW 文件本身不被修改，Lightroom 自动处理只接受独立 XMP 的相机 RAW：{photo_path.name}"
             )
-        base = recipe.get("base")
-        if not isinstance(base, Mapping):
-            raise LightroomApplyError(f"{photo_path.name} 缺少已确认的 Lightroom 基础方案。")
-        style = _safe_style(base)
-        style.update(_creative_profile_style(recipe))
+        fields = lightroom_recipe_settings(recipe, photo_name=photo_path.name)
+        fields["style"].update(_creative_profile_style(recipe))
         look_fields = _creative_look_fields(recipe)
         task = LightroomTask(
             photo_path=photo_path.resolve(),
             rating=rating,
-            auto_tone=_as_bool(base.get("AutoTone")),
-            auto_white_balance=_auto_white_balance(base),
-            lens_profile=_as_bool(base.get("LensProfileEnable")),
-            remove_chromatic_aberration=_as_bool(base.get("AutoLateralCA")),
-            crop=_selected_crop(recipe, photo_name=photo_path.name),
-            style=style,
+            **fields,
             task_id=f"photo-{index:06d}",
             **look_fields,
         )

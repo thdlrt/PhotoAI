@@ -56,3 +56,11 @@ Lightroom-Presets (MIT). Those preset libraries are not bundled here.
 collected for this release. It is a notice inventory, not a claim that every
 optional component is installed or a substitute for upstream license terms.
 `ThirdPartyNotices.zip` in the Release contains the same notices for convenience.
+
+## Optional portable video tools
+
+The local media-enabled candidate includes unchanged Gyan FFmpeg/FFprobe 8.0.1 binaries. Their GPL notices, precise source/build provenance and SHA-256 values are preserved in licenses/ffmpeg/INTEGRATION.md and the adjacent notice files. These tools are separate executables and are not relicensed under the application's MIT license.
+
+## FramePick / 帧选
+
+工具箱集成 FramePick 1.2.0（MIT，Copyright 2026 thdlrt），源码位于 integrations/framepick。Windows 发布载荷中的 .NET/WPF 原始许可证与第三方声明保留在 tools/framepick/licenses。复用本工具箱的 FFmpeg，不重复分发第二份媒体工具。

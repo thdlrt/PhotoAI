@@ -1,7 +1,7 @@
 [project]
 name = "landscape-ai-culler"
-version = "0.9.0b4"
-description = "Local, non-destructive AI-assisted landscape photo culling and Lightroom workflow."
+version = "0.10.0b2"
+description = "Local photography post-production toolbox: AI culling, collaborative review, timelapse and Lightroom handoff."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
@@ -38,6 +38,8 @@ landscape-culler = "landscape_culler.cli:main"
 landscape-culler-web = "landscape_culler.web:main"
 photoai-service = "landscape_culler.service:main"
 photoai-core-worker = "landscape_culler.core_worker:main"
+photography-toolbox = "landscape_culler.toolbox_cli:main"
+photo-toolbox = "landscape_culler.toolbox_cli:main"
 
 [build-system]
 requires = ["hatchling"]

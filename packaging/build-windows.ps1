@@ -3,7 +3,9 @@ param(
     [switch]$SkipDesktop,
     [switch]$SkipNpmInstall,
     [switch]$NoBundle,
-    [switch]$Quick
+    [switch]$Quick,
+    [switch]$WithMediaTools,
+    [string]$MediaToolsSource
 )
 
 $ErrorActionPreference = 'Stop'
@@ -20,14 +22,19 @@ $ResourceSource = Join-Path $ProjectRoot 'packaging\resources'
 $ExifToolSource = Join-Path $ProjectRoot 'packaging\vendor\exiftool-13.59'
 $ExifToolExe = Join-Path $ExifToolSource 'exiftool-13.59_64\exiftool.exe'
 $LightroomSource = Join-Path $ProjectRoot 'integrations\photo-ai-lightroom.lrplugin'
+if (-not $MediaToolsSource) {
+    $MediaToolsSource = Join-Path $ProjectRoot 'packaging\vendor\ffmpeg-8.0.1'
+}
 
 # Release inputs are intentionally pinned here as well as in the staged
 # manifest. A different builder-local executable must be reviewed explicitly.
 $ExpectedUvVersion = 'uv 0.11.2 (02036a8ba 2026-03-26 x86_64-pc-windows-msvc)'
 $ExpectedUvSha256 = '0548e585d7030d3be5e23cbf32da0d510a4225d15b72c28b15cc7ee7187dbb59'
 $ExpectedExifToolSha256 = '68c079c32fdae0d6c7130e9a5fb73f8ac9dabdf9ab8da312da4f6c549d6d3385'
-$ProductVersion = '0.9.0-beta.4'
-$PythonPackageVersion = '0.9.0b4'
+$ExpectedFfmpegSha256 = '74db6c184a03dba2bdfe23e1a1f41cf5a8385bc1de6a7a1b26db1dc541abef93'
+$ExpectedFfprobeSha256 = '55bb6c6289367ae2383efa86b26bf2596f8adb72ac747360eb13df162354161c'
+$ProductVersion = '0.10.0-beta.2'
+$PythonPackageVersion = '0.10.0b2'
 
 function Reset-OwnedDirectory {
     param(
@@ -109,6 +116,19 @@ if ($UvVersion -ne $ExpectedUvVersion) {
 }
 Assert-FileHash -Path $Uv -Expected $ExpectedUvSha256 -Label 'uv.exe'
 Assert-FileHash -Path $ExifToolExe -Expected $ExpectedExifToolSha256 -Label 'ExifTool 13.59'
+if ($WithMediaTools) {
+    Assert-FileHash -Path (Join-Path $MediaToolsSource 'ffmpeg.exe') -Expected $ExpectedFfmpegSha256 -Label 'FFmpeg 8.0.1 static'
+    Assert-FileHash -Path (Join-Path $MediaToolsSource 'ffprobe.exe') -Expected $ExpectedFfprobeSha256 -Label 'FFprobe 8.0.1 static'
+    foreach ($Notice in @('LICENSE', 'README.txt', 'manifest.json')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $MediaToolsSource $Notice) -PathType Leaf)) {
+            throw "缺少 FFmpeg 来源或许可文件：$Notice"
+        }
+    }
+    & $Python (Join-Path $PSScriptRoot 'verify-media-tools.py') --tools $MediaToolsSource
+    if ($LASTEXITCODE -ne 0) {
+        throw '便携媒体工具隔离验证失败。'
+    }
+}
 
 foreach ($Required in @(
     (Join-Path $ResourceSource 'ai-requirements.lock'),
@@ -140,9 +160,7 @@ if ($ProjectMetadataVersion.Trim() -ne $PythonPackageVersion) {
 if ($Quick) {
     New-Item -ItemType Directory -Force -Path $BuildRoot | Out-Null
     $QuickWheelRoot = Join-Path $BuildRoot 'ai-worker'
-    if (Test-Path -LiteralPath $QuickWheelRoot) {
-        Remove-Item -LiteralPath $QuickWheelRoot -Recurse -Force
-    }
+    Reset-OwnedDirectory -Target $QuickWheelRoot -AllowedRoot $BuildRoot
 } else {
     Reset-OwnedDirectory -Target $BuildRoot -AllowedRoot (Join-Path $ProjectRoot 'packaging')
 }
@@ -178,6 +196,7 @@ try {
 
 foreach ($Output in @(
     @{ Root = $ServiceRoot; Exe = 'PhotoAI.Service.exe' },
+    @{ Root = $ServiceRoot; Exe = 'PhotoToolbox.CLI.exe' },
     @{ Root = $WorkerRoot; Exe = 'PhotoAI.CoreWorker.exe' }
 )) {
     $Executable = Join-Path $Output.Root $Output.Exe
@@ -205,12 +224,22 @@ foreach ($Directory in @($StageTools, $StageIntegrations, $StageManifests, $Stag
 }
 
 $StageUv = Join-Path $StageTools 'uv.exe'
+& (Join-Path $PSScriptRoot 'build-framepick.ps1') -Destination (Join-Path $StageTools 'framepick')
+if ($LASTEXITCODE -ne 0) { throw '帧选组件构建失败。' }
 Copy-Item -LiteralPath $Uv -Destination $StageUv -Force
 Write-HashSidecar -Path $StageUv | Out-Null
 Copy-Item -LiteralPath $ExifToolSource -Destination $StageTools -Recurse -Force
 $StageExifTool = Join-Path $StageTools 'exiftool-13.59\exiftool-13.59_64\exiftool.exe'
 Assert-FileHash -Path $StageExifTool -Expected $ExpectedExifToolSha256 -Label 'staged ExifTool 13.59'
 Write-HashSidecar -Path $StageExifTool | Out-Null
+if ($WithMediaTools) {
+    $StageMediaTools = Join-Path $StageTools 'ffmpeg'
+    Copy-TreeContents -Source $MediaToolsSource -Destination $StageMediaTools
+    Assert-FileHash -Path (Join-Path $StageMediaTools 'ffmpeg.exe') -Expected $ExpectedFfmpegSha256 -Label 'staged FFmpeg'
+    Assert-FileHash -Path (Join-Path $StageMediaTools 'ffprobe.exe') -Expected $ExpectedFfprobeSha256 -Label 'staged FFprobe'
+    Write-HashSidecar -Path (Join-Path $StageMediaTools 'ffmpeg.exe') | Out-Null
+    Write-HashSidecar -Path (Join-Path $StageMediaTools 'ffprobe.exe') | Out-Null
+}
 
 $StagePlugin = Join-Path $StageIntegrations 'photo-ai-lightroom.lrplugin'
 New-Item -ItemType Directory -Force -Path $StagePlugin | Out-Null
@@ -238,12 +267,15 @@ $ResourceInventory = @($ResourceFiles | ForEach-Object {
         sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
     }
 })
+$WorkerCodeVersion = & $Python -c 'from landscape_culler.constants import AI_WORKER_CODE_VERSION; print(AI_WORKER_CODE_VERSION)'
+if ($LASTEXITCODE -ne 0) { throw '无法读取工作组件版本。' }
 $ReleaseManifest = [ordered]@{
     schema_version = 1
     product = 'PhotoAI'
-    product_name = '照片选片'
+    product_name = '摄影后期工具箱'
     version = $ProductVersion
     python_package_version = $PythonPackageVersion
+    worker_code_version = $WorkerCodeVersion.Trim()
     api_version = $ApiVersion.Trim()
     service_protocol = $ServiceProtocol.Trim()
     worker_protocol = $WorkerProtocol.Trim()
@@ -254,6 +286,9 @@ $ReleaseManifest = [ordered]@{
     offline_base_install = $true
     model_weights_included = $false
     ai_environment_installed_post_setup = $true
+    media_tools_included = [bool]$WithMediaTools
+    framepick_included = $true
+    framepick_version = '1.2.0'
     resources = $ResourceInventory
 }
 $ReleaseManifestPath = Join-Path $StageManifests 'release-manifest.json'
@@ -276,6 +311,7 @@ if (-not $SkipDesktop) {
         ResourceStage = $StageRoot
         SkipNpmInstall = ($SkipNpmInstall -or $Quick)
         NoBundle = $NoBundle
+        WithMediaTools = $WithMediaTools
     }
     & (Join-Path $PSScriptRoot 'build-desktop.ps1') @DesktopArguments
     if ($LASTEXITCODE -ne 0) {

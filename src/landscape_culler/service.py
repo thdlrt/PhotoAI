@@ -102,10 +102,13 @@ class ServiceApp:
         app: AsgiApp,
         bootstrap_token: str | None = None,
         control_token: str | None = None,
+        cli_token: str | None = None,
     ) -> None:
         self.app = app
         self.gate = _SessionGate(bootstrap_token)
         self._control_token = control_token or secrets.token_urlsafe(32)
+        self.cli_token = cli_token or secrets.token_urlsafe(32)
+        self.instance_id = secrets.token_hex(16)
         self.shutdown: Callable[[], None] | None = None
 
     @property
@@ -133,7 +136,7 @@ class ServiceApp:
         path = str(scope.get("path") or "/")
         if path == "/health":
             body = json.dumps(
-                {"protocol": PROTOCOL, "status": "ok", "pid": os.getpid()},
+                {"protocol": PROTOCOL, "status": "ok", "pid": os.getpid(), "instance_id": self.instance_id},
                 separators=(",", ":"),
             ).encode("utf-8")
             await _plain_response(send, 200, body)
@@ -141,6 +144,10 @@ class ServiceApp:
 
         headers = _headers(scope)
         session_valid = self.gate.valid_session(_session_cookie(headers))
+        cli_candidate = headers.get("x-photo-ai-cli-token")
+        cli_valid = bool(cli_candidate) and secrets.compare_digest(str(cli_candidate), self.cli_token)
+        if cli_valid and path != "/api/service/shutdown":
+            session_valid = True
         query_pairs = parse_qsl(
             bytes(scope.get("query_string") or b"").decode("utf-8", "replace"),
             keep_blank_values=True,
@@ -346,6 +353,8 @@ def main(argv: list[str] | None = None) -> int:
     # desktop parent receives exactly one machine-readable handshake line.
     with contextlib.redirect_stdout(sys.stderr):
         layout = _initialize_managed_content_root(args.content_root)
+        from .agent_connection import acquire_service_lock, release_service_lock
+        service_lock = acquire_service_lock(layout.state / "service.lock")
         import uvicorn
 
         os.environ["PHOTO_AI_DEFER_DEFAULT_WEB_APP"] = "1"
@@ -375,12 +384,18 @@ def main(argv: list[str] | None = None) -> int:
         if parent_pid:
             _watch_parent(server, parent_pid)
 
+    from .agent_connection import publish_connection, remove_connection
+    connection_path = publish_connection(
+        layout.state / "cli-session.json", origin=f"http://127.0.0.1:{port}", pid=os.getpid(),
+        instance_id=app.instance_id, token=app.cli_token, content_root=layout.root, data_dir=layout.data_dir,
+    )
     handshake = {
         "port": port,
         "token": app.bootstrap_token,
         "control_token": app.control_token,
         "pid": os.getpid(),
         "origin": f"http://127.0.0.1:{port}",
+        "connection_file": str(connection_path),
     }
     print(
         f"{PROTOCOL} "
@@ -393,6 +408,8 @@ def main(argv: list[str] | None = None) -> int:
             server.run(sockets=[socket])
         finally:
             socket.close()
+            remove_connection(connection_path, app.instance_id)
+            release_service_lock(service_lock)
     return 0
 
 

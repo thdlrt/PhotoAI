@@ -13,6 +13,7 @@ import os
 import queue
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -25,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from .content_root import ContentRootLayout, resolve_resource_path, runtime_environment
-from .constants import VLM_PROMPT_VERSION
+from .constants import AI_WORKER_CODE_VERSION, VLM_PROMPT_VERSION
 from .progress import emit_progress, heartbeat_timestamp, phase_end, phase_start
 from .util import read_json, write_json
 from .version import AI_ENGINE_VERSION, PRODUCT_VERSION, PYTHON_RUNTIME_VERSION
@@ -187,6 +188,10 @@ def _venv_python(engine: Path) -> Path:
     return engine / "venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
+def _worker_site_packages(engine: Path) -> Path:
+    return engine / "venv" / ("Lib/site-packages" if os.name == "nt" else "lib/python3.12/site-packages")
+
+
 def _engine_pointer(layout: ContentRootLayout) -> Path:
     return layout.runtimes / ENGINE_POINTER
 
@@ -224,22 +229,24 @@ def ai_worker_needs_update(engine: Path) -> bool:
     """Published worker wheels are installed separately from desktop updates."""
     try:
         manifest = read_json(engine / ENGINE_MANIFEST)
-        version = manifest.get("product_version")
     except (OSError, ValueError):
         return False  # active_engine handles missing/invalid engine manifests.
     revision = manifest.get("vlm_prompt_version")
-    if revision:
-        return revision != VLM_PROMPT_VERSION
-    # beta.3 already ships this review fix; desktop-only updates need not
-    # reinstall its unchanged AI environment. Read the legacy worker revision.
-    constants = engine / "venv" / ("Lib/site-packages" if os.name == "nt" else "lib/python3.12/site-packages") / "landscape_culler/constants.py"
+    code_revision = manifest.get("worker_code_version")
+    if revision and code_revision:
+        return revision != VLM_PROMPT_VERSION or code_revision != AI_WORKER_CODE_VERSION
+    # Read old manifests without rewriting them. Product version alone cannot
+    # identify worker fixes in a local build with the same desktop version.
+    constants = _worker_site_packages(engine) / "landscape_culler/constants.py"
     try:
-        match = re.search(r'^VLM_PROMPT_VERSION\s*=\s*[\"\']([^\"\']+)[\"\']', constants.read_text(encoding="utf-8"), re.MULTILINE)
+        source = constants.read_text(encoding="utf-8")
     except OSError:
-        match = None
-    if match:
-        return match.group(1) != VLM_PROMPT_VERSION
-    return bool(version and version != PRODUCT_VERSION)
+        return True
+    def installed_revision(name: str) -> str | None:
+        match = re.search(rf'^{name}\s*=\s*[\"\']([^\"\']+)[\"\']', source, re.MULTILINE)
+        return match.group(1) if match else None
+    return (installed_revision("VLM_PROMPT_VERSION") != VLM_PROMPT_VERSION
+            or installed_revision("AI_WORKER_CODE_VERSION") != AI_WORKER_CODE_VERSION)
 
 
 def ai_runtime_status(layout: ContentRootLayout) -> dict[str, Any]:
@@ -257,7 +264,7 @@ def ai_runtime_status(layout: ContentRootLayout) -> dict[str, Any]:
         "engine_version": AI_ENGINE_VERSION,
         "ready": engine is not None and not worker_update_required,
         "worker_update_required": worker_update_required,
-        "message": "AI 评审计算环境需要更新，请在资源页重新配置当前档位（复用已下载模型）。" if worker_update_required else "",
+        "message": "AI 处理代码需要更新，现有 Python、依赖和已校验模型会复用。" if worker_update_required else "",
         "engine_path": str(engine) if engine else None,
         "gpu": {
             "available": gpu.available,
@@ -487,7 +494,7 @@ def _run_source_attempts(
 
 
 def _ensure_install_preconditions(
-    layout: ContentRootLayout, profile_id: str
+    layout: ContentRootLayout, profile_id: str, required_bytes: int | None = None
 ) -> NvidiaStatus:
     if profile_id not in PROFILE_ESTIMATED_BYTES:
         raise AiRuntimeError("未知显存档位。")
@@ -504,7 +511,7 @@ def _ensure_install_preconditions(
             f"{profile_id.upper()} 配置至少需要 {required_vram} MiB 显存，当前为 {gpu.memory_total_mib} MiB。"
         )
     free = shutil.disk_usage(layout.root).free
-    required = PROFILE_ESTIMATED_BYTES[profile_id]
+    required = PROFILE_ESTIMATED_BYTES[profile_id] if required_bytes is None else required_bytes
     if free < required:
         raise AiRuntimeError(f"数据盘空间不足：至少还需 {required / 1024**3:.1f} GiB。")
     return gpu
@@ -542,6 +549,113 @@ def _restore_file_snapshot(path: Path, snapshot: bytes | None) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _reusable_worker_engine(layout: ContentRootLayout, profile_id: str, resources_root: Path | None) -> Path | None:
+    engine = active_engine(layout)
+    if engine is None:
+        return None
+    manifest = read_json(engine / ENGINE_MANIFEST)
+    smoke = read_json(engine / SMOKE_RESULT)
+    if (manifest.get("python_version") != PYTHON_RUNTIME_VERSION
+            or manifest.get("profile_id") != profile_id or smoke.get("profile_id") != profile_id):
+        return None
+    site = _worker_site_packages(engine)
+    package = site / "landscape_culler"
+    if not package.is_dir() or package.is_symlink() or not package.resolve().is_relative_to(engine.resolve()):
+        return None
+    requirements = (resources_root or release_resources_root()) / "ai-requirements.lock"
+    if manifest.get("requirements_sha256"):
+        try:
+            if manifest["requirements_sha256"] != _sha256(requirements):
+                return None
+        except OSError:
+            return None
+    from .model_resources import model_resources_status
+    models = model_resources_status(layout.models, layout.state)
+    if bool(models.get("cloud_vision")) != bool(smoke.get("checks", {}).get("cloud_vision")):
+        return None
+    return engine if any(item.get("id") == profile_id and item.get("ready") and item.get("configured")
+                         for item in models.get("profiles", [])) else None
+
+
+def _remove_worker_tree(path: Path, engine: Path) -> None:
+    if not path.resolve().is_relative_to(engine.resolve()) or path == engine:
+        raise AiRuntimeError("拒绝清理计算环境之外的处理代码。")
+    def retry_readonly(function, filename, error):
+        if not Path(filename).resolve().is_relative_to(engine.resolve()):
+            raise error
+        os.chmod(filename, stat.S_IWRITE)
+        function(filename)
+    shutil.rmtree(path, onexc=retry_readonly)
+
+
+def _refresh_worker_code(layout: ContentRootLayout, engine: Path, profile_id: str,
+                         resources: ReleaseResources, runner: CommandRunner,
+                         environment: Mapping[str, str]) -> dict[str, Any]:
+    if not ai_worker_needs_update(engine):
+        phase_start("activate", "复用已就绪的计算环境和模型", 1, unit="项")
+        phase_end("activate", "计算环境和模型无需重复安装", 1, unit="项")
+        return ai_runtime_status(layout)
+    site = _worker_site_packages(engine)
+    names = ["landscape_culler", *(path.name for path in site.glob("landscape_ai_culler-*.dist-info"))]
+    backup = engine / f".worker-backup-{uuid.uuid4().hex}"
+    backup.mkdir()
+    manifest_path = engine / ENGINE_MANIFEST
+    check_path = engine / "worker-check.json"
+    manifest_before = _file_snapshot(manifest_path)
+    check_before = _file_snapshot(check_path)
+    installed = False
+    keep_backup = False
+    try:
+        for name in names:
+            shutil.copytree(site / name, backup / name)
+        offline_environment = dict(environment)
+        offline_environment.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", UV_OFFLINE="1")
+        phase_start("worker", "更新 AI 处理代码", 1, unit="项")
+        installed = True
+        runner([str(resources.uv), "pip", "install", "--python", str(_venv_python(engine)),
+                "--managed-python", "--no-deps", "--reinstall", "--offline", str(resources.worker_wheel)],
+               _stage_environment(offline_environment, phase="worker", label="更新 AI 处理代码",
+                                  resource="AI Worker", detail="复用现有 Python、依赖和已校验模型，仅更新处理代码",
+                                  watch_roots=[]), resources.root)
+        runner([str(_venv_python(engine)), "-m", "landscape_culler.ai_install_worker",
+                "--content-root", str(layout.root), "--profile", profile_id,
+                "--smoke-result", str(check_path), "--worker-only"], offline_environment, resources.root)
+        check = read_json(check_path)
+        if (check.get("status") != "passed" or check.get("worker_code_version") != AI_WORKER_CODE_VERSION
+                or check.get("vlm_prompt_version") != VLM_PROMPT_VERSION):
+            raise AiRuntimeError("处理代码检查未通过，已停止更新。")
+        manifest = json.loads(manifest_before)
+        write_json(manifest_path, {**manifest, "product_version": PRODUCT_VERSION,
+                                  "worker_wheel": resources.worker_wheel.name,
+                                  "worker_wheel_sha256": resources.worker_wheel_sha256,
+                                  "vlm_prompt_version": VLM_PROMPT_VERSION,
+                                  "worker_code_version": AI_WORKER_CODE_VERSION,
+                                  "requirements_sha256": _sha256(resources.requirements),
+                                  "worker_updated_at": _now()})
+        phase_end("worker", "AI 处理代码已更新，现有模型校验保留", 1, unit="项")
+        phase_start("activate", "启用处理代码", 1, unit="项")
+        phase_end("activate", "现有计算环境已就绪", 1, unit="项")
+    except Exception:
+        if installed:
+            try:
+                current = [site / "landscape_culler", *site.glob("landscape_ai_culler-*.dist-info")]
+                for path in current:
+                    if path.exists():
+                        _remove_worker_tree(path, engine)
+                for name in names:
+                    shutil.copytree(backup / name, site / name)
+                _restore_file_snapshot(manifest_path, manifest_before)
+                _restore_file_snapshot(check_path, check_before)
+            except Exception as restore_error:
+                keep_backup = True
+                raise AiRuntimeError(f"处理代码更新失败，旧代码备份保留在 {backup}；自动恢复失败：{restore_error}") from restore_error
+        raise
+    finally:
+        if not keep_backup:
+            _remove_worker_tree(backup, engine)
+    return ai_runtime_status(layout)
+
+
 def install_ai_profile(
     layout: ContentRootLayout,
     profile_id: str,
@@ -562,7 +676,9 @@ def install_ai_profile(
         current_resource="NVIDIA GPU",
         heartbeat_at=heartbeat_timestamp(),
     )
-    gpu = _ensure_install_preconditions(layout, profile_id)
+    reusable = _reusable_worker_engine(layout, profile_id, resources_root)
+    required_bytes = 64 * 1024**2 if reusable is not None else PROFILE_ESTIMATED_BYTES.get(profile_id, 0)
+    gpu = _ensure_install_preconditions(layout, profile_id, required_bytes)
     emit_progress(
         "preflight",
         "显卡与驱动符合要求",
@@ -585,7 +701,7 @@ def install_ai_profile(
         unit="项",
         detail=(
             f"可用 {free_bytes / 1024**3:.1f} GiB；"
-            f"本配置至少需要 {PROFILE_ESTIMATED_BYTES[profile_id] / 1024**3:.1f} GiB"
+            f"本次操作至少需要 {required_bytes / 1024**3:.2f} GiB"
         ),
         current_resource=str(layout.root),
         heartbeat_at=heartbeat_timestamp(),
@@ -593,13 +709,6 @@ def install_ai_profile(
     resources = locate_release_resources(resources_root)
     phase_end("preflight", "硬件与空间检查通过", 2, unit="项")
     runner = runner or _run
-    engines = layout.runtimes / "engines"
-    engines.mkdir(parents=True, exist_ok=True)
-    # A venv is not relocatable: pyvenv.cfg and entry points may contain its
-    # absolute creation path. Build the candidate at its permanent unique path
-    # and make it current only by atomically replacing current.json.
-    candidate = engines / f"{AI_ENGINE_VERSION}-{uuid.uuid4().hex}"
-    candidate.mkdir(parents=True, exist_ok=False)
     managed_python = layout.runtimes / "python"
     environment = os.environ.copy()
     environment.update(runtime_environment(layout))
@@ -615,6 +724,13 @@ def install_ai_profile(
             "PHOTO_AI_MODEL_PROFILE": profile_id,
         }
     )
+    if reusable is not None:
+        return _refresh_worker_code(layout, reusable, profile_id, resources, runner, environment)
+    engines = layout.runtimes / "engines"
+    engines.mkdir(parents=True, exist_ok=True)
+    # A venv is not relocatable. Build at its permanent path, then publish.
+    candidate = engines / f"{AI_ENGINE_VERSION}-{uuid.uuid4().hex}"
+    candidate.mkdir(parents=True, exist_ok=False)
     try:
         phase_start("python", "安装受管 Python", 1, unit="项")
         python_command = [
@@ -782,9 +898,11 @@ def install_ai_profile(
                 "engine_version": AI_ENGINE_VERSION,
                 "product_version": PRODUCT_VERSION,
                 "python_version": PYTHON_RUNTIME_VERSION,
+                "requirements_sha256": _sha256(resources.requirements),
                 "worker_wheel": resources.worker_wheel.name,
                 "worker_wheel_sha256": resources.worker_wheel_sha256,
                 "vlm_prompt_version": VLM_PROMPT_VERSION,
+                "worker_code_version": AI_WORKER_CODE_VERSION,
                 "profile_id": profile_id,
                 "gpu": {
                     "name": gpu.name,

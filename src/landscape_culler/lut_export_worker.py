@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import secrets
@@ -10,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .progress import emit_progress, phase_end, phase_start
-from .util import full_fingerprint, read_json
+from .util import full_fingerprint, read_json, write_json
 
 LUT_EXPORT_PROTOCOL = "PHOTO_AI_LUT_EXPORT/1"
 _MAX_TASK_BYTES = 8 * 1024 * 1024
@@ -51,6 +52,9 @@ def _read_task(path: Path) -> dict[str, Any]:
     items = payload.get("items")
     if not isinstance(items, list) or not items or len(items) > 10_000:
         raise LutExportTaskError("创意 LUT 导出任务没有有效的照片列表。")
+    ids = [str(item.get("item_id") or "") for item in items if isinstance(item, Mapping)]
+    if len(ids) != len(items) or len(set(ids)) != len(ids) or any(not _ITEM_ID.fullmatch(value) for value in ids):
+        raise LutExportTaskError("创意 LUT 项目编号缺失或重复。")
     return payload
 
 
@@ -82,7 +86,78 @@ def _expected_fingerprint(value: Any) -> tuple[int, str]:
     return size, digest
 
 
-def _atomic_replace_from_cache(cache_path: Path, destination: Path) -> None:
+def _task_digest(task: Mapping[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(task, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _checkpoint_path(task_path: Path, task_digest: str, item_id: str) -> Path:
+    key = hashlib.sha256(item_id.encode("utf-8")).hexdigest()
+    return Path(task_path).parent / "lut-export-checkpoints" / task_digest / f"{key}.json"
+
+
+def _fingerprint_matches(path: Path, expected: Any) -> bool:
+    try:
+        size, digest = _expected_fingerprint(expected)
+        current = full_fingerprint(path)
+        return current["size"] == size and current["sha256"].casefold() == digest
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def verified_export_lut_results(task_path: Path, result: Any = None) -> dict[str, Any]:
+    """Recover completed files, including a crash after replace but before ACK.
+
+    This read-only verifier has no image/model imports and is safe in Service.
+    Neither an old checkpoint nor a worker success flag proves completion:
+    the exact task identity, recipe, input and current output bytes must match.
+    """
+    task = _read_task(task_path)
+    digest = _task_digest(task)
+    candidates: list[dict[str, Any]] = []
+    for item in task["items"]:
+        checkpoint = _checkpoint_path(task_path, digest, str(item["item_id"]))
+        try:
+            saved = read_json(checkpoint) if checkpoint.stat().st_size <= 128 * 1024 else {}
+            if isinstance(saved, dict) and saved.get("task_sha256") == digest and isinstance(saved.get("item"), dict):
+                candidates.append(saved["item"])
+        except (OSError, ValueError, TypeError):
+            pass
+    if (isinstance(result, dict) and result.get("protocol") == LUT_EXPORT_PROTOCOL
+        and result.get("export_spec_id") == task.get("export_spec_id")
+        and result.get("attempt_id") == task.get("attempt_id")):
+        candidates.extend(result.get("items", []))
+    originals = {str(item["item_id"]): item for item in task["items"] if isinstance(item, dict) and item.get("item_id")}
+    verified = {}
+    for row in candidates:
+        try:
+            original = originals[str(row["item_id"])]
+            target = Path(original["jpeg_path"]).resolve()
+            if task.get("output_root") and not _inside(target, Path(task["output_root"])):
+                continue
+            if (Path(row["output"]).resolve() != target
+                or row.get("lut_id") != original.get("lut_id")
+                or str(row.get("lut_hash")).casefold() != str(original.get("lut_hash")).casefold()
+                or row.get("strength") != original.get("strength", 100)
+                or _expected_fingerprint(row.get("input_fingerprint")) != _expected_fingerprint(original.get("input_fingerprint"))
+                or not _fingerprint_matches(target, row.get("output_fingerprint"))):
+                continue
+            verified[str(row["item_id"])] = {**row, "succeeded": True, "recovered": True}
+        except (KeyError, OSError, TypeError, ValueError):
+            continue
+    return {"protocol": LUT_EXPORT_PROTOCOL, "export_spec_id": task.get("export_spec_id"),
+            "attempt_id": task.get("attempt_id"), "items": list(verified.values())}
+
+
+def reusable_export_lut_inputs(task_path: Path) -> dict[str, Any]:
+    """Return only unmodified Lightroom bases eligible for a LUT-only retry."""
+    task = _read_task(task_path)
+    return {**task, "items": [item for item in task["items"]
+        if isinstance(item, dict) and item.get("jpeg_path")
+        and (not task.get("output_root") or _inside(Path(item["jpeg_path"]), Path(task["output_root"])))
+        and _fingerprint_matches(Path(item["jpeg_path"]), item.get("input_fingerprint"))]}
+
+
+def _atomic_replace_from_cache(cache_path: Path, destination: Path, expected_input: Any) -> None:
     source = Path(cache_path).resolve()
     target = Path(destination).resolve()
     temporary = target.with_name(
@@ -94,6 +169,8 @@ def _atomic_replace_from_cache(cache_path: Path, destination: Path) -> None:
             writer.flush()
             os.fsync(writer.fileno())
         shutil.copystat(source, temporary)
+        if not _fingerprint_matches(target, expected_input):
+            raise LutExportTaskError("基础 JPEG 在渲染期间已变化，已拒绝覆盖。")
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
@@ -115,6 +192,12 @@ def render_export_luts(
     """
 
     task = _read_task(task_path)
+    recovered = {str(row["item_id"]): row for row in verified_export_lut_results(task_path)["items"]}
+    receipts = dict(recovered)
+    task_digest = _task_digest(task)
+    def save_receipt(item_id: str) -> None:
+        write_json(_checkpoint_path(task_path, task_digest, item_id),
+                   {"task_sha256": task_digest, "item": receipts[item_id]})
     engine = engine_factory(project_root)
     raw_items = task["items"]
     total = len(raw_items)
@@ -135,6 +218,11 @@ def render_export_luts(
         item_id = str(raw.get("item_id") or "") if isinstance(raw, Mapping) else ""
         row: dict[str, Any] = {"item_id": item_id, "succeeded": False}
         try:
+            if item_id in recovered:
+                results.append(recovered[item_id])
+                cache_hits += 1
+                emit_progress("render", "复用已完成创意 LUT 成片", position, total, unit="张", cached=cache_hits)
+                continue
             if not isinstance(raw, Mapping) or not _ITEM_ID.fullmatch(item_id):
                 raise LutExportTaskError("创意 LUT 项目编号无效。")
             jpeg_path = Path(str(raw.get("jpeg_path") or "")).expanduser().resolve()
@@ -177,7 +265,19 @@ def render_export_luts(
                 strength=int(strength_value),
                 jpeg_quality=quality,
             )
-            _atomic_replace_from_cache(rendered.cache_path, jpeg_path)
+            if (str(rendered.lut_id) != lut_id or str(rendered.lut_hash).casefold() != lut_hash
+                or rendered.strength != int(strength_value) or bool(rendered.xmp_compatible)):
+                raise LutExportTaskError("LUT 渲染结果与冻结外观或强度不一致。")
+            # Persist the expected rendered bytes before committing them. This
+            # receipt also covers process termination immediately after replace.
+            receipts[item_id] = {
+                "item_id": item_id, "output": str(jpeg_path), "lut_id": lut_id,
+                "lut_hash": lut_hash, "strength": int(strength_value),
+                "input_fingerprint": observed, "output_fingerprint": full_fingerprint(rendered.cache_path),
+                "cache_key": str(rendered.cache_key), "cache_hit": bool(rendered.cache_hit),
+            }
+            save_receipt(item_id)
+            _atomic_replace_from_cache(rendered.cache_path, jpeg_path, observed)
             output_fingerprint = full_fingerprint(jpeg_path)
             cache_hits += int(bool(rendered.cache_hit))
             row.update(
@@ -191,6 +291,8 @@ def render_export_luts(
                 input_fingerprint=observed,
                 output_fingerprint=output_fingerprint,
             )
+            receipts[item_id] = dict(row)
+            save_receipt(item_id)
         except (OSError, TypeError, ValueError, RuntimeError) as exc:
             row["error"] = str(exc)[:1000] or type(exc).__name__
         results.append(row)

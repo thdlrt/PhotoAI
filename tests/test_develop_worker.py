@@ -114,3 +114,93 @@ def test_develop_worker_records_failure_without_replacing_cached_plan(
     progress = read_json(run_dir / "develop-progress.json")
     assert progress["status"] == "failed"
     assert "synthetic crop failure" in progress["message"]
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_locked_progress_does_not_abort_plan_or_hide_real_failure(
+    tmp_path, monkeypatch, capsys, failure
+):
+    input_path = tmp_path / "input.json"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _input(input_path)
+    progress_path = run_dir / "develop-progress.json"
+    write_json(progress_path, {"status": "running", "completed": 7})
+    before = progress_path.read_bytes()
+    persistence_attempts = []
+
+    def locked_write(path, payload):
+        if path == progress_path:
+            persistence_attempts.append(payload)
+            raise PermissionError("synthetic locked progress")
+        write_json(path, payload)
+
+    def create(payload, target, revision, progress):
+        for position in range(34):
+            progress({"status": "running", "current": position + 1, "total": 34,
+                      "overall_percent": (position + 1) / 34 * 100})
+        if failure:
+            raise RuntimeError("real crop failure")
+        plan = {"run_id": "run-1", "plan_id": "develop-locked",
+                "items": [{"index": index} for index in range(34)]}
+        write_json(target / "develop.json", plan)
+        return plan
+
+    monkeypatch.setattr(develop_worker, "write_json", locked_write)
+    monkeypatch.setattr(develop_worker, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(develop, "create_develop_plan", create)
+    monkeypatch.setenv("PHOTO_AI_PROGRESS", "json")
+    if failure:
+        with pytest.raises(RuntimeError, match="real crop failure"):
+            develop_worker.run_develop_plan_job(input_path, run_dir, 3)
+    else:
+        result = develop_worker.run_develop_plan_job(input_path, run_dir, 3)
+        assert result["eligible_count"] == 34
+        assert len(read_json(run_dir / "develop.json")["items"]) == 34
+        assert '1000' in capsys.readouterr().out
+    assert progress_path.read_bytes() == before
+    assert len(persistence_attempts) == 2  # First and terminal event, no repeated stalls.
+
+
+def test_real_34_photo_crop_plan_completes_despite_intermittent_progress_locks(tmp_path, monkeypatch):
+    from PIL import Image
+    preview = tmp_path / "preview.jpg"
+    Image.new("RGB", (160, 100), "#719baf").save(preview)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    input_path = tmp_path / "input.json"
+    write_json(input_path, {"schema_version": 1, "review_revision": 3,
+                           "payload": {"run_id": "run-34", "results": [
+                               {"path": str(tmp_path / f"{i}.ARW"), "preview": str(preview),
+                                "rating": 4, "group_id": 1} for i in range(34)]}})
+    writes = 0
+
+    def intermittently_locked(path, payload):
+        nonlocal writes
+        writes += 1
+        if payload.get("status") == "running" and writes % 8 == 0:
+            raise PermissionError("synthetic intermittent progress lock")
+        write_json(path, payload)
+
+    monkeypatch.setenv("PHOTO_AI_SMART_CROP_MODE", "heuristic")
+    monkeypatch.setattr(develop_worker, "write_json", intermittently_locked)
+    result = develop_worker.run_develop_plan_job(input_path, run_dir, 3)
+    plan = read_json(run_dir / "develop.json")
+    assert result["eligible_count"] == len(plan["items"]) == 34
+    assert all(Path(item["preview_path"]).is_file() for item in plan["items"])
+    assert read_json(run_dir / "develop-progress.json")["status"] == "completed"
+
+
+def test_develop_result_save_failure_still_fails_job(tmp_path, monkeypatch):
+    input_path = tmp_path / "input.json"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _input(input_path)
+
+    def fail_result(*args, **kwargs):
+        raise PermissionError("develop.json denied")
+
+    monkeypatch.setattr(develop, "create_develop_plan", fail_result)
+    with pytest.raises(PermissionError, match="develop.json denied"):
+        develop_worker.run_develop_plan_job(input_path, run_dir, 3)
+    assert read_json(run_dir / "develop-progress.json")["status"] == "failed"

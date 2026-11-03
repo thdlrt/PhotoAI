@@ -11,7 +11,6 @@ from landscape_culler.constants import SCORING_PIPELINE_VERSION
 from landscape_culler.fusion import (
     DEEP_WEIGHTS,
     FAST_WEIGHTS,
-    _external_01,
     fuse_scores,
 )
 from landscape_culler.group_critic import OllamaGroupCritic
@@ -19,6 +18,7 @@ from landscape_culler.scoring import (
     _group_ids,
     _groups_from_file,
     _paths_from_grouping,
+    _raw_paths,
     assign_global_ratings,
     score_directory,
 )
@@ -54,9 +54,9 @@ def _critique(identifier: str, rank: int, score: float) -> dict:
 
 def test_fast_and_deep_fusion_are_finite_and_keep_components() -> None:
     general = [
-        {"quality": 3.0, "aesthetic": 2.5},
-        {"quality": 4.0, "aesthetic": 4.5},
-        {"quality": 3.5, "aesthetic": 3.0},
+        {"quality": 0.5, "aesthetic": 0.375},
+        {"quality": 0.75, "aesthetic": 0.875},
+        {"quality": 0.625, "aesthetic": 0.5},
     ]
     groups = [[0, 1], [2]]
 
@@ -82,8 +82,10 @@ def test_fast_and_deep_fusion_are_finite_and_keep_components() -> None:
 
 
 def test_qrealign_zero_to_one_scores_are_not_remapped_as_one_to_five() -> None:
-    assert _external_01(0.8) == 0.8
-    assert _external_01(3.0) == 0.5
+    from landscape_culler.aesthetic_scores import qrealign_score
+    assert qrealign_score(0.8) == 0.8
+    with pytest.raises(ValueError):
+        qrealign_score(3.0)
 
 
 def test_tiny_qrealign_difference_is_not_amplified_to_rank_step() -> None:
@@ -202,7 +204,7 @@ def test_score_directory_has_no_personal_model_dependency(
     payload = json.loads(Path(published["results_path"]).read_text(encoding="utf-8"))
 
     assert payload["pipeline_version"] == SCORING_PIPELINE_VERSION
-    assert SCORING_PIPELINE_VERSION == "landscape-ai-v5-general"
+    assert SCORING_PIPELINE_VERSION == "landscape-ai-v8-validated-signals"
     for item in payload["results"]:
         assert "personal_score" not in item
         assert "personal" not in item["components"]
@@ -374,7 +376,7 @@ def test_global_rating_budget_is_not_one_winner_per_group() -> None:
     global_scores = np.asarray([0.70, 0.20, 0.99, 0.30, 0.10], dtype=np.float64)
     ratings, pool, ranks = assign_global_ratings(local, global_scores, [[0, 1], [2], [3, 4]], 0.40)
 
-    assert set(pool) == {0, 2, 3}
+    assert set(pool) == {0, 1, 2, 3, 4}
     assert ratings.tolist() == [3, 0, 4, 0, 0]
     assert ranks[2] == 1
     assert int((ratings >= 3).sum()) == 2
@@ -424,3 +426,31 @@ def test_excluded_group_round_trip_preserves_real_group_labels(tmp_path: Path) -
     mapping = dict(zip((path.name for path in restored_paths), _group_ids(groups, len(restored_paths), labels).tolist()))
     assert excluded == []
     assert mapping == {"active.ARW": 2, "removed.ARW": 1}
+
+
+def test_scans_prune_trash_and_deleted_records_keep_directory_validation_strict(tmp_path):
+    live = tmp_path / "photos/live.ARW"
+    live.parent.mkdir()
+    live.write_bytes(b"live")
+    archived = live.parent / "nested/.PHOTO-AI-TRASH/selection/old/deleted.ARW"
+    archived.parent.mkdir(parents=True)
+    archived.write_bytes(b"trash")
+    assert _raw_paths(live.parent) == [live]
+    assert _raw_paths(archived.parent) == []
+    snapshot = tmp_path / "groups.json"
+    write_json(snapshot, {"results": [
+        {"path":str(live), "source_key":cache_key(live), "group_id":6},
+        {"path":str(live.parent / "gone.ARW"), "group_id":1, "deleted":True},
+        {"path":str(archived), "group_id":2},
+    ]})
+    active, excluded = _paths_from_grouping(_raw_paths(live.parent), snapshot)
+    assert active == [live] and not excluded
+    assert _groups_from_file(active, snapshot) == ([[0]], [6])
+    new = live.parent / "new.ARW"
+    new.write_bytes(b"new")
+    with pytest.raises(RuntimeError, match="照片目录内容已变化"):
+        _paths_from_grouping(_raw_paths(live.parent), snapshot)
+    new.unlink()
+    live.write_bytes(b"changed source")
+    with pytest.raises(RuntimeError, match="照片在分类后发生变化"):
+        _paths_from_grouping(_raw_paths(live.parent), snapshot)

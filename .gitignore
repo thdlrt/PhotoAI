@@ -42,3 +42,6 @@ packaging/vendor/
 *.key
 .playwright-cli/
 output/playwright/
+output/
+*.framepick
+*.framepick.bak

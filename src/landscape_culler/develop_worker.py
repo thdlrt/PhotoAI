@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import logging
 import os
 from datetime import UTC, datetime
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 from .progress import emit_progress
 from .util import read_json, write_json
 
 DEVELOP_INPUT_SCHEMA = 1
+logger = logging.getLogger(__name__)
 
 
 def _now() -> str:
@@ -74,10 +77,29 @@ def run_develop_plan_job(
     from .develop import DEVELOP_PROGRESS_PHASES, create_develop_plan
 
     progress_path = run_dir / "develop-progress.json"
+    latest_progress: dict[str, Any] = {}
+    progress_warning_logged = False
+    retry_progress_at = 0.0
+
+    def persist_progress(event: dict[str, Any]) -> None:
+        nonlocal latest_progress, progress_warning_logged, retry_progress_at
+        latest_progress = {**event, "updated_at": _now()}
+        if event.get("status") == "running" and monotonic() < retry_progress_at:
+            return
+        try:
+            write_json(progress_path, latest_progress)
+        except OSError as exc:
+            # After bounded atomic retries fail, avoid waiting on the same
+            # persistent lock at every AI phase. Terminal events still try.
+            retry_progress_at = monotonic() + 5.0
+            # Progress is advisory; create_develop_plan still saves its result
+            # strictly. A locked progress file must not discard completed work.
+            if not progress_warning_logged:
+                logger.warning("进度文件暂时无法更新，构图分析继续：%s", exc)
+                progress_warning_logged = True
 
     def save_progress(event: dict[str, Any]) -> None:
-        normalized = {**event, "updated_at": _now()}
-        write_json(progress_path, normalized)
+        persist_progress(event)
         overall = max(0.0, min(100.0, float(event.get("overall_percent") or 0.0)))
         emit_progress(
             "develop",
@@ -95,13 +117,14 @@ def run_develop_plan_job(
             progress=save_progress,
         )
     except Exception as exc:
-        previous = {}
-        try:
-            candidate = read_json(progress_path)
-            if isinstance(candidate, dict):
-                previous = candidate
-        except (OSError, ValueError):
-            pass
+        previous = latest_progress
+        if not previous:
+            try:
+                candidate = read_json(progress_path)
+                if isinstance(candidate, dict):
+                    previous = candidate
+            except (OSError, ValueError):
+                pass
         nodes = previous.get("nodes") if isinstance(previous.get("nodes"), list) else []
         if not nodes:
             nodes = [
@@ -122,8 +145,7 @@ def run_develop_plan_job(
                 }
                 for node in nodes
             ]
-        write_json(
-            progress_path,
+        persist_progress(
             {
                 **previous,
                 "status": "failed",
@@ -136,14 +158,14 @@ def run_develop_plan_job(
         raise
 
     total = len(plan.get("items", []))
-    write_json(
-        progress_path,
+    persist_progress(
         {
             "status": "completed",
             "phase": "preview",
             "stage_label": "智能构图完成",
             "current": total,
             "completed": total,
+            "analyzed": total,
             "total": total,
             "filename": "",
             "overall_percent": 100.0,

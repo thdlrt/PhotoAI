@@ -122,6 +122,37 @@ def test_low_confidence_falls_back_to_original_and_cache_is_reused(tmp_path: Pat
     assert calls["scene"] == 1
 
 
+def test_interrupted_rank_reuses_semantic_analysis_and_candidate_scores(tmp_path, monkeypatch):
+    calls = {"scene": 0, "dense": 0}
+    def scene(*_args, **_kwargs):
+        calls["scene"] += 1
+        result = _scene()
+        result["subjects"][0]["_mask_integral"] = np.ones((4, 4), dtype=np.int32)
+        return result
+    generate = smart.generate_dense_candidates
+    def dense(*args):
+        calls["dense"] += 1
+        # The synthetic matrix is for serialization only, not real coverage.
+        args[1]["subjects"][0].pop("_mask_integral")
+        return generate(*args)
+    monkeypatch.setattr(smart, "analyze_scene", scene)
+    monkeypatch.setattr(smart, "generate_dense_candidates", dense)
+    def interrupted(*_args, **_kwargs):
+        raise KeyboardInterrupt("process ended during rank")
+    monkeypatch.setattr(smart, "_rank_candidates", interrupted)
+    import pytest
+    with pytest.raises(KeyboardInterrupt):
+        smart.smart_crop_candidates(_image(), tmp_path / "run", mode="full")
+    monkeypatch.setattr(smart, "_rank_candidates", lambda image, dense, scene, data_dir, mode:
+                        (dense, 0.0, "QA rank"))
+    events = []
+    result = smart.smart_crop_candidates(_image(), tmp_path / "run", mode="full",
+                                        progress=lambda phase, label: events.append((phase, label)))
+    assert result[2]["dense_candidate_count"] > 40
+    assert calls == {"scene": 1, "dense": 1}
+    assert any("复用" in label for _, label in events)
+
+
 def test_vlm_request_does_not_override_managed_ollama_endpoint(
     tmp_path: Path, monkeypatch
 ) -> None:

@@ -1,9 +1,11 @@
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from landscape_culler.xmp import build_xmp, rollback_manifest, validate_xmp, write_results_xmp
+from landscape_culler import xmp
 from landscape_culler.util import write_json
 
 
@@ -18,6 +20,36 @@ def test_build_xmp_is_valid_and_contains_rating() -> None:
     assert 'xmp:Rating="4"' in text
     assert "AI|候选|强推荐" in text
     validate_xmp(text)
+
+
+def test_exiftool_validates_persisted_bytes_without_passing_unicode_path(tmp_path, monkeypatch):
+    sidecar = tmp_path / "照片" / "测试.xmp"
+    sidecar.parent.mkdir()
+    sidecar.write_text(build_xmp(4, ["地点|南京"]), encoding="utf-8")
+    monkeypatch.setattr(xmp, "assert_exiftool_available", lambda: Path("exiftool"))
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(returncode=0, stdout=b'[{"XMP-xmp:Rating":4}]', stderr=b"")
+
+    monkeypatch.setattr(xmp.subprocess, "run", run)
+    xmp.validate_xmp_with_exiftool(sidecar, 4)
+    args, kwargs = calls[0]
+    assert args[-1] == "-" and str(sidecar) not in args
+    assert kwargs["input"] == sidecar.read_bytes()
+    with pytest.raises(ValueError, match="星级不一致"):
+        xmp.validate_xmp_with_exiftool(sidecar, 5)
+
+
+def test_exiftool_failure_reports_diagnostic(tmp_path, monkeypatch):
+    sidecar = tmp_path / "test.xmp"
+    sidecar.write_text("invalid", encoding="utf-8")
+    monkeypatch.setattr(xmp, "assert_exiftool_available", lambda: Path("exiftool"))
+    monkeypatch.setattr(xmp.subprocess, "run", lambda *_args, **_kwargs:
+                        SimpleNamespace(returncode=1, stdout=b"", stderr=b"Error: invalid XMP"))
+    with pytest.raises(RuntimeError, match="invalid XMP"):
+        xmp.validate_xmp_with_exiftool(sidecar, 4)
 
 
 def test_build_xmp_contains_confirmed_lightroom_develop_recipe() -> None:

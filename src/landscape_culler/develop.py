@@ -3,15 +3,21 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import copy
+import os
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from .util import read_json, write_json
+from .util import cache_key, read_json, write_json
+from .develop_checkpoint import DevelopCheckpoint
+from .style_state import selection_for_group, scope_is_confirmed
 
 SMART_CROP_VERSION = "semantic-crop-v2"
+DEVELOP_PREVIEW_VERSION = "crop-preview-v2"
 
 
 class _LazyModule:
@@ -36,6 +42,7 @@ def smart_crop_candidates(*args: Any, **kwargs: Any) -> Any:
         ".smart_crop", package=__package__
     ).smart_crop_candidates
     return implementation(*args, **kwargs)
+
 
 DEVELOP_SCHEMA_VERSION = 5
 LEGACY_DEVELOP_SCHEMA_VERSIONS = {1, 2, 3, 4}
@@ -402,6 +409,16 @@ def style_options(
     ]
 
 
+def recipe_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().casefold() in {"1", "true", "yes", "on", "auto", "enabled"}
+    return False
+
+
 def _scaled_style_settings(style_id: str, strength: int) -> dict[str, Any]:
     presets = {**LEGACY_STYLE_PRESETS, **STYLE_PRESETS}
     if style_id not in presets:
@@ -423,8 +440,22 @@ def _scaled_style_settings(style_id: str, strength: int) -> dict[str, Any]:
 
 
 def xmp_settings_for_recipe(recipe: dict[str, Any]) -> dict[str, Any]:
-    base = dict(recipe.get("base", {}))
-    style = _scaled_style_settings(
+    skip_base = recipe.get("basic_color_status") == "skipped"
+    base = {} if skip_base else dict(recipe.get("base", {}))
+    if "AutoTone" in base:
+        base["AutoTone"] = "True" if recipe_bool(base["AutoTone"]) else "False"
+    for key in ("LensProfileEnable", "AutoLateralCA"):
+        if key in base:
+            base[key] = int(recipe_bool(base[key]))
+    auto_wb = base.pop("AutoWhiteBalance", None)
+    if auto_wb is not None:
+        if recipe_bool(auto_wb):
+            base["WhiteBalance"] = "Auto"
+        elif str(base.get("WhiteBalance", "")).strip().casefold() == "auto":
+            base.pop("WhiteBalance", None)
+    elif str(base.get("WhiteBalance", "")).strip().casefold() == "auto":
+        base["WhiteBalance"] = "Auto"
+    style = {} if skip_base else _scaled_style_settings(
         str(recipe.get("style_id", "lightroom")), int(recipe.get("style_strength", 60))
     )
     additive = {
@@ -447,9 +478,16 @@ def xmp_settings_for_recipe(recipe: dict[str, Any]) -> dict[str, Any]:
         else:
             base[key] = value
     candidates = {item["id"]: item for item in recipe.get("crop_candidates", [])}
-    crop = candidates.get(str(recipe.get("crop_id"))) or candidates.get("original")
+    crop_id = recipe.get("crop_id")
+    crop = candidates.get(str(crop_id)) if crop_id is not None else candidates.get("original")
+    if crop_id is not None and crop is None:
+        raise ValueError(f"找不到已保存的裁切方案 {crop_id!r}，请重新确认。")
     if crop:
         bounds = crop["bounds"]
+        left, top, right, bottom = (float(bounds[key]) for key in ("left", "top", "right", "bottom"))
+        angle = float(recipe.get("angle", 0.0))
+        if not (0 <= left < right <= 1 and 0 <= top < bottom <= 1 and -45 <= angle <= 45):
+            raise ValueError("已保存的裁切坐标或角度无效，请重新确认。")
         base.update(
             {
                 "CropLeft": round(float(bounds["left"]), 6),
@@ -482,9 +520,11 @@ def _apply_preview_recipe(image: Image.Image, recipe: dict[str, Any]) -> Image.I
         )
     )
     exposure = float(base.get("Exposure2012", 0.0))
-    result = ImageEnhance.Brightness(result).enhance(2.0**exposure)
+    if exposure:
+        result = ImageEnhance.Brightness(result).enhance(2.0**exposure)
     contrast = 1.0 + float(base.get("Contrast2012", 0.0)) / 120.0
-    result = ImageEnhance.Contrast(result).enhance(max(0.65, contrast))
+    if contrast != 1.0:
+        result = ImageEnhance.Contrast(result).enhance(max(0.65, contrast))
     style_id = str(recipe.get("style_id", "lightroom"))
     preset = (
         STYLE_PRESETS.get(style_id)
@@ -492,17 +532,18 @@ def _apply_preview_recipe(image: Image.Image, recipe: dict[str, Any]) -> Image.I
         or STYLE_PRESETS["lightroom"]
     )
     amount = _clamp(float(recipe.get("style_strength", 60)), 0.0, 100.0) / 100.0
-    array = np.asarray(result, dtype=np.float32) / 255.0
-    rgb_scale = np.asarray(preset["rgb"], dtype=np.float32)
-    array *= 1.0 + (rgb_scale - 1.0) * amount
-    array = np.clip(array, 0.0, 1.0)
-    result = Image.fromarray(np.round(array * 255.0).astype(np.uint8), "RGB")
-    result = ImageEnhance.Color(result).enhance(
-        1.0 + (float(preset["saturation"]) - 1.0) * amount
-    )
-    result = ImageEnhance.Contrast(result).enhance(
-        1.0 + (float(preset["contrast"]) - 1.0) * amount
-    )
+    if amount and any(float(value) != 1.0 for value in preset["rgb"]):
+        array = np.asarray(result, dtype=np.float32) / 255.0
+        rgb_scale = np.asarray(preset["rgb"], dtype=np.float32)
+        array *= 1.0 + (rgb_scale - 1.0) * amount
+        array = np.clip(array, 0.0, 1.0)
+        result = Image.fromarray(np.round(array * 255.0).astype(np.uint8), "RGB")
+    saturation = 1.0 + (float(preset["saturation"]) - 1.0) * amount
+    style_contrast = 1.0 + (float(preset["contrast"]) - 1.0) * amount
+    if saturation != 1.0:
+        result = ImageEnhance.Color(result).enhance(saturation)
+    if style_contrast != 1.0:
+        result = ImageEnhance.Contrast(result).enhance(style_contrast)
     return result
 
 
@@ -519,6 +560,8 @@ def _render_preview(run_dir: Path, item: dict[str, Any], source_preview: Path) -
         repr(
             (
                 SMART_CROP_VERSION,
+                DEVELOP_PREVIEW_VERSION,
+                cache_key(source_preview),
                 item.get("crop_id"),
                 crop.get("bounds") if isinstance(crop, dict) else None,
                 item.get("style_id"),
@@ -531,12 +574,143 @@ def _render_preview(run_dir: Path, item: dict[str, Any], source_preview: Path) -
     output_dir = run_dir / "develop-previews"
     output_dir.mkdir(parents=True, exist_ok=True)
     target = output_dir / f"{int(item['index']):05d}-{fingerprint}.jpg"
-    if not target.is_file():
+    healthy = False
+    if target.is_file():
+        try:
+            with Image.open(target) as previous:
+                previous.load()
+            healthy = True
+        except (OSError, ValueError):
+            pass
+    if not healthy:
+        temporary = target.with_name(f".{target.stem}-{uuid.uuid4().hex}.tmp")
         with Image.open(source_preview) as source:
             rendered = _apply_preview_recipe(source, item)
             rendered.thumbnail((1400, 1400), Image.Resampling.LANCZOS)
-            rendered.save(target, format="JPEG", quality=90, optimize=True)
+            try:
+                rendered.save(temporary, format="JPEG", quality=90, optimize=True)
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
     return str(target)
+
+
+def _develop_checkpoint_context(run_dir: Path) -> dict[str, Any]:
+    from .constants import VLM_MODEL_ID
+    from .model_resources import active_vlm_model
+    from .vision_provider import identity, load_config
+
+    data_dir = (
+        run_dir.parent.parent if run_dir.parent.name == "runs" else run_dir.parent
+    )
+    content_root = os.environ.get("PHOTO_AI_CONTENT_ROOT")
+    if content_root:
+        data_dir = Path(content_root) / "state"
+    provider = load_config(data_dir)
+    mode = os.environ.get("PHOTO_AI_SMART_CROP_MODE", "full").strip().casefold()
+    return {
+        "crop_version": SMART_CROP_VERSION,
+        "mode": mode if mode in {"full", "heuristic"} else "full",
+        "provider": identity(provider) if provider.get("mode") == "cloud" else "local",
+        "model": provider.get("model")
+        if provider.get("mode") == "cloud"
+        else active_vlm_model(data_dir, fallback=VLM_MODEL_ID),
+    }
+
+
+def _develop_item_key(result: dict[str, Any]) -> str:
+    def file_key(value: Any) -> str | None:
+        try:
+            return cache_key(Path(str(value)))
+        except OSError:
+            return None
+
+    identity = {
+        "path": str(result.get("path", "")),
+        "source": file_key(result.get("path")),
+        "source_key": result.get("source_key"),
+        "preview": file_key(result.get("preview")),
+        "technical": result.get("technical", {}),
+    }
+    return hashlib.sha256(
+        json.dumps(identity, sort_keys=True, ensure_ascii=False).encode()
+    ).hexdigest()
+
+
+def _load_develop_checkpoint(run_dir: Path) -> DevelopCheckpoint:
+    return DevelopCheckpoint(run_dir, _develop_checkpoint_context(run_dir))
+
+
+def _checkpoint_item(
+    checkpoint: DevelopCheckpoint, result: dict[str, Any]
+) -> dict[str, Any] | None:
+    for item in checkpoint.candidates(_develop_item_key(result)):
+        if (
+            isinstance(item.get("crop_candidates"), list)
+            and item["crop_candidates"]
+            and item.get("crop_id")
+            and isinstance(item.get("smart_crop"), dict)
+        ):
+            try:
+                xmp_settings_for_recipe(item)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            return copy.deepcopy(item)
+    return None
+
+
+@lru_cache(maxsize=2048)
+def _decoded_checkpoint_jpeg(path: str, size: int, mtime_ns: int, inode: int) -> bool:
+    # The stat tuple invalidates repaired files while unchanged polling never
+    # decodes the same previews over and over. JPEG marker bytes alone are not
+    # evidence that the compressed image can actually be decoded.
+    del size, mtime_ns, inode
+    # Let transient I/O errors escape to the caller: lru_cache must never keep
+    # a temporary Windows sharing violation as a permanent failed verdict.
+    with Image.open(path) as image:
+        if image.format != "JPEG" or max(image.size) > 1400:
+            return False
+        image.load()
+    return True
+
+
+def _checkpoint_preview_ready(
+    item: dict[str, Any] | None, run_dir: Path, *, preview_root: Path | None = None
+) -> bool:
+    if item is None or item.get("preview_version") != DEVELOP_PREVIEW_VERSION:
+        return False
+    path = Path(str(item.get("preview_path", "")))
+    try:
+        resolved = path.resolve()
+        root = preview_root if preview_root is not None else (run_dir / "develop-previews").resolve()
+        if not resolved.is_relative_to(root):
+            return False
+        stat = resolved.stat()
+        return _decoded_checkpoint_jpeg(str(resolved), stat.st_size, stat.st_mtime_ns, stat.st_ino)
+    except (OSError, ValueError, Image.DecompressionBombError):
+        return False
+
+
+def develop_resume_summary(payload: dict[str, Any], run_dir: Path) -> dict[str, int]:
+    """Read durable results without changing an existing project or loading AI."""
+    checkpoint = _load_develop_checkpoint(run_dir)
+    eligible = [
+        item
+        for item in payload.get("results", [])
+        if not item.get("excluded") and int(item.get("rating", 0)) >= 3
+    ]
+    analyzed = [_checkpoint_item(checkpoint, item) for item in eligible]
+    preview_root = (run_dir / "develop-previews").resolve()
+    completed = sum(_checkpoint_preview_ready(item, run_dir, preview_root=preview_root) for item in analyzed)
+    return {"completed": completed, "analyzed": sum(item is not None for item in analyzed), "total": len(eligible)}
+
+
+def develop_resume_percent(summary: dict[str, int]) -> float:
+    total = max(0, int(summary.get("total", 0)))
+    completed = min(total, max(0, int(summary.get("completed", 0))))
+    analyzed = min(total, max(completed, int(summary.get("analyzed", completed))))
+    credit = (len(DEVELOP_PROGRESS_PHASES) - 1) / len(DEVELOP_PROGRESS_PHASES)
+    return round((completed + (analyzed - completed) * credit) / max(1, total) * 100, 1)
 
 
 def create_develop_plan(
@@ -554,18 +728,50 @@ def create_develop_plan(
     if not eligible:
         raise ValueError("当前没有 3 星以上照片可进行裁剪调色。")
     total = len(eligible)
+    checkpoint = _load_develop_checkpoint(run_dir)
+    restored = {
+        index: _checkpoint_item(checkpoint, result) for index, result in eligible
+    }
+    preview_root = (run_dir / "develop-previews").resolve()
+    completed = sum(
+        _checkpoint_preview_ready(item, run_dir, preview_root=preview_root) for item in restored.values()
+    )
+    analyzed = sum(item is not None for item in restored.values())
+    resumed_count = analyzed
+    analysis_credit = (len(DEVELOP_PROGRESS_PHASES) - 1) / len(DEVELOP_PROGRESS_PHASES)
+    progress_units = completed + (analyzed - completed) * analysis_credit
+    if progress is not None and resumed_count:
+        progress(
+            {
+                "status": "running",
+                "phase": "cache",
+                "stage_label": "继续未完成的构图",
+                "current": completed,
+                "completed": completed,
+                "analyzed": analyzed,
+                "total": total,
+                "resumed_count": resumed_count,
+                "filename": "",
+                "overall_percent": round(progress_units / total * 100, 1),
+                "nodes": [],
+            }
+        )
     phase_indexes = {
         key: index for index, (key, _label) in enumerate(DEVELOP_PROGRESS_PHASES)
     }
 
     for position, (index, result) in enumerate(eligible):
         filename = Path(str(result.get("path", ""))).name
+        item = restored[index]
+        already_complete = _checkpoint_preview_ready(item, run_dir)
+        base_units = progress_units - (analysis_credit if item is not None and not already_complete else 0)
 
         def report(
             phase: str,
             label: str,
-            _position: int = position,
+            _position: int = completed,
             _filename: str = filename,
+            _base_units: float = base_units,
         ) -> None:
             if progress is None:
                 return
@@ -573,7 +779,7 @@ def create_develop_plan(
             if phase == "cache":
                 phase_index = len(DEVELOP_PROGRESS_PHASES) - 2
             overall = (
-                (_position + phase_index / len(DEVELOP_PROGRESS_PHASES)) / total
+                (_base_units + phase_index / len(DEVELOP_PROGRESS_PHASES)) / total
             ) * 100.0
             progress(
                 {
@@ -582,7 +788,9 @@ def create_develop_plan(
                     "stage_label": label,
                     "current": _position + 1,
                     "completed": _position,
+                    "analyzed": analyzed,
                     "total": total,
+                    "resumed_count": resumed_count,
                     "filename": _filename,
                     "overall_percent": round(min(99.5, overall), 1),
                     "nodes": [
@@ -607,50 +815,69 @@ def create_develop_plan(
             raise FileNotFoundError(
                 f"缺少照片预览：{Path(str(result.get('path', ''))).name}"
             )
-        with Image.open(preview_path) as source:
-            image = source.convert("RGB")
-            crops, crop_id, smart_crop = smart_crop_candidates(
-                image, run_dir, progress=report
-            )
-            angle = 0.0
-            horizon_confidence = float(smart_crop.get("horizon_confidence", 0.0))
-            technical = dict(result.get("technical", {}))
-            base = base_adjustments(technical, image)
-            styles = style_options(image, technical)
-        item = {
-            "index": index,
-            "path": str(result.get("path", "")),
-            "filename": Path(str(result.get("path", ""))).name,
-            "group_id": int(result.get("group_id", index + 1)),
-            "rating": int(result.get("rating", 0)),
-            "crop_candidates": crops,
-            "crop_id": crop_id,
-            "angle": angle,
-            "horizon_confidence": horizon_confidence,
-            "smart_crop": smart_crop,
-            "base_engine": "lightroom-classic",
-            "crop_engine": SMART_CROP_VERSION,
-            "base": base,
-            "style_options": styles,
-            "style_id": styles[0]["id"],
-            "style_strength": 60,
-            "crop_confirmed": False,
-            "confirmed": False,
-        }
-        report("preview", "生成构图预览")
-        item["preview_path"] = _render_preview(run_dir, item, preview_path)
+        if item is None:
+            with Image.open(preview_path) as source:
+                image = source.convert("RGB")
+                crops, crop_id, smart_crop = smart_crop_candidates(
+                    image, run_dir, progress=report
+                )
+                angle = 0.0
+                horizon_confidence = float(smart_crop.get("horizon_confidence", 0.0))
+                technical = dict(result.get("technical", {}))
+                base = base_adjustments(technical, image)
+                styles = style_options(image, technical)
+            item = {
+                "index": index,
+                "path": str(result.get("path", "")),
+                "filename": Path(str(result.get("path", ""))).name,
+                "group_id": int(result.get("group_id", index + 1)),
+                "rating": int(result.get("rating", 0)),
+                "crop_candidates": crops,
+                "crop_id": crop_id,
+                "angle": angle,
+                "horizon_confidence": horizon_confidence,
+                "smart_crop": smart_crop,
+                "base_engine": "lightroom-classic",
+                "crop_engine": SMART_CROP_VERSION,
+                "base": base,
+                "style_options": styles,
+                "style_id": styles[0]["id"],
+                "style_strength": 60,
+                "crop_confirmed": False,
+                "confirmed": False,
+            }
+            # Save AI output before preview rendering: a failed/closed preview
+            # must not force expensive model inference to run again.
+            checkpoint.save(_develop_item_key(result), item)
+            analyzed += 1
+        item.update(
+            index=index,
+            path=str(result.get("path", "")),
+            filename=filename,
+            rating=int(result.get("rating", 0)),
+            group_id=int(result.get("group_id", index + 1)),
+        )
+        if not already_complete:
+            report("preview", "生成构图预览")
+            item["preview_path"] = _render_preview(run_dir, item, preview_path)
+            item["preview_version"] = DEVELOP_PREVIEW_VERSION
+            checkpoint.save(_develop_item_key(result), item)
+            completed += 1
+            progress_units = base_units + 1
         items.append(item)
-        if progress is not None:
+        if progress is not None and not already_complete:
             progress(
                 {
                     "status": "running",
                     "phase": "preview",
                     "stage_label": "构图预览已完成",
-                    "current": position + 1,
-                    "completed": position + 1,
+                    "current": completed,
+                    "completed": completed,
+                    "analyzed": analyzed,
                     "total": total,
                     "filename": filename,
-                    "overall_percent": round(((position + 1) / total) * 100.0, 1),
+                    "resumed_count": resumed_count,
+                    "overall_percent": round((progress_units / total) * 100.0, 1),
                     "nodes": [
                         {"key": key, "label": label, "status": "completed"}
                         for key, label in DEVELOP_PROGRESS_PHASES
@@ -674,6 +901,66 @@ def create_develop_plan(
         "updated_at": now,
         "items": items,
     }
+    write_json(run_dir / "develop.json", plan)
+    return plan
+
+
+def create_original_develop_plan(
+    payload: dict[str, Any], run_dir: Path, review_revision: int,
+    previous: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Enter color processing with original frames, without any AI analysis."""
+    items = []
+    eligible = [(index, result) for index, result in enumerate(payload.get("results", []))
+                if not result.get("excluded") and int(result.get("rating", 0)) >= 3]
+    if not eligible:
+        raise ValueError("当前没有 3 星以上照片可继续处理。")
+    # Check every source before saving the plan, so a missing preview cannot
+    # replace an existing project with a partial plan.
+    for _index, result in eligible:
+        if not Path(str(result.get("preview", ""))).is_file():
+            raise FileNotFoundError(f"缺少照片预览：{Path(str(result.get('path', ''))).name}")
+    old_items = {str(item.get("path")): item for item in (previous or {}).get("items", [])}
+    for index, result in eligible:
+        item = {
+            "index": index, "path": str(result["path"]), "filename": Path(result["path"]).name,
+            "group_id": int(result.get("group_id", index + 1)), "rating": int(result["rating"]),
+            "crop_candidates": [{"id": "original", "label": "原图", "description": "保留原始构图",
+                "bounds": {"left": 0.0, "top": 0.0, "right": 1.0, "bottom": 1.0}}],
+            "crop_id": "original", "angle": 0.0, "horizon_confidence": 0.0,
+            "smart_crop": {"mode": "skipped", "warnings": []}, "crop_engine": "original",
+            "base_engine": "lightroom-classic", "base": base_adjustments({}, None),
+            "style_options": style_options(None, {}), "style_id": "lightroom", "style_strength": 60,
+            "crop_confirmed": True, "confirmed": True,
+        }
+        old = old_items.get(str(result["path"]), {})
+        for key in ("base_engine", "base", "style_options", "style_id", "style_strength"):
+            if key in old:
+                item[key] = copy.deepcopy(old[key])
+        item["preview_path"] = _render_preview(run_dir, item, Path(result["preview"]))
+        items.append(item)
+    now = _utc_now()
+    plan = {**copy.deepcopy(previous or {}), "schema_version": DEVELOP_SCHEMA_VERSION,
+            "plan_id": (previous or {}).get("plan_id") or f"develop-{uuid.uuid4().hex}",
+            "run_id": payload.get("run_id", run_dir.name), "source_review_revision": int(review_revision),
+            "revision": int(previous.get("revision", 0)) + 1 if previous else 0,
+            "crop_skipped": True, "color_enabled": (previous or {}).get("color_enabled", True), "crop": {"status": "skipped"},
+            "basic_color": copy.deepcopy((previous or {}).get("basic_color", {"status": "pending"})),
+            "creative_style": copy.deepcopy((previous or {}).get("creative_style", {"status": "pending", "scope": "global", "groups": {}})),
+            "color_mode": (previous or {}).get("color_mode", "pending"),
+            "created_at": (previous or {}).get("created_at", now), "updated_at": now, "items": items}
+    plan.pop("migrated_from_schema_version", None)
+    if previous:
+        changed_groups = set()
+        new_items = {str(item.get("path")): item for item in items}
+        for source in old_items.keys() | new_items.keys():
+            old, new = old_items.get(source), new_items.get(source)
+            if (old is None or new is None
+                    or old.get("group_id") != new.get("group_id")
+                    or _render_input_identity(old) != _render_input_identity(new)):
+                changed_groups.update(str(item.get("group_id", -1)) for item in (old, new) if item)
+        if changed_groups:
+            _invalidate_style_previews(plan, changed_groups)
     write_json(run_dir / "develop.json", plan)
     return plan
 
@@ -740,6 +1027,44 @@ def develop_summary(
     }
 
 
+def _render_input_identity(item: dict[str, Any]) -> dict[str, Any]:
+    selected = next((candidate for candidate in item.get("crop_candidates", [])
+                     if candidate.get("id") == item.get("crop_id")), {})
+    return copy.deepcopy({"bounds": selected.get("bounds"), "angle": item.get("angle", 0),
+                       "base": item.get("base", {}), "style_id": item.get("style_id"),
+                       "style_strength": item.get("style_strength")})
+
+
+def _invalidate_style_previews(plan: dict[str, Any], group_ids: set[str] | None = None) -> None:
+    """Keep choices, invalidate only evidence derived from changed input pixels."""
+    creative = plan.get("creative_style")
+    if not isinstance(creative, dict):
+        return
+    selections = [value for key, value in (creative.get("groups") or {}).items()
+                  if group_ids is None or str(key) in group_ids]
+    if isinstance(creative.get("global_selection"), dict):
+        selections.append(creative["global_selection"])
+    for selection in selections:
+        if not isinstance(selection, dict):
+            continue
+        selection["recommendation_status"] = "stale"
+        for key in list(selection):
+            if "preview" in key:
+                selection.pop(key)
+        for candidate in selection.get("top3") or []:
+            if not isinstance(candidate, dict):
+                continue
+            candidate["render_status"] = "stale"
+            for key in list(candidate):
+                if "preview" in key:
+                    candidate.pop(key)
+        # Choosing no creative transform remains valid for any crop/base.
+        if not (selection.get("manual_override") and selection.get("status") == "skipped"):
+            selection["status"] = "pending"
+    if creative.get("status") == "confirmed" and not scope_is_confirmed(plan):
+        creative["status"] = "pending"
+
+
 def update_develop_item(
     plan: dict[str, Any],
     run_dir: Path,
@@ -760,11 +1085,14 @@ def update_develop_item(
     )
     if item is None:
         raise KeyError(index)
+    previous_render = _render_input_identity(item)
     if crop_id is not None:
         allowed = {value["id"] for value in item.get("crop_candidates", [])}
         if crop_id not in allowed:
             raise ValueError("裁剪方案不存在。")
         item["crop_id"] = crop_id
+        if crop_id == "original":
+            item["angle"] = 0.0
         plan["crop_skipped"] = False
         plan["crop"] = {"status": "pending"}
         item["crop_confirmed"] = False
@@ -801,6 +1129,8 @@ def update_develop_item(
         plan["crop"] = {"status": "confirmed"}
     elif str(plan.get("crop", {}).get("status")) != "skipped":
         plan["crop"] = {"status": "pending"}
+    if _render_input_identity(item) != previous_render:
+        _invalidate_style_previews(plan, {str(item.get("group_id", -1))})
     _bump_plan(plan, run_dir)
     return item
 
@@ -821,6 +1151,7 @@ def skip_all_crops(
 ) -> None:
     """Select the original frame for every eligible photo and confirm the step."""
 
+    previous_renders = {int(item["index"]): _render_input_identity(item) for item in plan.get("items", [])}
     for item in plan.get("items", []):
         candidates = {
             str(candidate.get("id"))
@@ -831,6 +1162,7 @@ def skip_all_crops(
             raise ValueError(f"{item.get('filename', '照片')} 缺少原图构图方案。")
     for item in plan.get("items", []):
         item["crop_id"] = "original"
+        item["angle"] = 0.0
         item["crop_confirmed"] = True
         item["confirmed"] = True
         if source_previews is not None:
@@ -841,6 +1173,10 @@ def skip_all_crops(
             item["preview_path"] = _render_preview(run_dir, item, source_preview)
     plan["crop_skipped"] = True
     plan["crop"] = {"status": "skipped"}
+    changed_groups = {str(item.get("group_id", -1)) for item in plan.get("items", [])
+                      if _render_input_identity(item) != previous_renders[int(item["index"])]}
+    if changed_groups:
+        _invalidate_style_previews(plan, changed_groups)
     _bump_plan(plan, run_dir)
 
 
@@ -854,11 +1190,38 @@ def update_develop_options(
     _bump_plan(plan, run_dir)
 
 
-def update_color_mode(plan: dict[str, Any], run_dir: Path, *, mode: str) -> None:
+def update_color_mode(
+    plan: dict[str, Any], run_dir: Path, *, mode: str, stage: str | None = None
+) -> None:
     """Select the third workflow step without applying or exporting anything."""
 
     if mode not in {"skip", "auto", "style"}:
         raise ValueError("调色模式不存在。")
+    if stage is not None:
+        _ensure_plan_defaults(plan)
+        if stage == "basic" and mode in {"skip", "auto"}:
+            status = "enabled" if mode == "auto" else "skipped"
+            if plan["basic_color"]["status"] != status:
+                _invalidate_style_previews(plan)
+            plan["basic_color"]["status"] = status
+            plan["color_enabled"] = status == "enabled"
+            if plan["color_mode"] != "style":
+                plan["color_mode"] = mode
+        elif stage == "creative" and mode in {"skip", "style"}:
+            creative = plan["creative_style"]
+            if mode == "skip":
+                creative["status"] = "skipped"
+                plan["color_mode"] = (
+                    "auto" if plan["basic_color"]["status"] == "enabled" else "skip"
+                )
+            else:
+                if creative["status"] == "skipped":
+                    creative["status"] = "pending"
+                plan["color_mode"] = "style"
+        else:
+            raise ValueError("调色步骤与模式不匹配。")
+        _bump_plan(plan, run_dir)
+        return
     if mode == "skip":
         plan["basic_color"] = {"status": "skipped"}
         plan["creative_style"] = {"status": "skipped", "scope": "global", "groups": {}}
@@ -897,6 +1260,20 @@ def update_color_mode(plan: dict[str, Any], run_dir: Path, *, mode: str) -> None
         }
         plan["color_enabled"] = True
     plan["color_mode"] = mode
+    _bump_plan(plan, run_dir)
+
+
+def update_style_scope(plan: dict[str, Any], run_dir: Path, *, scope: str) -> None:
+    """Persist scope without copying or discarding either scope's choices."""
+    if scope not in {"global", "group"}:
+        raise ValueError("外观应用范围不存在。")
+    _ensure_plan_defaults(plan)
+    creative = plan["creative_style"]
+    if creative["scope"] == scope:
+        return
+    creative["scope"] = scope
+    creative["status"] = "confirmed" if scope_is_confirmed(plan) else "pending"
+    plan["color_mode"] = "style"
     _bump_plan(plan, run_dir)
 
 
@@ -1045,8 +1422,6 @@ def update_style_group(
         )
         else "pending"
     )
-    plan["basic_color"] = {"status": "enabled"}
-    plan["color_enabled"] = True
     plan["color_mode"] = "style"
     _bump_plan(plan, run_dir)
     return selected
@@ -1073,7 +1448,7 @@ def update_style_global(
         if isinstance(creative.get("global_selection"), dict)
         else {}
     )
-    if not previous:
+    if not previous and status != "skipped":
         raise ValueError("当前工程还没有全局统一风格推荐。")
     if status not in {"pending", "confirmed", "skipped"}:
         raise ValueError("风格状态不存在。")
@@ -1179,8 +1554,6 @@ def update_style_global(
     creative["scope"] = "global"
     creative["global_selection"] = selected
     creative["status"] = "pending"
-    plan["basic_color"] = {"status": "enabled"}
-    plan["color_enabled"] = True
     plan["color_mode"] = "style"
     _bump_plan(plan, run_dir)
     return selected
@@ -1333,15 +1706,14 @@ def confirm_recommended_styles(plan: dict[str, Any], run_dir: Path) -> None:
             )
         else:
             raise ValueError("AI 推荐结果不完整，请重新运行 AI 推荐。")
-    creative["groups"] = groups
     if scope == "global":
         frozen = dict(next(iter(groups.values())))
         frozen.pop("group_id", None)
         frozen["scope"] = "global"
         creative["global_selection"] = frozen
+    else:
+        creative["groups"] = groups
     creative["status"] = "confirmed"
-    plan["basic_color"] = {"status": "enabled"}
-    plan["color_enabled"] = True
     plan["color_mode"] = "style"
     _bump_plan(plan, run_dir)
 
@@ -1372,8 +1744,6 @@ def replace_style_recommendations(
         "groups": merged,
         "updated_at": _utc_now(),
     }
-    plan["basic_color"] = {"status": "enabled"}
-    plan["color_enabled"] = True
     plan["color_mode"] = "style"
     _bump_plan(plan, run_dir)
 
@@ -1396,9 +1766,6 @@ def merge_confirmed_develop(
     }
     basic_status = str(plan["basic_color"].get("status", "pending"))
     creative = plan["creative_style"]
-    creative_groups = (
-        creative.get("groups", {}) if isinstance(creative.get("groups"), dict) else {}
-    )
     for index, result in enumerate(payload.get("results", [])):
         if index in by_index:
             source = by_index[index]
@@ -1424,7 +1791,7 @@ def merge_confirmed_develop(
             recipe["basic_color_status"] = basic_status
             if basic_status != "enabled":
                 recipe["base"] = {}
-            group_selection = creative_groups.get(str(int(source.get("group_id", -1))))
+            group_selection = selection_for_group(plan, int(source.get("group_id", -1)))
             if creative.get("status") == "confirmed" and isinstance(
                 group_selection, dict
             ):
@@ -1443,12 +1810,13 @@ def merge_confirmed_develop(
                         "lut_hash",
                         "xmp_compatible",
                         "amount",
+                        "strength",
                         "amount_supported",
                         "confidence",
                         "top3",
                         "manual_override",
                     )
-                    if key in group_selection
+                    if key in group_selection and (key != "strength" or group_selection[key] is not None)
                 }
             else:
                 recipe["creative_style"] = {"status": "skipped"}

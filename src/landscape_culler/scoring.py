@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import html
-import math
 import os
 import shutil
 from collections import defaultdict
@@ -13,68 +12,24 @@ import numpy as np
 
 from .constants import (
     PROPRIETARY_RAW_EXTENSIONS,
-    READABLE_RAW_EXTENSIONS,
     SCORING_PIPELINE_VERSION,
 )
 from .features import TECHNICAL_NAMES, FeatureExtractor
-from .fusion import fuse_scores
+from .fusion import fuse_scores, relative_sharpness_flags, technical_quality
 from .general_aesthetic import GeneralAestheticScorer
 from .group_critic import OllamaGroupCritic
+from .grouping import GROUPING_VERSION, group_images as _group_images
 from .preview import preview_cache_path
 from .progress import emit_progress, phase_end, phase_start
-from .util import cache_key, read_json, runs_root, sequence_number, write_json
+from .selection_policy import retention_budget
+from .util import (
+    cache_key, is_photo_trash_path, raw_photo_paths, read_json,
+    runs_root, write_json,
+)
 
 
 def _cache_root(data_dir: Path) -> Path:
     return Path(os.environ.get("PHOTO_AI_CACHE_DIR") or data_dir / "cache")
-
-
-def _group_images(
-    paths: list[Path], features: np.ndarray, technical_count: int = 8
-) -> list[list[int]]:
-    by_parent: dict[str, list[int]] = defaultdict(list)
-    for index, path in enumerate(paths):
-        by_parent[str(path.parent)].append(index)
-    groups: list[list[int]] = []
-    for indices in by_parent.values():
-        indices.sort(
-            key=lambda i: (
-                sequence_number(paths[i]) is None,
-                sequence_number(paths[i]) or 0,
-                paths[i].name.lower(),
-            )
-        )
-        current: list[int] = []
-        for index in indices:
-            if not current:
-                current = [index]
-                continue
-            previous = current[-1]
-            previous_number = sequence_number(paths[previous])
-            current_number = sequence_number(paths[index])
-            number_close = (
-                previous_number is not None
-                and current_number is not None
-                and 0 < current_number - previous_number <= 5
-            )
-            similarity = 0.0
-            if features.shape[1] > technical_count:
-                left = features[previous, technical_count:]
-                right = features[index, technical_count:]
-                similarity = float(
-                    np.dot(left, right)
-                    / max(1e-8, np.linalg.norm(left) * np.linalg.norm(right))
-                )
-            if number_close and (
-                features.shape[1] == technical_count or similarity >= 0.82
-            ):
-                current.append(index)
-            else:
-                groups.append(current)
-                current = [index]
-        if current:
-            groups.append(current)
-    return groups
 
 
 def _keywords(
@@ -92,19 +47,12 @@ def _keywords(
     if tech["shadow_clip"] >= 0.08:
         result.append("AI|技术警告|阴影堵塞")
     if low_sharpness:
-        result.append("AI|技术警告|低清晰度")
+        result.append("AI|技术警告|清晰度待复核")
     return result
 
 
 def _raw_paths(input_root: Path) -> list[Path]:
-    return sorted(
-        [
-            path
-            for path in input_root.rglob("*")
-            if path.is_file() and path.suffix.lower() in READABLE_RAW_EXTENSIONS
-        ],
-        key=lambda path: str(path).lower(),
-    )
+    return raw_photo_paths(input_root)
 
 
 def _path_identity(path: Path) -> str:
@@ -142,7 +90,9 @@ def _groups_from_file(
 ) -> tuple[list[list[int]], list[int]]:
     payload = read_json(grouping_path)
     records = [
-        record for record in payload.get("results", []) if not record.get("excluded")
+        record for record in payload.get("results", [])
+        if not record.get("excluded") and not record.get("deleted")
+        and not is_photo_trash_path(Path(record.get("path", "")))
     ]
     by_path: dict[str, tuple[int, str | None]] = {}
     for record in records:
@@ -175,7 +125,9 @@ def _paths_from_grouping(
     """Validate the full directory snapshot, then omit reviewed exclusions."""
 
     payload = read_json(grouping_path)
-    records = payload.get("results", [])
+    records = [record for record in payload.get("results", [])
+               if not record.get("deleted")
+               and not is_photo_trash_path(Path(record.get("path", "")))]
     by_path: dict[str, dict] = {}
     for record in records:
         raw = Path(record.get("path", ""))
@@ -202,30 +154,20 @@ def _paths_from_grouping(
     return active, excluded
 
 
-def _candidate_pool(
-    scores: np.ndarray, groups: list[list[int]], retain_ratio: float
-) -> list[int]:
-    pool: list[int] = []
-    for indices in groups:
-        keep = max(1, int(math.ceil(len(indices) * retain_ratio)))
-        pool.extend(
-            sorted(indices, key=lambda index: float(scores[index]), reverse=True)[:keep]
-        )
-    return pool
-
-
 def assign_global_ratings(
     local_scores: np.ndarray,
     global_scores: np.ndarray,
     groups: list[list[int]],
     retain_ratio: float,
 ) -> tuple[np.ndarray, list[int], dict[int, int]]:
-    """Preselect inside each group, then allocate all stars on one global scale."""
-
-    pool = _candidate_pool(local_scores, groups, retain_ratio)
+    """Strict batch quota: grouping never limits a photo's eligibility."""
+    if len(local_scores) != len(global_scores) or not np.isfinite(global_scores).all():
+        raise ValueError("全批评分必须覆盖全部照片，并为有限数值。")
+    keep = retention_budget(len(global_scores), retain_ratio)
+    _group_ids(groups, len(global_scores))
+    pool = list(range(len(global_scores)))
     ranked = sorted(pool, key=lambda index: float(global_scores[index]), reverse=True)
-    keep = min(len(ranked), max(1, int(math.ceil(len(local_scores) * retain_ratio))))
-    strong = max(1, int(math.ceil(keep / 3)))
+    strong = max(1, (keep + 2) // 3)
     ratings = np.zeros(len(local_scores), dtype=np.int32)
     for rank, index in enumerate(ranked[:keep]):
         ratings[index] = 4 if rank < strong else 3
@@ -284,7 +226,7 @@ def classify_directory(
     phase_end("grouping", "自动整理分组", 1, unit="步")
     group_ids = _group_ids(groups, len(paths))
     group_sizes = CounterLike(group_ids)
-    sharpness_cutoff = float(np.quantile(features[:, 0], 0.10))
+    sharpness_flags = relative_sharpness_flags(features, groups)
     results: list[dict] = []
     phase_start("finalize", "保存分组工程", len(paths), unit="张")
     for index, path in enumerate(paths):
@@ -297,7 +239,7 @@ def classify_directory(
             for value in _keywords(
                 0,
                 tech,
-                features[index, 0] <= sharpness_cutoff,
+                bool(sharpness_flags[index]),
                 group_sizes[int(group_ids[index])],
                 mode,
             )
@@ -324,6 +266,21 @@ def classify_directory(
             }
         )
         emit_progress("finalize", "保存分组工程", index + 1, len(paths), unit="张")
+    # Keep unreadable sources in the directory snapshot. Dropping them here
+    # makes the next scoring run incorrectly report a changed directory.
+    failures = getattr(extractor, "failures", [])
+    for offset, (path, error) in enumerate(failures, 1):
+        results.append({
+            "path": str(path), "source_key": cache_key(path),
+            "extension": path.suffix.lower(),
+            "can_write_sidecar": path.suffix.lower() in PROPRIETARY_RAW_EXTENSIONS,
+            "score": 0.0, "rating": 0, "group_id": len(groups) + offset,
+            "group_size": 0, "keywords": ["AI|读取失败"],
+            "technical": {}, "components": {}, "reason": None,
+            "scoring_mode": mode, "pipeline_version": SCORING_PIPELINE_VERSION,
+            "excluded": True, "read_error": str(error)[:400],
+            "preview": str(preview_cache_path(path, cache_root / "previews")),
+        })
     run_id, run_dir = _run_dir(data_dir)
     payload = {
         "run_id": run_id,
@@ -331,10 +288,11 @@ def classify_directory(
         "retain_ratio": retain_ratio,
         "scoring_mode": mode,
         "workflow_state": "grouped",
+        "grouping_algorithm": GROUPING_VERSION,
         "pipeline_version": SCORING_PIPELINE_VERSION,
-        "image_count": len(paths),
+        "image_count": len(results),
         "active_image_count": len(paths),
-        "excluded_count": 0,
+        "excluded_count": len(failures),
         "group_count": len(groups),
         "candidate_count": 0,
         "strong_count": 0,
@@ -367,101 +325,70 @@ def score_directory(
     if grouping_path:
         paths, excluded_records = _paths_from_grouping(paths, grouping_path)
     # DINO remains the similarity-grouping representation and cached fallback.
+    # Release the previous local VLM before allocating DINO, not afterwards.
+    OllamaGroupCritic(data_dir).unload()
     cache_root = _cache_root(data_dir)
     extractor = FeatureExtractor(cache_root, use_dino=True)
     try:
         features, paths = extractor.extract(paths)
+        if failures := getattr(extractor, "failures", []):
+            names = "、".join(path.name for path, _ in failures[:3])
+            raise RuntimeError(f"无法读取照片：{names}。请修复源文件，或重新分类以跳过无法读取的照片。")
         if grouping_path:
             groups, group_labels = _groups_from_file(paths, grouping_path)
         else:
             groups = _group_images(paths, features, 8)
     finally:
         extractor.release()
-    # A cancelled previous deep run may have left Qwen resident briefly.
-    OllamaGroupCritic(data_dir).unload()
-
     aesthetic_scorer = GeneralAestheticScorer(data_dir)
     try:
         general = aesthetic_scorer.score(paths)
     finally:
         aesthetic_scorer.release()
 
-    fast_scores, _fast_components, _fast_reasons = fuse_scores(
+    technical_scores = technical_quality(features, groups)
+    fast_scores, fast_components, fast_reasons = fuse_scores(
         features,
         groups,
         general,
         mode="fast",
+        technical_scores=technical_scores,
     )
-    local_critiques = None
-    critic = None
-    if mode == "deep":
-        critic = OllamaGroupCritic(data_dir)
-        try:
-            local_critiques = critic.critique_groups(
-                paths, groups, fast_scores.tolist()
-            )
-        except Exception:
-            critic.unload()
-            raise
-    phase_start("local_rank", "组内综合排名", len(paths), unit="张")
-    try:
-        local_scores, components, reasons = fuse_scores(
-            features,
-            groups,
-            general,
-            mode=mode,
-            critiques=local_critiques,
-        )
-    except Exception:
-        if critic is not None:
-            critic.unload()
-        raise
-    phase_end("local_rank", "组内综合排名", len(paths), unit="张")
+    phase_start("local_rank", "初步质量排序", len(paths), unit="张")
+    phase_end("local_rank", "初步质量排序", len(paths), unit="张")
 
-    # Stage two: every group contributes its strongest candidates, then those
-    # candidates are compared on one shared scale.  Stars are allocated only
-    # after this global pass, so a weak burst winner cannot automatically beat
-    # a strong photo from another group.
-    pool = _candidate_pool(local_scores, groups, retain_ratio)
-    selected = np.asarray(pool, dtype=np.int64)
-    candidate_groups = [list(range(len(pool)))]
-    candidate_critiques = None
+    # Every photograph is reviewed on one anchored global scale. A preliminary
+    # score orders the batches; it never excludes a photo. This removes both
+    # per-group admission quotas and the duplicate local-then-global VLM pass.
+    pool = list(range(len(paths)))
+    critic = OllamaGroupCritic(data_dir) if mode == "deep" else None
     try:
         if mode == "deep":
             assert critic is not None
             global_critiques = critic.critique_groups(
-                paths,
-                [pool],
-                local_scores.tolist(),
-                context="global",
+                paths, [pool], fast_scores.tolist(), context="global",
             )
-            candidate_critiques = {
-                local_index: global_critiques[global_index]
-                for local_index, global_index in enumerate(pool)
-            }
         phase_start("global_rank", "跨组统一排名", len(pool), unit="张")
-        candidate_scores, candidate_components, candidate_reasons = fuse_scores(
-            features[selected],
-            candidate_groups,
-            [general[index] for index in pool],
-            mode=mode,
-            critiques=candidate_critiques,
-        )
+        if mode == "fast":
+            global_scores, components, reasons = fast_scores, fast_components, fast_reasons
+        else:
+            global_scores, components, reasons = fuse_scores(
+                features, groups, general, mode=mode, critiques=global_critiques,
+                technical_scores=technical_scores,
+            )
         phase_end("global_rank", "跨组统一排名", len(pool), unit="张")
     finally:
         if critic is not None:
             critic.unload()
 
-    global_scores = local_scores.copy()
-    for local_index, global_index in enumerate(pool):
-        global_scores[global_index] = candidate_scores[local_index]
-        components[global_index] = candidate_components[local_index]
-        reasons[global_index] = candidate_reasons[local_index]
+    # Legacy consumers may still read local_score. It now uses the same
+    # calibrated score as global_score, including for within-group ordering.
+    local_scores = global_scores
 
     ratings, pool, global_ranks = assign_global_ratings(
         local_scores, global_scores, groups, retain_ratio
     )
-    sharpness_cutoff = float(np.quantile(features[:, 0], 0.10))
+    sharpness_flags = relative_sharpness_flags(features, groups)
     group_ids = _group_ids(groups, len(paths), group_labels)
     group_ranks: dict[int, int] = {}
     for group_id, indices in enumerate(groups, start=1):
@@ -490,7 +417,7 @@ def score_directory(
         keywords = _keywords(
             rating,
             tech,
-            features[index, 0] <= sharpness_cutoff,
+            bool(sharpness_flags[index]),
             group_sizes[int(group_ids[index])],
             mode,
         )
@@ -569,7 +496,8 @@ def score_directory(
         "scoring_mode": mode,
         "workflow_state": "scored",
         "pipeline_version": SCORING_PIPELINE_VERSION,
-        "selection_strategy": "group_then_global_v1",
+        "selection_strategy": "strict_global_budget_v2",
+        "grouping_algorithm": grouping_meta.get("grouping_algorithm", "imported-snapshot") if grouping_path else GROUPING_VERSION,
         "source_run_id": source_run_id,
         "grouping_revision": grouping_meta.get("review_revision"),
         "group_order": grouping_meta.get("group_order", []),
@@ -669,13 +597,13 @@ def _write_html_report(path: Path, payload: dict) -> None:
 .group-header{{display:flex;align-items:end;justify-content:space-between;gap:12px;padding:0 2px 10px;border-bottom:1px solid var(--line);margin-bottom:12px}}.group-header h2{{font-size:18px}}.group-header p{{color:var(--muted)}}
 .singleton-note,.singleton-card-note{{color:var(--amber)}}.singleton-note{{border:1px solid #695727;background:#2d2719;border-radius:999px;padding:4px 9px;white-space:nowrap}}
 .grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}}.card{{min-width:0;background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden;transition:opacity .15s,border-color .15s,filter .15s}}
-.card.rating-4{{border-color:#3b9d5a}}.card.rating-3{{border-color:#426a9d}}.card.rating-0{{opacity:.48;filter:saturate(.55)}}.card.rating-0:hover{{opacity:.78;filter:saturate(.8)}}
+.card.rating-4{{border-color:#3b9d5a}}.card.rating-3{{border-color:#426a9d}}.card.rating-0 .card-heading strong{{color:var(--muted)}}
 .preview-link{{display:block;background:#07090b}}.card img{{display:block;width:100%;height:220px;object-fit:contain}}.meta{{display:grid;gap:7px;padding:12px}}
 .card-heading{{display:flex;align-items:start;justify-content:space-between;gap:10px}}.card-heading strong{{min-width:0;overflow-wrap:anywhere}}.rating-badge{{flex:none;font-size:12px;border-radius:999px;padding:2px 7px;background:var(--panel-2)}}
 .rating-4 .rating-badge{{color:#8de5a8}}.rating-3 .rating-badge{{color:#9bc1ff}}.rating-0 .rating-badge{{color:#a0a7ae}}.score{{color:#c4ccd4}}small{{color:#adb6bf}}code{{font:11px/1.45 ui-monospace,"Cascadia Mono",monospace;color:#818b96;overflow-wrap:anywhere}}
 @media(max-width:640px){{.page{{padding:18px 12px}}#visible-count{{width:100%;margin-left:2px}}.card img{{height:200px}}}}
 </style></head><body><div class="page"><header><h1>风光 AI 选片报告</h1>
-<p class="lead">批次：{html.escape(str(payload["input_root"]), quote=True)}。报告按相似组展示，组内按星级和综合分从高到低排列；0 星照片仅在报告中弱化显示，原文件保持不变。</p></header>
+<p class="lead">批次：{html.escape(str(payload["input_root"]), quote=True)}。报告按相似组展示，组内按星级和综合分从高到低排列；所有预览保持相同的亮度与色彩显示。</p></header>
 <section class="stats" aria-label="报告统计">
 <div class="stat"><strong>{len(results)}</strong><span>全部照片</span></div><div class="stat"><strong>{group_count}</strong><span>相似组</span></div>
 <div class="stat"><strong>{rating_counts[4]}</strong><span>4★ 强推荐</span></div><div class="stat"><strong>{rating_counts[3]}</strong><span>3★ 候选</span></div>

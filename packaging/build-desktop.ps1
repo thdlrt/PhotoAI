@@ -4,7 +4,8 @@ param(
     [string]$CoreWorkerOnedir,
     [string]$ResourceStage,
     [switch]$SkipNpmInstall,
-    [switch]$NoBundle
+    [switch]$NoBundle,
+    [switch]$WithMediaTools
 )
 
 $ErrorActionPreference = 'Stop'
@@ -12,6 +13,7 @@ $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $DesktopRoot = Join-Path $ProjectRoot 'desktop'
 $TauriRoot = Join-Path $DesktopRoot 'src-tauri'
 $CoreResourceRoot = Join-Path $TauriRoot 'resources\core'
+$BootstrapSource = Join-Path $DesktopRoot 'bootstrap'
 
 if (-not $ServiceOnedir) {
     $ServiceOnedir = Join-Path $ProjectRoot 'packaging\dist\core\PhotoAI.Service'
@@ -157,7 +159,7 @@ if (-not $CargoVersionMatch) {
     throw '无法读取桌面 Cargo 版本。'
 }
 $CargoVersion = $CargoVersionMatch.Matches[0].Groups[1].Value
-if ($Config.productName -ne '照片选片' -or $Config.mainBinaryName -ne 'PhotoAI') {
+if ($Config.productName -ne '摄影后期工具箱' -or $Config.mainBinaryName -ne 'PhotoAI') {
     throw 'Tauri 产品名或主程序名已偏离发布约定。'
 }
 if ($Config.version -ne $Package.version -or $Config.version -ne $CargoVersion) {
@@ -168,6 +170,17 @@ if ($Config.bundle.windows.nsis.installMode -ne 'currentUser') {
 }
 if ($Config.bundle.windows.webviewInstallMode.type -ne 'offlineInstaller') {
     throw '基础安装器必须携带离线 WebView2。'
+}
+
+# Keep the small startup/error screen reproducible; desktop/dist is generated.
+$BootstrapDist = Join-Path $DesktopRoot 'dist'
+New-Item -ItemType Directory -Force -Path $BootstrapDist | Out-Null
+foreach ($BootstrapFile in @('index.html', 'bootstrap.js', 'bootstrap.css')) {
+    $SourceFile = Join-Path $BootstrapSource $BootstrapFile
+    if (-not (Test-Path -LiteralPath $SourceFile -PathType Leaf)) {
+        throw "缺少桌面启动界面源文件：$SourceFile"
+    }
+    Copy-Item -LiteralPath $SourceFile -Destination (Join-Path $BootstrapDist $BootstrapFile) -Force
 }
 
 $NsisDirectory = Join-Path $TauriRoot 'target\release\bundle\nsis'
@@ -235,6 +248,15 @@ try {
     if ($SelfTest.ExitCode -ne 0) {
         throw "PhotoAI 桌面载荷自检失败，退出码：$($SelfTest.ExitCode)"
     }
+    if ($WithMediaTools) {
+        & (Join-Path $ProjectRoot '.venv\Scripts\python.exe') `
+            (Join-Path $ProjectRoot 'packaging\verify-cli-serve.py') `
+            --install-root $SelfTestRoot `
+            --report (Join-Path $SelfTestParent 'cli-serve-check.json')
+        if ($LASTEXITCODE -ne 0) {
+            throw 'CLI 独立服务与安装资源发现自检失败。'
+        }
+    }
 } finally {
     if (Test-Path -LiteralPath $SelfTestRoot) {
         Remove-Item -LiteralPath $SelfTestRoot -Recurse -Force
@@ -250,8 +272,14 @@ $ApplicationExe = Get-Item -LiteralPath $ApplicationExePath
 $ResourceBytes = (Get-ChildItem -LiteralPath (Join-Path $TauriRoot 'resources') -Recurse -File |
     Measure-Object -Property Length -Sum).Sum
 $InstalledPayloadBytes = $ApplicationExe.Length + $ResourceBytes
-if ($InstalledPayloadBytes -gt 700MB) {
-    throw "基础程序载荷超过 700MB 门禁：$([Math]::Round($InstalledPayloadBytes / 1MB, 1))MB"
+$FramePickRoot = Join-Path $ResourceStage 'tools\framepick'
+if (-not (Test-Path (Join-Path $FramePickRoot 'FramePick.exe'))) { throw '安装器缺少帧选组件。' }
+$FramePickBytes = [long](Get-ChildItem -LiteralPath $FramePickRoot -Recurse -File | Measure-Object -Property Length -Sum).Sum
+if ($FramePickBytes -gt 80MB) { throw '帧选独立组件超过 80MiB 预算。' }
+$FramePickAllowance = $FramePickBytes
+$InstalledPayloadLimit = 700MB + $FramePickAllowance
+if ($InstalledPayloadBytes -gt $InstalledPayloadLimit) {
+    throw "基础程序与帧选载荷超过已测量预算：$([Math]::Round($InstalledPayloadBytes / 1MB, 1))MB"
 }
 
 $Installers = @(Get-ChildItem -LiteralPath $NsisDirectory -Filter '*.exe' -File)
@@ -263,13 +291,53 @@ if ($GeneratedInstaller.FullName -ne $FinalInstallerPath) {
     Move-Item -LiteralPath $GeneratedInstaller.FullName -Destination $FinalInstallerPath
 }
 $Installer = Get-Item -LiteralPath $FinalInstallerPath
-$Limit = 350MB
+$MediaToolsBytes = 0L
+$MediaInstallerAllowance = 0L
+$CliPayloadBytes = 0L
+$CliInstallerAllowance = 0L
+if ($WithMediaTools) {
+    $ReleaseRecord = Get-Content -LiteralPath (Join-Path $ResourceStage 'manifests\release-manifest.json') -Raw | ConvertFrom-Json
+    if (-not $ReleaseRecord.media_tools_included) {
+        throw '媒体候选体积预算要求已校验的媒体资源清单。'
+    }
+    $MediaToolsRoot = Join-Path $ResourceStage 'tools\ffmpeg'
+    foreach ($RequiredTool in @('ffmpeg.exe', 'ffprobe.exe', 'LICENSE', 'README.txt')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $MediaToolsRoot $RequiredTool) -PathType Leaf)) {
+            throw "媒体候选缺少工具或许可：$RequiredTool"
+        }
+    }
+    $MediaToolsBytes = [long](Get-ChildItem -LiteralPath $MediaToolsRoot -Recurse -File | Measure-Object -Property Length -Sum).Sum
+    # The measured 0.10 candidate is 374.5 MiB. Keep the original base limit;
+    # the explicitly selected, pinned media bundle gets at most 32 MiB extra,
+    # bounded by its actual uncompressed bytes. FramePick has a separate measured allowance.
+    $MediaInstallerAllowance = [Math]::Min($MediaToolsBytes, [long](32MB))
+    $CliPayloadBytes = (Get-Item -LiteralPath (Join-Path $ServiceTarget 'PhotoToolbox.CLI.exe')).Length
+    # The second-stage candidate adds a real CLI executable while sharing the
+    # runtime. Account only for those measured new bytes (at most 16 MiB), not
+    # a blanket increase of the base package's limit.
+    $CliInstallerAllowance = [Math]::Min($CliPayloadBytes, [long](16MB))
+}
+$Limit = 350MB + $MediaInstallerAllowance + $CliInstallerAllowance + $FramePickAllowance
 if ($Installer.Length -gt $Limit) {
-    throw "安装器超过 350MB 门禁：$([Math]::Round($Installer.Length / 1MB, 1))MB"
+    throw "安装器超过 $([Math]::Round($Limit / 1MB, 1))MB 门禁：$([Math]::Round($Installer.Length / 1MB, 1))MB"
 }
 $Digest = (Get-FileHash -LiteralPath $Installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
 $DigestLine = "$Digest *$($Installer.Name)"
 Set-Content -LiteralPath ($Installer.FullName + '.sha256') -Value $DigestLine -Encoding ascii
+[ordered]@{
+    with_media_tools = [bool]$WithMediaTools
+    installer_bytes = $Installer.Length
+    base_installer_limit_bytes = 350MB
+    media_source_bytes = $MediaToolsBytes
+    media_allowance_bytes = $MediaInstallerAllowance
+    cli_payload_bytes = $CliPayloadBytes
+    cli_allowance_bytes = $CliInstallerAllowance
+    framepick_payload_bytes = $FramePickBytes
+    framepick_allowance_bytes = $FramePickAllowance
+    installer_limit_bytes = $Limit
+    installed_payload_bytes = $InstalledPayloadBytes
+    installed_payload_limit_bytes = $InstalledPayloadLimit
+} | ConvertTo-Json | Set-Content -LiteralPath ($Installer.FullName + '.budget.json') -Encoding utf8
 
 Write-Host "安装器：$($Installer.FullName)"
 Write-Host "大小：$([Math]::Round($Installer.Length / 1MB, 1)) MB"

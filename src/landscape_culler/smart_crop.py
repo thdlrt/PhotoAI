@@ -18,6 +18,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from .constants import VLM_MODEL_ID
 from .group_critic import OllamaGroupCritic
+from .vision_provider import model_label
 from .util import read_json, write_json
 
 SMART_CROP_VERSION = "semantic-crop-v2"
@@ -511,7 +512,7 @@ def _scene_schema() -> dict[str, Any]:
                 "type": "string",
                 "enum": ["original", "3:2", "4:3", "4:5", "16:9"],
             },
-            "summary": {"type": "string"},
+            "summary": {"type": "string", "maxLength": 120},
         },
         "required": [
             "scene_type",
@@ -546,7 +547,7 @@ def _rank_schema(ids: list[str]) -> dict[str, Any]:
                         "id": {"type": "string", "enum": ids},
                         "rank": {"type": "integer", "minimum": 1, "maximum": count},
                         "score": {"type": "number", "minimum": 0, "maximum": 100},
-                        "reason": {"type": "string"},
+                        "reason": {"type": "string", "maxLength": 40},
                     },
                     "required": ["id", "rank", "score", "reason"],
                     "additionalProperties": False,
@@ -594,7 +595,10 @@ def _vlm_json(
             return result
         except (KeyError, TypeError, ValueError, OSError) as exc:
             last_error = exc
-    raise RuntimeError(f"Qwen3-VL 构图分析失败：{last_error}")
+            if getattr(exc, "finish_reason", None) == "length":
+                payload["options"] = {**payload["options"],
+                    "num_predict": min(16384, payload["options"]["num_predict"] * 2)}
+    raise RuntimeError(f"{model_label(data_dir)} 构图分析失败：{last_error}")
 
 
 def _default_scene(
@@ -695,7 +699,7 @@ def analyze_scene(
     fallback = _default_scene(segmentation, subjects)
     scene = dict(fallback)
     if mode == "full":
-        _report_progress(progress, "scene", "Qwen3-VL 理解构图语义")
+        _report_progress(progress, "scene", f"{model_label(data_dir)} 理解构图语义")
         detected = [
             {"label": item["label"], "score": item["score"], "box": item["box"]}
             for item in subjects
@@ -708,6 +712,7 @@ def analyze_scene(
             "以及最适合的三分法、居中、对称、层次、引导线或留白构图。"
             "所有坐标按原图归一化为 0–1，框顺序为 left,top,right,bottom。"
             "只按 JSON Schema 返回可观察结论。"
+            "summary 只写一句不超过 60 字的关键构图结论，不要重复逐项解释。"
         )
         try:
             scene = _normalize_scene(
@@ -1093,17 +1098,19 @@ def _rank_candidates(
     ids = [item["internal_id"] for item in shortlist]
     prompt = (
         "你是专业摄影构图编辑。第一张图是原始照片，第二张是带编号的候选裁剪联系表。"
-        f"场景分析={json.dumps({key: value for key, value in scene.items() if key not in {'subjects', 'segmentation'}}, ensure_ascii=False)}。"
+        f"场景分析={json.dumps({key: value for key, value in scene.items() if key not in {'subjects', 'segmentation', 'engines', 'warnings'}}, ensure_ascii=False)}。"
         "逐一评价主体是否完整、三分法/居中/对称关系、地平线位置、人物或动物视线空间、"
         "天空与地面或水面比例、引导线、边缘截断和画面平衡。不要把裁得更紧本身当成优点。"
         "原图可以排名第一；只有明确改善才推荐裁切。为所有编号给出唯一完整名次和 0–100 分。"
+        "confidence 单独使用 0–1（如 0.9，不能写 90）。每个 reason 只写一句不超过 15 字的关键理由，"
+        "summary 不超过 40 字；无需重复场景描述或输出推理过程。"
     )
     result = _vlm_json([image, sheet], prompt, _rank_schema(ids), data_dir)
     items = result.get("items")
     if not isinstance(items, list) or {
         str(item.get("id")) for item in items if isinstance(item, dict)
     } != set(ids):
-        raise ValueError("Qwen3-VL 没有覆盖全部构图候选")
+        raise ValueError("视觉模型没有覆盖全部构图候选")
     cleaned: dict[str, dict[str, Any]] = {}
     for item in items:
         identifier = str(item["id"])
@@ -1305,6 +1312,7 @@ def smart_crop_candidates(
             if (
                 cached.get("version") == SMART_CROP_VERSION
                 and cached.get("mode") == mode
+                and cached.get("model", VLM_MODEL_ID) == VLM_MODEL_ID
                 and cache_is_healthy
             ):
                 _report_progress(progress, "cache", "读取智能构图缓存")
@@ -1312,14 +1320,37 @@ def smart_crop_candidates(
         except (OSError, TypeError, ValueError, KeyError):
             pass
 
-    scene = analyze_scene(image, data_dir, mode=mode, progress=progress)
-    _report_progress(progress, "candidates", "生成并筛选构图候选")
-    dense = generate_dense_candidates(image, scene)
+    # Preserve expensive semantic analysis independently of the final VLM rank.
+    stages_path = cache_path.with_name(f"{digest}-{mode}-stages.json")
+    stages = None
+    try:
+        saved = read_json(stages_path)
+        if (saved.get("version") == SMART_CROP_VERSION and saved.get("mode") == mode
+                and saved.get("model") == VLM_MODEL_ID
+                and isinstance(saved.get("scene"), dict) and not saved["scene"].get("warnings")
+                and isinstance(saved.get("dense"), list) and saved["dense"]):
+            stages = saved
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    if stages is not None:
+        scene, dense = stages["scene"], stages["dense"]
+        _report_progress(progress, "candidates", "复用已完成的主体、构图和候选分析")
+    else:
+        scene = analyze_scene(image, data_dir, mode=mode, progress=progress)
+        _report_progress(progress, "candidates", "生成并筛选构图候选")
+        dense = generate_dense_candidates(image, scene)
+        write_json(stages_path, {
+            "version": SMART_CROP_VERSION, "mode": mode, "model": VLM_MODEL_ID,
+            # Dense scores already contain pixel-mask coverage. Ranking needs
+            # only public subjects, avoiding megabytes of integral matrices.
+            "scene": {**scene, "subjects": _public_subjects(scene.get("subjects", []))},
+            "dense": dense,
+        })
     ranking_warning = None
     _report_progress(
         progress,
         "rank",
-        "Qwen3-VL 复评候选构图" if mode == "full" else "规则复评候选构图",
+        f"{model_label(data_dir)} 复评候选构图" if mode == "full" else "规则复评候选构图",
     )
     try:
         ranked, rank_confidence, rank_summary = _rank_candidates(
@@ -1366,6 +1397,7 @@ def smart_crop_candidates(
         {
             "version": SMART_CROP_VERSION,
             "mode": mode,
+            "model": VLM_MODEL_ID,
             "candidates": candidates,
             "selected": selected,
             "analysis": analysis,

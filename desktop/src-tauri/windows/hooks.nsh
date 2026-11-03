@@ -17,14 +17,102 @@ Var PhotoAIFreshInstall
 Var PhotoAISelfTestExit
 Var PhotoAINestedDataRelative
 Var PhotoAIRenameAttempts
+Var PhotoAIRestoreFailed
+Var PhotoAIFailedEntry
+Var PhotoAIDataReinstall
+Var PhotoAIPreviousProductLocation
+
+; Only these entries belong to the installer. Data and unrelated files remain
+; at their original paths, including when another process holds the root open.
+!macro PhotoAIProgramPayload Apply
+  !insertmacro ${Apply} "${MAINBINARYNAME}.exe" "file"
+  !insertmacro ${Apply} "uninstall.exe" "file"
+  !insertmacro ${Apply} ".photoai-install-marker" "file"
+  !insertmacro ${Apply} "core" "directory"
+  !insertmacro ${Apply} "tools" "directory"
+  !insertmacro ${Apply} "integrations" "directory"
+  !insertmacro ${Apply} "manifests" "directory"
+  !insertmacro ${Apply} "licenses" "directory"
+  !insertmacro ${Apply} "LICENSE" "file"
+  !insertmacro ${Apply} "THIRD_PARTY_NOTICES.md" "file"
+  !insertmacro ${Apply} "photography-toolbox.cmd" "file"
+!macroend
+
+!macro PhotoAIValidateProgramEntry Entry Kind
+  StrCmp $PhotoAINestedDataRelative "${Entry}" photoai_preinstall_data_conflict
+  StrLen $0 "${Entry}\"
+  StrCpy $1 "$PhotoAINestedDataRelative" $0
+  StrCmp $1 "${Entry}\" photoai_preinstall_data_conflict
+  System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR\${Entry}") i.r0'
+  ${If} $0 != -1
+    IntOp $1 $0 & 0x400
+    ${If} $1 != 0
+      StrCpy $PhotoAIFailedEntry "${Entry}"
+      Goto photoai_preinstall_reparse_entry
+    ${EndIf}
+  ${EndIf}
+!macroend
+
+!macro PhotoAIBackupProgramEntry Entry Kind
+  System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR\${Entry}") i.r0'
+  ${If} $0 != -1
+    StrCpy $PhotoAIRenameAttempts 0
+    ${Do}
+      ClearErrors
+      Rename "$INSTDIR\${Entry}" "$PhotoAIRollbackDir\${Entry}"
+      ${IfNot} ${Errors}
+        ${ExitDo}
+      ${EndIf}
+      IntOp $PhotoAIRenameAttempts $PhotoAIRenameAttempts + 1
+      ${If} $PhotoAIRenameAttempts >= 10
+        StrCpy $PhotoAIFailedEntry "${Entry}"
+        Goto photoai_preinstall_payload_failed
+      ${EndIf}
+      Sleep 500
+    ${Loop}
+  ${EndIf}
+!macroend
+
+!macro PhotoAIRestoreProgramEntry Entry Kind
+  System::Call 'kernel32::GetFileAttributesW(w "$PhotoAIRollbackDir\${Entry}") i.r0'
+  ${If} $0 != -1
+    ; Never overwrite an unexpected file during rollback.
+    System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR\${Entry}") i.r1'
+    ${If} $1 != -1
+      StrCpy $PhotoAIRestoreFailed 1
+    ${Else}
+      ClearErrors
+      Rename "$PhotoAIRollbackDir\${Entry}" "$INSTDIR\${Entry}"
+      ${If} ${Errors}
+        StrCpy $PhotoAIRestoreFailed 1
+      ${EndIf}
+    ${EndIf}
+  ${EndIf}
+!macroend
+
+!macro PhotoAIClearNewProgramEntry Entry Kind
+  !if "${Kind}" == "directory"
+    RMDir /r "$INSTDIR\${Entry}"
+  !else
+    Delete "$INSTDIR\${Entry}"
+  !endif
+!macroend
+
+!macro PhotoAIClearBackupProgramEntry Entry Kind
+  !if "${Kind}" == "directory"
+    RMDir /r /REBOOTOK "$PhotoAIRollbackDir\${Entry}"
+  !else
+    Delete /REBOOTOK "$PhotoAIRollbackDir\${Entry}"
+  !endif
+!macroend
 
 !macro NSIS_HOOK_PREINSTALL
-  ; Keep the previous program tree beside the install directory until the new
-  ; tree has passed its own self-test.  CONTENT_ROOT is external and is never
-  ; part of this swap.  Moving on the same volume is atomic and avoids making a
-  ; second large copy on the user's small system disk.
+  ; Stage the known program payload on the same volume until self-test passes.
+  ; Never move the install root: nested data, terminal working directories and
+  ; an installer launched from this tree can keep that directory open.
   StrCpy $PhotoAIRollbackActive 0
   StrCpy $PhotoAIFreshInstall 0
+  StrCpy $PhotoAIDataReinstall 0
   StrCpy $PhotoAINestedDataRelative ""
   ReadRegStr $PhotoAIContentRoot HKCU "Software\PhotoAI" "ContentRoot"
   ${If} $PhotoAIContentRoot != ""
@@ -45,7 +133,11 @@ Var PhotoAIRenameAttempts
   ; Tauri stores InstallLocation as a quoted command-path value. Match that
   ; exact representation; do not trim, canonicalize or accept a prefix.
   StrCmp $PhotoAIPreviousInstallLocation "$\"$INSTDIR$\"" 0 photoai_preinstall_not_owned
+  ; The product was renamed in 0.10. Keep accepting the exact prior display
+  ; name, while retaining every path, uninstaller and ownership-marker check.
+  StrCmp $PhotoAIPreviousDisplayName "照片选片" photoai_preinstall_known_brand 0
   StrCmp $PhotoAIPreviousDisplayName "${PRODUCTNAME}" 0 photoai_preinstall_not_owned
+  photoai_preinstall_known_brand:
   IfFileExists "$INSTDIR\uninstall.exe" 0 photoai_preinstall_not_owned
   IfFileExists "$INSTDIR\.photoai-install-marker" 0 photoai_preinstall_not_owned
   ClearErrors
@@ -58,6 +150,8 @@ Var PhotoAIRenameAttempts
   StrCmp $PhotoAIInstallMarkerContents "PHOTO_AI_INSTALL/1" 0 photoai_preinstall_not_owned
 
   !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+  StrCmp $PhotoAIContentRoot "$INSTDIR" photoai_preinstall_data_conflict
+  !insertmacro PhotoAIProgramPayload PhotoAIValidateProgramEntry
   StrCpy $PhotoAIRollbackDir "$INSTDIR.photoai-previous"
   IfFileExists "$PhotoAIRollbackDir\." 0 photoai_preinstall_backup
     MessageBox MB_OK|MB_ICONSTOP "发现尚未清理的旧版暂存目录：$\r$\n$PhotoAIRollbackDir$\r$\n$\r$\n为避免覆盖可恢复版本，安装已停止。"
@@ -66,23 +160,38 @@ Var PhotoAIRenameAttempts
   photoai_preinstall_backup:
   ReadRegStr $PhotoAIPreviousDisplayVersion SHCTX "${UNINSTKEY}" "DisplayVersion"
   SetOutPath "$TEMP"
-  StrCpy $PhotoAIRenameAttempts 0
-  photoai_preinstall_backup_retry:
   ClearErrors
-  Rename "$INSTDIR" "$PhotoAIRollbackDir"
+  CreateDirectory "$PhotoAIRollbackDir"
   ${If} ${Errors}
-    IntOp $PhotoAIRenameAttempts $PhotoAIRenameAttempts + 1
-    ${If} $PhotoAIRenameAttempts < 10
-      Sleep 500
-      Goto photoai_preinstall_backup_retry
-    ${EndIf}
-    MessageBox MB_OK|MB_ICONSTOP "无法暂存当前版本，安装未修改。请关闭占用程序目录的应用，并将安装包保存到程序目录之外（例如“下载”目录）后重试。"
+    MessageBox MB_OK|MB_ICONSTOP "无法创建程序暂存目录，安装未修改：$\r$\n$PhotoAIRollbackDir"
     SetErrorLevel 1
     Abort
   ${EndIf}
-  CreateDirectory "$INSTDIR"
+  !insertmacro PhotoAIProgramPayload PhotoAIBackupProgramEntry
   StrCpy $PhotoAIRollbackActive 1
   Goto photoai_preinstall_create_marker
+
+  photoai_preinstall_payload_failed:
+  StrCpy $PhotoAIRestoreFailed 0
+  !insertmacro PhotoAIProgramPayload PhotoAIRestoreProgramEntry
+  ${If} $PhotoAIRestoreFailed == 0
+    RMDir "$PhotoAIRollbackDir"
+    MessageBox MB_OK|MB_ICONSTOP "程序文件仍被占用，更新已停止并恢复旧程序：$\r$\n$INSTDIR\$PhotoAIFailedEntry$\r$\n请关闭正在使用该程序文件的进程后重试。数据和工程未修改。"
+  ${Else}
+    MessageBox MB_OK|MB_ICONSTOP "程序文件被占用，部分旧程序未能自动恢复，已保留在：$\r$\n$PhotoAIRollbackDir$\r$\n数据和工程未修改，请勿删除暂存目录。"
+  ${EndIf}
+  SetErrorLevel 1
+  Abort
+
+  photoai_preinstall_data_conflict:
+  MessageBox MB_OK|MB_ICONSTOP "数据目录与程序资源目录重叠，已停止更新以保护数据。请在设置中将数据目录改到独立位置后重试。"
+  SetErrorLevel 1
+  Abort
+
+  photoai_preinstall_reparse_entry:
+  MessageBox MB_OK|MB_ICONSTOP "程序资源目录经过链接或目录联接点，已停止更新：$\r$\n$INSTDIR\$PhotoAIFailedEntry"
+  SetErrorLevel 1
+  Abort
 
   photoai_preinstall_not_owned:
   MessageBox MB_OK|MB_ICONSTOP "所选目录中的现有程序未通过照片选片安装所有权校验，安装未修改。请使用原安装位置更新，或选择一个空目录重新安装。"
@@ -95,6 +204,18 @@ Var PhotoAIRenameAttempts
   ; Stale registration or any unknown directory entry still fails closed.
   StrCmp $PhotoAIPreviousInstallLocation "" 0 photoai_preinstall_not_owned
   StrCmp $PhotoAIPreviousDisplayName "" 0 photoai_preinstall_not_owned
+  ; An uninstall that keeps data also keeps the product's last install path.
+  ; Reinstall only that exact registered location, with an owned nested root.
+  ; No retained data is ever extracted over, moved or recursively removed.
+  ReadRegStr $PhotoAIPreviousProductLocation SHCTX "${MANUPRODUCTKEY}" ""
+  ${If} $PhotoAIPreviousProductLocation == "$INSTDIR"
+  ${AndIf} $PhotoAINestedDataRelative != ""
+    IfFileExists "$PhotoAIContentRoot\marker.json" 0 photoai_preinstall_fresh_not_empty
+    !insertmacro PhotoAIProgramPayload PhotoAIValidateProgramEntry
+    StrCpy $PhotoAIDataReinstall 1
+    StrCpy $PhotoAIFreshInstall 1
+    Goto photoai_preinstall_create_marker
+  ${EndIf}
   IfFileExists "$INSTDIR\.photoai-install-marker" photoai_preinstall_recover_stale 0
   StrCpy $PhotoAIFreshInstall 1
   CreateDirectory "$INSTDIR"
@@ -178,6 +299,25 @@ Var PhotoAIRenameAttempts
     StrCmp $1 "." photoai_preinstall_fresh_next
     StrCmp $1 ".." photoai_preinstall_fresh_next
     StrCmp $1 ".photoai-install-marker" photoai_preinstall_fresh_next
+    ${If} $PhotoAIDataReinstall == 1
+      ; Accept only the top-level directory containing the registered data.
+      StrCmp $1 "uninstall.exe" photoai_preinstall_fresh_next
+      StrCmp $PhotoAINestedDataRelative "$1" photoai_preinstall_retained_data
+      StrLen $2 "$1\"
+      StrCpy $3 "$PhotoAINestedDataRelative" $2
+      StrCmp $3 "$1\" photoai_preinstall_retained_data
+      Goto photoai_preinstall_fresh_unknown
+      photoai_preinstall_retained_data:
+      System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR\$1") i.r2'
+      IntOp $3 $2 & 0x400
+      ${If} $3 == 0
+        IntOp $3 $2 & 0x10
+        ${If} $3 != 0
+          Goto photoai_preinstall_fresh_next
+        ${EndIf}
+      ${EndIf}
+    ${EndIf}
+    photoai_preinstall_fresh_unknown:
     FindClose $0
     Goto photoai_preinstall_fresh_not_empty_after_marker
 
@@ -212,17 +352,21 @@ Var PhotoAIRenameAttempts
   photoai_preinstall_marker_failed:
   SetOutPath "$TEMP"
   Delete "$INSTDIR\.photoai-install-marker"
-  RMDir "$INSTDIR"
   ${If} $PhotoAIRollbackActive == 1
-    ClearErrors
-    Rename "$PhotoAIRollbackDir" "$INSTDIR"
-    ${If} ${Errors}
+    StrCpy $PhotoAIRestoreFailed 0
+    !insertmacro PhotoAIProgramPayload PhotoAIRestoreProgramEntry
+    ${If} $PhotoAIRestoreFailed != 0
       MessageBox MB_OK|MB_ICONSTOP "无法创建安装所有权标记，且原版本未能自动恢复。原版本仍保留在：$\r$\n$PhotoAIRollbackDir$\r$\n$\r$\n请勿删除该目录。"
+      SetErrorLevel 1
       Abort
     ${EndIf}
+    RMDir "$PhotoAIRollbackDir"
     StrCpy $PhotoAIRollbackActive 0
+  ${Else}
+    RMDir "$INSTDIR"
   ${EndIf}
   MessageBox MB_OK|MB_ICONSTOP "无法创建安装所有权标记，安装未修改。请确认目录可写后重试。"
+  SetErrorLevel 1
   Abort
 
   photoai_preinstall_done:
@@ -241,15 +385,17 @@ Var PhotoAIRenameAttempts
   ${If} $PhotoAISelfTestExit <> 0
     ${If} $PhotoAIRollbackActive == 1
       SetOutPath "$TEMP"
-      RMDir /r "$INSTDIR"
-      ClearErrors
-      Rename "$PhotoAIRollbackDir" "$INSTDIR"
-      ${If} ${Errors}
+      !insertmacro PhotoAIProgramPayload PhotoAIClearNewProgramEntry
+      StrCpy $PhotoAIRestoreFailed 0
+      !insertmacro PhotoAIProgramPayload PhotoAIRestoreProgramEntry
+      ${If} $PhotoAIRestoreFailed != 0
         MessageBox MB_OK|MB_ICONSTOP "新版自检失败（错误码 $PhotoAISelfTestExit），自动恢复旧版也失败。旧版仍保留在：$\r$\n$PhotoAIRollbackDir$\r$\n$\r$\n请勿删除该目录。"
+        SetErrorLevel 1
         Abort
       ${EndIf}
+      RMDir "$PhotoAIRollbackDir"
       WriteRegStr SHCTX "${MANUPRODUCTKEY}" "" "$INSTDIR"
-      WriteRegStr SHCTX "${UNINSTKEY}" "DisplayName" "${PRODUCTNAME}"
+      WriteRegStr SHCTX "${UNINSTKEY}" "DisplayName" "$PhotoAIPreviousDisplayName"
       WriteRegStr SHCTX "${UNINSTKEY}" "DisplayIcon" "$\"$INSTDIR\${MAINBINARYNAME}.exe$\""
       WriteRegStr SHCTX "${UNINSTKEY}" "InstallLocation" "$\"$INSTDIR$\""
       WriteRegStr SHCTX "${UNINSTKEY}" "UninstallString" "$\"$INSTDIR\uninstall.exe$\""
@@ -270,6 +416,7 @@ Var PhotoAIRenameAttempts
       DeleteRegKey SHCTX "${MANUPRODUCTKEY}"
       Delete "$INSTDIR\${MAINBINARYNAME}.exe"
       Delete "$INSTDIR\uninstall.exe"
+      Delete "$INSTDIR\photography-toolbox.cmd"
       Delete "$INSTDIR\.photoai-install-marker"
       RMDir /r "$INSTDIR\core"
       RMDir /r "$INSTDIR\tools"
@@ -286,27 +433,15 @@ Var PhotoAIRenameAttempts
         MessageBox MB_OK|MB_ICONSTOP "照片选片安装后自检失败（错误码 $PhotoAISelfTestExit）。仅本次创建的已知程序文件已清理；安装目录仍包含未识别或被占用的内容，因此已安全保留：$\r$\n$INSTDIR"
       ${EndIf}
     ${EndIf}
+    SetErrorLevel 1
     Abort
   ${EndIf}
   ${If} $PhotoAIRollbackActive == 1
     SetOutPath "$TEMP"
-    ; Content roots nested inside the install directory remain in the rollback
-    ; tree until the program self-test succeeds. Restore them before deleting
-    ; old program files. A failed move leaves the entire backup untouched.
-    ${If} $PhotoAINestedDataRelative != ""
-      IfFileExists "$PhotoAIRollbackDir\$PhotoAINestedDataRelative\." 0 photoai_nested_data_done
-      ${GetParent} "$INSTDIR\$PhotoAINestedDataRelative" $0
-      CreateDirectory "$0"
-      ClearErrors
-      Rename "$PhotoAIRollbackDir\$PhotoAINestedDataRelative" "$INSTDIR\$PhotoAINestedDataRelative"
-      ${If} ${Errors}
-        MessageBox MB_OK|MB_ICONSTOP "新版已安装，但数据目录未能自动归还。已保留全部旧数据，未执行清理：$\r$\n$PhotoAIRollbackDir\$PhotoAINestedDataRelative$\r$\n请勿删除此目录，恢复数据后再打开软件。"
-        SetErrorLevel 1
-        Abort
-      ${EndIf}
-      photoai_nested_data_done:
-    ${EndIf}
-    RMDir /r /REBOOTOK "$PhotoAIRollbackDir"
+    ; Data never left its original location. Clean only staged program entries;
+    ; an unexpected file in the backup prevents this non-recursive removal.
+    !insertmacro PhotoAIProgramPayload PhotoAIClearBackupProgramEntry
+    RMDir /REBOOTOK "$PhotoAIRollbackDir"
   ${EndIf}
 !macroend
 
@@ -382,6 +517,8 @@ Var PhotoAIRenameAttempts
     ${EndIf}
     DeleteRegValue HKCU "Software\PhotoAI" "ContentRoot"
     DeleteRegKey /ifempty HKCU "Software\PhotoAI"
+    ; Clear only the recovery pointer after confirmed, complete data deletion.
+    Delete "$LOCALAPPDATA\com.photoai.culler\content-root.json"
     Goto photoai_postuninstall_done
 
     photoai_content_delete_failed:

@@ -37,7 +37,27 @@ def test_release_gate_executes_cleanup_not_only_parser_self_test() -> None:
     assert 'result.get("deleted_count") != 2' in gate
 
 
-def test_pyinstaller_spec_builds_only_two_lightweight_console_sidecars() -> None:
+def test_service_packages_preview_dependencies_and_gate_runs_current_toolbox_workflow() -> None:
+    spec = (PROJECT_ROOT / "packaging/PhotoAI.spec").read_text(encoding="utf-8")
+    service_spec = spec.split("service_analysis = core_analysis(", 1)[1].split("service_pyz", 1)[0]
+    for module in ("PIL.Image", "PIL.ImageEnhance", "numpy"):
+        assert f'"{module}"' in service_spec
+    assert "preview_dependencies=True" in service_spec
+    worker_spec = spec.split("worker_analysis = core_analysis(", 1)[1]
+    assert "preview_dependencies=True" not in worker_spec
+    gate = (PROJECT_ROOT / "packaging/verify-release.py").read_text(encoding="utf-8")
+    assert "verify_service_toolbox_runtime(origin, token, probe, content_root, require_media=require_media)" in gate
+    assert '"/api/review-workspaces"' in gate
+    assert '"/api/toolbox/timelapse"' in gate
+    assert "expected=410" in gate
+    assert 'chosen["user"]["memory"] != 3' in gate
+    assert 'probe["plan_file"].read_bytes() != legacy_before' in gate
+    assert 'result.get("frames") != 12 or not result.get("verified")' in gate
+    for module in ("landscape_culler.timelapse_api", "landscape_culler.collaborative_review_api"):
+        assert f'"{module}"' in service_spec
+
+
+def test_pyinstaller_spec_builds_shared_runtime_cli_and_two_lightweight_sidecars() -> None:
     spec = (PROJECT_ROOT / "packaging/PhotoAI.spec").read_text(encoding="utf-8")
 
     assert "collect_all" not in spec
@@ -47,7 +67,11 @@ def test_pyinstaller_spec_builds_only_two_lightweight_console_sidecars() -> None
     assert '"landscape_culler.ai_runtime"' in spec
     assert '"landscape_culler.model_resources"' in spec
     assert '"landscape_culler.offline_bundle"' in spec
-    assert spec.count("console=True") == 2
+    assert spec.count("console=True") == 3
+    assert 'name="PhotoToolbox.CLI"' in spec
+    assert '"landscape_culler.toolbox_cli"' in spec
+    assert '"landscape_culler.agent_connection"' in spec
+    assert 'if name == "service_entry" else (name, path, kind)' in spec
     assert "version_info_worker.txt" in spec
     worker_version = (PROJECT_ROOT / "packaging/version_info_worker.txt").read_text(
         encoding="utf-8"
@@ -133,10 +157,10 @@ def test_nsis_hooks_fail_closed_around_owned_data_and_plugin_removal() -> None:
     assert "PhotoAIPreviousDisplayName" in hooks
     assert "PHOTO_AI_INSTALL/1" in hooks
     assert 'IfFileExists "$PhotoAIRollbackDir\\."' in hooks
-    assert 'Rename "$INSTDIR" "$PhotoAIRollbackDir"' in hooks
-    assert 'Rename "$PhotoAIRollbackDir" "$INSTDIR"' in hooks
+    assert '!insertmacro PhotoAIProgramPayload PhotoAIBackupProgramEntry' in hooks
+    assert '!insertmacro PhotoAIProgramPayload PhotoAIRestoreProgramEntry' in hooks
     assert 'DeleteRegKey SHCTX "Software\\Classes\\photoai"' in hooks
-    assert 'RMDir /r "$INSTDIR"' in hooks
+    assert 'RMDir /r "$INSTDIR"' not in hooks
     assert "$UpdateMode == 1" in hooks
     assert "MB_YESNO|MB_ICONEXCLAMATION|MB_DEFBUTTON2" in hooks
 
@@ -154,7 +178,7 @@ def test_nsis_update_requires_exact_owned_install_and_self_test_fails_closed() -
 
     update_validation = hooks.index("photoai_preinstall_validate_update:")
     running_check = hooks.index("!insertmacro CheckIfAppIsRunning")
-    backup = hooks.index('Rename "$INSTDIR" "$PhotoAIRollbackDir"')
+    backup = hooks.index('!insertmacro PhotoAIProgramPayload PhotoAIBackupProgramEntry')
     assert update_validation < running_check < backup
     assert (
         'StrCmp $PhotoAIPreviousInstallLocation "$\\"$INSTDIR$\\"" 0 '
@@ -211,7 +235,7 @@ def test_nsis_fresh_install_requires_empty_root_and_cleans_known_payload_only() 
             "!macro NSIS_HOOK_PREUNINSTALL"
         )
     ]
-    assert postinstall.count('RMDir /r "$INSTDIR"') == 1
+    assert 'RMDir /r "$INSTDIR"' not in postinstall
     for relative in ("core", "tools", "integrations", "manifests"):
         assert f'RMDir /r "$INSTDIR\\{relative}"' in postinstall
     assert 'Delete "$INSTDIR\\${MAINBINARYNAME}.exe"' in postinstall
@@ -225,10 +249,11 @@ def test_nsis_fresh_install_requires_empty_root_and_cleans_known_payload_only() 
             "!macro NSIS_HOOK_PREUNINSTALL"
         )
     ]
-    # Updates must restore a nested Content Root before removing the old payload.
-    restore = 'Rename "$PhotoAIRollbackDir\\$PhotoAINestedDataRelative" "$INSTDIR\\$PhotoAINestedDataRelative"'
-    assert restore in install_hooks
-    assert install_hooks.index(restore) < install_hooks.rindex('RMDir /r /REBOOTOK "$PhotoAIRollbackDir"')
+    # Updates never move data or the root directory, including during rollback.
+    assert 'Rename "$INSTDIR" "$PhotoAIRollbackDir"' not in install_hooks
+    assert 'Rename "$PhotoAIRollbackDir" "$INSTDIR"' not in install_hooks
+    assert '!insertmacro PhotoAIProgramPayload PhotoAIRestoreProgramEntry' in install_hooks
+    assert 'RMDir /r /REBOOTOK "$PhotoAIRollbackDir"' not in install_hooks
     assert 'ReadRegStr $PhotoAIContentRoot HKCU "Software\\PhotoAI" "ContentRoot"' in install_hooks
 
     postuninstall = hooks[hooks.index("!macro NSIS_HOOK_POSTUNINSTALL") :]

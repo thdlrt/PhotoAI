@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from typing import Any
 
 import numpy as np
+from .aesthetic_scores import qrealign_scores
 
 FAST_WEIGHTS = {
     # Preserve the relative contribution of the remaining signals after the
@@ -20,19 +21,6 @@ DEEP_WEIGHTS = {
     "quality": 2.0 / 17.0,
     "technical": 1.0 / 17.0,
 }
-
-
-def _external_01(value: float) -> float:
-    """Normalize common 0–1, 1–5, 0–10, or 0–100 score ranges."""
-
-    value = float(value)
-    if 0.0 <= value <= 1.05:
-        return float(np.clip(value, 0.0, 1.0))
-    if value <= 5.5:
-        return float(np.clip((value - 1.0) / 4.0, 0.0, 1.0))
-    if value <= 10.5:
-        return float(np.clip(value / 10.0, 0.0, 1.0))
-    return float(np.clip(value / 100.0, 0.0, 1.0))
 
 
 def group_normalize(values: Iterable[float], groups: list[list[int]]) -> np.ndarray:
@@ -69,6 +57,27 @@ def technical_quality(features: np.ndarray, groups: list[list[int]]) -> np.ndarr
     return np.clip(0.32 * sharp + 0.18 * contrast + 0.18 * entropy + 0.17 * exposure + 0.15 * clipping, 0.0, 1.0)
 
 
+def relative_sharpness_flags(features: np.ndarray, groups: list[list[int]]) -> np.ndarray:
+    """Flag a meaningful deficit among similar frames, not a mandatory percentile.
+
+    Laplacian variance depends on scene texture. A singleton or uniformly soft
+    sequence provides no reliable reference; aesthetic/quality models still
+    evaluate those images. This warning requests inspection, never rejection.
+    """
+    sharpness = np.asarray(features[:, 0], dtype=np.float64)
+    flagged = np.zeros(len(sharpness), dtype=bool)
+    for indices in groups:
+        if len(indices) < 2:
+            continue
+        values = sharpness[indices]
+        if not np.isfinite(values).all():
+            continue
+        # Features are log1p(variance): 0.5 is a substantial difference, not
+        # the tiny numerical noise previously expanded by a bottom-10% rule.
+        flagged[indices] = values < float(np.median(values)) - 0.5
+    return flagged
+
+
 def vlm_dimension_score(item: dict[str, Any]) -> float:
     """Deterministic visual score; never trust a model's contradictory rank."""
 
@@ -90,10 +99,19 @@ def fuse_scores(
     *,
     mode: str,
     critiques: dict[int, dict[str, Any]] | None = None,
+    technical_scores: np.ndarray | None = None,
 ) -> tuple[np.ndarray, list[dict[str, float]], list[dict[str, Any]]]:
-    technical = technical_quality(features, groups)
-    aesthetic_raw = np.asarray([_external_01(item["aesthetic"]) for item in general])
-    quality_raw = np.asarray([_external_01(item["quality"]) for item in general])
+    # Reuse calibration from the complete batch for candidate re-evaluation.
+    # Membership of the candidate pool cannot change a photograph's measured
+    # technical quality, even when its visual critique is updated.
+    technical = technical_quality(features, groups) if technical_scores is None else np.asarray(technical_scores, dtype=np.float64)
+    if technical.shape != (len(features),) or not np.isfinite(technical).all() or ((technical < 0) | (technical > 1)).any():
+        raise ValueError("技术评分必须与照片一一对应，并为 0–1 的有限数值。")
+    if len(general) != len(features):
+        raise ValueError("Q-ReAlign 评分必须与照片一一对应。")
+    normalized = [qrealign_scores(item) for item in general]
+    aesthetic_raw = np.asarray([item["aesthetic"] for item in normalized])
+    quality_raw = np.asarray([item["quality"] for item in normalized])
     # Q-ReAlign is already calibrated to 0–1. Preserve the absolute values:
     # exact within-group ranks would turn harmless 0.001 noise into a 0.65 gap.
     aesthetic = np.clip(aesthetic_raw, 0.0, 1.0)

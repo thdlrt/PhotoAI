@@ -6,6 +6,7 @@ import argparse
 import base64
 import gc
 import io
+import importlib
 import json
 import os
 import tempfile
@@ -114,12 +115,10 @@ class _SmokeTelemetry:
 
 def _run_smoke(layout: Any, profile_id: str) -> dict[str, Any]:
     checks: dict[str, Any] = {}
-    telemetry = _SmokeTelemetry(9)
+    telemetry = _SmokeTelemetry(5)
     success = False
     try:
         import cv2
-        import PyOpenColorIO
-        import pyvips
         import rawpy
         import torch
         import transformers
@@ -129,8 +128,6 @@ def _run_smoke(layout: Any, profile_id: str) -> dict[str, Any]:
             "transformers": transformers.__version__,
             "opencv": cv2.__version__,
             "rawpy": rawpy.__version__,
-            "pyvips": pyvips.__version__,
-            "opencolorio": PyOpenColorIO.__version__,
         }
         telemetry.advance("AI 运行组件", "固定 AI 依赖可正常导入")
         if not torch.cuda.is_available():
@@ -150,14 +147,6 @@ def _run_smoke(layout: Any, profile_id: str) -> dict[str, Any]:
         from transformers import (
             AutoImageProcessor,
             AutoModel,
-            AutoModelForZeroShotObjectDetection,
-            AutoProcessor,
-            CLIPModel,
-            CLIPProcessor,
-            Sam2Model,
-            Sam2Processor,
-            SegformerForSemanticSegmentation,
-            SegformerImageProcessor,
         )
 
         image = Image.new("RGB", (96, 96), "#708090")
@@ -185,91 +174,6 @@ def _run_smoke(layout: Any, profile_id: str) -> dict[str, Any]:
         del dino_output, dino_inputs, dino, dino_processor
         _release_cuda(torch)
         telemetry.advance("DINOv2 Base", "视觉特征实测通过")
-
-        telemetry.working("CLIP ViT-B/32", "加载图文匹配模型到 GPU")
-        clip_path = managed_hf_model_path("clip-vit-b32", models_root=layout.models)
-        clip_processor = CLIPProcessor.from_pretrained(clip_path, local_files_only=True)
-        clip = (
-            CLIPModel.from_pretrained(clip_path, local_files_only=True)
-            .eval()
-            .to(device)
-        )
-        clip_inputs = {
-            key: tensor.to(device)
-            for key, tensor in clip_processor(
-                text=["natural landscape"],
-                images=image,
-                return_tensors="pt",
-                padding=True,
-            ).items()
-        }
-        with torch.inference_mode():
-            clip_output = clip(**clip_inputs)
-        checks["clip"] = {
-            "logits_shape": list(clip_output.logits_per_image.shape),
-            "snapshot": clip_path.name,
-        }
-        del clip_output, clip_inputs, clip, clip_processor
-        _release_cuda(torch)
-        telemetry.advance("CLIP ViT-B/32", "图文匹配实测通过")
-
-        smart_models = (
-            (
-                "grounding-dino-tiny",
-                AutoProcessor,
-                AutoModelForZeroShotObjectDetection,
-            ),
-            (
-                "segformer-b2",
-                SegformerImageProcessor,
-                SegformerForSemanticSegmentation,
-            ),
-            ("sam2-hiera-tiny", Sam2Processor, Sam2Model),
-        )
-        loaded_smart_models: list[str] = []
-        for resource_id, processor_type, model_type in smart_models:
-            telemetry.working(
-                str(MODEL_SPECS[resource_id]["label"]),
-                "加载智能构图模型到 GPU",
-            )
-            model_path = managed_hf_model_path(resource_id, models_root=layout.models)
-            processor = processor_type.from_pretrained(
-                model_path, local_files_only=True
-            )
-            model = (
-                model_type.from_pretrained(model_path, local_files_only=True)
-                .eval()
-                .to(device)
-            )
-            if not any(parameter.is_cuda for parameter in model.parameters()):
-                raise RuntimeError(
-                    f"{MODEL_SPECS[resource_id]['label']} 未加载到 CUDA。"
-                )
-            if resource_id == "grounding-dino-tiny":
-                inputs = processor(images=image, text="a landscape.", return_tensors="pt")
-            elif resource_id == "sam2-hiera-tiny":
-                inputs = processor(images=image, input_points=[[[[48, 48]]]], return_tensors="pt")
-            else:
-                inputs = processor(images=image, return_tensors="pt")
-            inputs = {key: value.to(device) for key, value in inputs.items()}
-            with torch.inference_mode():
-                output = model(**inputs)
-            # Grounding DINO masks padded text-token logits with -inf by
-            # design. Validate predicted boxes instead of those padding slots.
-            output_tensor = (
-                output.pred_masks if resource_id == "sam2-hiera-tiny"
-                else output.pred_boxes if resource_id == "grounding-dino-tiny"
-                else output.logits
-            )
-            if not torch.isfinite(output_tensor).all().item():
-                raise RuntimeError(f"{MODEL_SPECS[resource_id]['label']} 推理结果异常。")
-            loaded_smart_models.append(resource_id)
-            del output_tensor, output, inputs, model, processor
-            _release_cuda(torch)
-            telemetry.advance(
-                str(MODEL_SPECS[resource_id]["label"]), "智能构图实际推理通过"
-            )
-        checks["smart_crop"] = {"loaded": loaded_smart_models, "inference_tested": True}
 
         import pyiqa
 
@@ -418,19 +322,36 @@ def install_models_and_smoke(
     write_json(result, payload)
 
 
+def check_worker_code(content_root: Path, profile_id: str, result: Path) -> None:
+    from .constants import AI_WORKER_CODE_VERSION, VLM_PROMPT_VERSION
+    layout = resolve_content_root(content_root, apply_environment=False, allow_managed_runtime=True)
+    apply_runtime_environment(layout)
+    os.environ.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", UV_OFFLINE="1")
+    modules = ["scoring", "cli"]
+    for name in modules:
+        importlib.import_module(f"landscape_culler.{name}")
+    write_json(result, {"schema_version": 1, "status": "passed", "profile_id": profile_id,
+                        "worker_code_version": AI_WORKER_CODE_VERSION, "vlm_prompt_version": VLM_PROMPT_VERSION,
+                        "checks": {"worker_imports": modules}, "completed_at": datetime.now(UTC).isoformat()})
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--content-root", type=Path, required=True)
     parser.add_argument("--profile", choices=("8gb", "16gb"), required=True)
     parser.add_argument("--smoke-result", type=Path, required=True)
     parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--worker-only", action="store_true")
     args = parser.parse_args()
-    install_models_and_smoke(
-        args.content_root,
-        args.profile,
-        args.smoke_result,
-        offline=args.offline,
-    )
+    if args.worker_only:
+        check_worker_code(args.content_root, args.profile, args.smoke_result)
+    else:
+        install_models_and_smoke(
+            args.content_root,
+            args.profile,
+            args.smoke_result,
+            offline=args.offline,
+        )
     print(json.dumps({"status": "passed", "profile": args.profile}))
 
 

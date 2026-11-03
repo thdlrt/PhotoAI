@@ -2,12 +2,34 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import json
+
 from landscape_culler import ai_install_worker
 from landscape_culler.ai_install_worker import (
     _SmokeTelemetry,
     install_models_and_smoke,
 )
 from landscape_culler.progress import parse_progress_line
+
+
+def test_worker_only_check_does_not_configure_or_load_models(tmp_path, monkeypatch):
+    from landscape_culler.constants import AI_WORKER_CODE_VERSION
+    layout = SimpleNamespace(root=tmp_path / "content")
+    monkeypatch.setattr(ai_install_worker, "resolve_content_root", lambda *_args, **_kwargs: layout)
+    monkeypatch.setattr(ai_install_worker, "apply_runtime_environment", lambda _layout: None)
+    for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "UV_OFFLINE"):
+        monkeypatch.setenv(name, "previous")
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("worker-only check must not revalidate models")
+    monkeypatch.setattr(ai_install_worker, "configure_model_profile", unexpected)
+    monkeypatch.setattr(ai_install_worker, "_run_smoke", unexpected)
+    imports = []
+    monkeypatch.setattr(ai_install_worker.importlib, "import_module", imports.append)
+    result = tmp_path / "worker-check.json"
+    ai_install_worker.check_worker_code(layout.root, "16gb", result)
+    payload = json.loads(result.read_text(encoding="utf-8"))
+    assert payload["status"] == "passed" and payload["worker_code_version"] == AI_WORKER_CODE_VERSION
+    assert imports == [f"landscape_culler.{name}" for name in ("scoring", "cli")]
 
 
 def test_smoke_telemetry_reports_current_model_and_checkpoint(

@@ -28,6 +28,9 @@ const state = {
   batchBusy: false,
   filter: "all",
   dialogIndex: null,
+  dialogSequence: null,
+  thumbnailSize: 210,
+  thumbnailDirty: false,
   rollbackId: null,
   developPlan: null,
   developStage: "crop",
@@ -56,6 +59,55 @@ const state = {
 };
 
 let mutationTokenRefresh = null;
+let visionThinkingRequest = 0;
+let ratingSave = Promise.resolve();
+let reviewViewer = null;
+let reviewGrid = null;
+let reviewOpenRequest = 0;
+let developLoadRequest = 0;
+let exportStarting = false;
+let jobsPolling = false;
+let jobsPollAgain = false;
+
+function renderVisionThinkingOptions(capabilities, value = $("#vision-thinking").value) {
+  const select = $("#vision-thinking");
+  const options = capabilities.options || [];
+  select.innerHTML = options.map((option) => `<option value="${escapeHtml(option.value)}">${escapeHtml(option.label)}</option>`).join("");
+  select.value = options.some((option) => option.value === value) ? value : capabilities.default;
+  select.disabled = options.length < 2;
+  $("#vision-thinking-hint").textContent = capabilities.hint || "";
+}
+
+async function refreshVisionThinkingOptions() {
+  const requestId = ++visionThinkingRequest;
+  try {
+    const query = new URLSearchParams({base_url: $("#vision-url").value, model: $("#vision-model").value});
+    const capabilities = await api(`/api/vision-provider/thinking-options?${query}`);
+    if (requestId === visionThinkingRequest) renderVisionThinkingOptions(capabilities);
+  } catch (error) {
+    if (requestId === visionThinkingRequest) $("#vision-status").textContent = error.message;
+  }
+}
+
+async function saveVisionProviderSettings(event) {
+  event.preventDefault();
+  const button = event.submitter;
+  button.disabled = true;
+  visionThinkingRequest += 1;
+  try {
+    const config = await api("/api/vision-provider", {method: "PUT", body: {
+      mode: $("#vision-mode").value, base_url: $("#vision-url").value,
+      model: $("#vision-model").value, api_key: $("#vision-key").value,
+      thinking_effort: $("#vision-thinking").value,
+      timeout: Number($("#vision-timeout").value), upload_consent: $("#vision-consent").checked,
+    }});
+    $("#vision-key").value = "";
+    renderVisionThinkingOptions(config.thinking_capabilities, config.thinking_effort);
+    $("#vision-status").textContent = "已保存，下次任务生效。";
+    await refreshModelResources();
+  } catch (error) { $("#vision-status").textContent = error.message; }
+  finally { button.disabled = false; }
+}
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
@@ -273,6 +325,21 @@ async function requireModelSetupUi() {
   return false;
 }
 
+async function requireStyleRuntimeUi() {
+  const run = state.currentRun;
+  const navigation = reviewOpenRequest;
+  try {
+    const status = await api("/api/style-runtime");
+    if (state.currentRun !== run || reviewOpenRequest !== navigation) return false;
+    if (status.ready) return true;
+    toast(status.message || "外观处理运行组件尚未就绪。");
+    await openModelResources("push");
+  } catch (error) {
+    if (state.currentRun === run && reviewOpenRequest === navigation) toast(error.message);
+  }
+  return false;
+}
+
 async function refreshMutationToken() {
   if (!mutationTokenRefresh) {
     mutationTokenRefresh = (async () => {
@@ -321,6 +388,27 @@ async function api(path, options = {}) {
     throw new Error(message);
   }
   return payload;
+}
+
+async function copyDiagnostics() {
+  const button = $("#app-diagnostics-copy");
+  if (button.disabled) return;
+  button.disabled = true;
+  const fallback = $("#app-diagnostics-fallback");
+  fallback.classList.add("hidden");
+  try {
+    const report = await api("/api/diagnostics");
+    try {
+      await navigator.clipboard.writeText(report.copy_text);
+      toast("诊断信息已复制");
+    } catch {
+      $("#app-diagnostics-text").value = report.copy_text;
+      fallback.classList.remove("hidden");
+      $("#app-diagnostics-text").focus();
+      $("#app-diagnostics-text").select();
+    }
+  } catch (error) { toast(error.message); }
+  finally { button.disabled = false; }
 }
 
 function toast(message) {
@@ -407,7 +495,9 @@ async function importSettingsFile(file) {
   }
 }
 
-function setView(name, route = name, historyMode = "replace") {
+async function setView(name, route = name, historyMode = "replace") {
+  if (PhotoReviewWorkspace.hasPending() && !await PhotoReviewWorkspace.savePending()) return;
+  if (!["project", "review", "develop", "export"].includes(name)) reviewOpenRequest += 1;
   const previousView = document.querySelector(".view.active")?.id || "";
   const previousHash = location.hash;
   $$(".view").forEach((node) => node.classList.toggle("active", node.id === `view-${name}`));
@@ -506,13 +596,19 @@ function toolboxTransactionRow(item) {
   </article>`;
 }
 
-function openToolboxSection(section = "home", historyMode = "push") {
-  const validSections = new Set(["home", "raw-jpeg", "xmp-cleanup", "xmp-records"]);
+async function openToolboxSection(section = "home", historyMode = "push") {
+  const requestedHash = location.hash;
+  if (PhotoReviewWorkspace.hasPending() && !await PhotoReviewWorkspace.savePending()) return;
+  const validSections = new Set(["home", "review", "timelapse", "agent", "raw-jpeg", "xmp-cleanup", "xmp-records"]);
   state.toolboxSection = validSections.has(section) ? section : "home";
   $$('[data-toolbox-panel]').forEach((node) => node.classList.toggle("hidden", node.dataset.toolboxPanel !== state.toolboxSection));
-  const route = state.toolboxSection === "home" ? "toolbox" : `toolbox/${state.toolboxSection}`;
+  let route = state.toolboxSection === "home" ? "toolbox" : `toolbox/${state.toolboxSection}`;
+  if (state.toolboxSection !== "home" && historyMode === "replace" && requestedHash.startsWith(`#${route}/`)) route = requestedHash.slice(1);
   setView("toolbox", route, historyMode);
   renderToolbox();
+  if (state.toolboxSection === "review") PhotoReviewWorkspace.open().catch(error => toast(error.message));
+  if (state.toolboxSection === "timelapse") PhotoTimelapse.open().catch(error => toast(error.message));
+  if (state.toolboxSection === "agent") PhotoAgentPanel.open().catch(error => toast(error.message));
 }
 
 function renderToolbox() {
@@ -610,7 +706,11 @@ function renderXmpCleanup() {
 }
 
 async function openProject(projectId, updateRoute = true) {
+  const request = ++reviewOpenRequest;
+  await ratingSave;
+  if (request !== reviewOpenRequest) return;
   const project = await api(`/api/projects/${encodeURIComponent(projectId)}`);
+  if (request !== reviewOpenRequest) return;
   state.currentProject = project;
   const route = updateRoute ? `project/${projectId}` : location.hash.replace(/^#/, "") || `project/${projectId}`;
   if (project.latest_run_id) {
@@ -689,80 +789,6 @@ function renderLightroom() {
   manualButton.disabled = state.lightroomBusy || !$("#lightroom-path").value.trim();
 }
 
-function renderStyleLibrary() {
-  const library = state.styleLibrary;
-  const summary = $("#settings-style-summary");
-  const files = [...$("#style-library-files").files];
-  const importButton = $("#style-library-import");
-  importButton.disabled = state.styleImportBusy || files.length === 0;
-  importButton.textContent = state.styleImportBusy ? "正在上传…" : files.length ? `上传 ${files.length} 个文件` : "上传所选";
-  if (!library) {
-    summary.textContent = "尚未同步";
-    renderStyleLibraryManager();
-    return;
-  }
-  const sources = library.sources || {};
-  summary.textContent = `${Number(sources.lightroom?.count || 0)} 个 Lightroom 预设 · ${Number(sources.user?.count || 0)} 个用户风格`;
-  renderStyleLibraryManager();
-}
-
-function styleSourceLabel(item) {
-  if (item.source_group === "user") return item.look_kind === "rendered_lut" ? "用户 LUT" : "用户上传";
-  return "Lightroom 自动识别";
-}
-
-function renderStyleLibraryManager() {
-  const list = $("#style-library-manager-list");
-  if (!list) return;
-  const library = state.styleLibrary || {};
-  const sources = library.sources || {};
-  const section = state.styleLibrarySection;
-  const lightroom = sources.lightroom || { count: 0, enabled: true, ai_pool: 0 };
-  const user = sources.user || { count: 0, enabled: true, ai_pool: 0 };
-  $("#style-library-manager-home").classList.toggle("hidden", section !== "home");
-  $("#style-library-source-view").classList.toggle("hidden", section === "home");
-  $("#style-library-manager-summary").textContent = `${Number(lightroom.count || 0) + Number(user.count || 0)} 个风格 · 2 个来源`;
-  [["lightroom", lightroom], ["user", user]].forEach(([key, source]) => {
-    const node = $(`#style-source-${key}-state`);
-    node.textContent = `${Number(source.count || 0)} 个 · ${source.enabled ? "已启用" : "已停用"}`;
-    node.classList.toggle("enabled", Boolean(source.enabled));
-  });
-  if (section === "home") return;
-
-  const isUser = section === "user";
-  const source = isUser ? user : lightroom;
-  $("#style-library-source-title").textContent = isUser ? "用户上传" : "从 Lightroom 导入";
-  $("#style-library-source-summary").textContent = `${Number(source.count || 0)} 个风格 · ${source.enabled ? "整类已启用" : "整类已停用"}${Number(source.ai_pool || 0) ? ` · ${Number(source.ai_pool)} 个可供 AI 推荐` : ""}`;
-  const toggle = $("#style-library-source-toggle");
-  toggle.disabled = state.styleLibraryBusy;
-  toggle.textContent = state.styleLibraryBusy ? "正在更新…" : source.enabled ? "停用整类" : "启用整类";
-  toggle.dataset.source = section;
-  toggle.dataset.enabled = source.enabled ? "false" : "true";
-  const rescan = $("#style-library-source-rescan");
-  rescan.classList.toggle("hidden", isUser);
-  rescan.disabled = state.styleLibraryBusy;
-  rescan.textContent = state.styleLibraryBusy ? "正在扫描…" : "重新扫描 Lightroom";
-  $("#style-library-user-import").classList.toggle("hidden", !isUser);
-
-  const query = $("#style-library-manager-search").value.trim().toLowerCase();
-  const all = (library.presets || []).filter((item) => item.source_group === section);
-  const matches = all.filter((item) => {
-    const haystack = [item.label, item.source, item.group, item.category].filter(Boolean).join(" ").toLowerCase();
-    return !query || haystack.includes(query);
-  });
-  const shown = matches.slice(0, 300);
-  list.innerHTML = shown.map((item) => {
-    const resourceId = escapeHtml(item.resource_id || "");
-    const busy = state.styleLibraryItemBusy === item.resource_id;
-    const toggleAction = `<button type="button" class="button" data-style-library-toggle="${resourceId}" data-hidden="${item.user_hidden ? "false" : "true"}" ${busy ? "disabled" : ""}>${busy ? "处理中…" : item.user_hidden ? "启用" : "停用"}</button>`;
-    const deleteAction = isUser && item.can_delete
-      ? `<button type="button" class="button danger" data-style-library-delete="${resourceId}" ${busy ? "disabled" : ""}>${busy ? "处理中…" : "删除"}</button>`
-      : "";
-    const status = item.user_hidden ? "已单独停用" : !source.enabled ? "来源已停用" : item.ai_enabled ? "AI 可用" : item.compatibility === "compatible" ? "已识别" : "不兼容";
-    return `<article class="style-library-item ${source.enabled && !item.user_hidden ? "" : "inactive"}"><div class="style-library-item-copy"><strong>${escapeHtml(item.label || "未命名风格")}</strong><small>${escapeHtml(styleSourceLabel(item))} · ${escapeHtml(status)}</small></div><div class="style-library-item-actions">${toggleAction}${deleteAction}</div></article>`;
-  }).join("") || `<div class="empty">${query ? "没有匹配的风格" : isUser ? "还没有上传风格" : "尚未扫描到 Lightroom 预设"}</div>`;
-}
-
 function selectedModelProfile() {
   const profiles = state.modelResources?.profiles || [];
   const preferred = state.modelProfile
@@ -833,7 +859,7 @@ function renderModelResources() {
   $("#model-profile-list").innerHTML = (data.profiles || []).map((profile) => {
     const isSelected = profile.id === selected.id;
     const action = profile.configured
-      ? (profile.ready ? "重新校验配置" : "补齐并修复")
+      ? (data.engine?.worker_update_required && profile.verified_count === profile.model_count ? "更新处理代码" : profile.ready ? "检查配置" : "补齐并修复")
       : (profile.ready ? "使用此档" : "一键下载并配置");
     return `<article class="model-profile-card ${isSelected ? "selected" : ""}" data-model-profile="${escapeHtml(profile.id)}">
       <div class="model-profile-copy"><div><strong>${escapeHtml(profile.label)}</strong>${profile.recommended ? `<span class="resource-badge recommended">推荐</span>` : ""}${profile.configured ? `<span class="resource-badge active">当前</span>` : ""}</div><p>${escapeHtml(profile.description)}</p><small>${Number(profile.verified_count ?? profile.installed_count)}/${profile.model_count} 个校验通过 · 约 ${formatBytes(profile.estimated_bytes)}</small></div>
@@ -961,16 +987,31 @@ async function deleteSelectedModelProfile() {
   }
 }
 
+function jobBlocksProject(project = state.currentRun, job = state.activeJob) {
+  if (!job || !["queued", "running", "cancelling"].includes(job.status) || job.kind === "model_download") return false;
+  if (!project) return true;
+  const scope = job.context || {};
+  if (project.run_id && [scope.run_id, scope.source_run_id].includes(project.run_id)) return true;
+  if (project.project_id && project.project_id === scope.project_id) return true;
+  const normalize = path => String(path || "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  const source = normalize(scope.input_root), target = normalize(project.input_root);
+  if (source && target) return source === target || source.startsWith(`${target}/`) || target.startsWith(`${source}/`);
+  // Unknown legacy file tasks remain protected until their scope is resolved.
+  return true;
+}
+
 function currentProgressJob() {
   const localProgress = state.developProgress || state.developFlowProgress;
   const foreground = localProgress ? {
+    id: localProgress.job_id,
+    kind: state.developProgress ? "develop" : null,
     title: localProgress.title || (state.developProgress ? "分析智能构图" : "保存处理设置"),
     status: localProgress.status || "running",
     stage: localProgress.stage_label,
     message: localProgress.message,
     progress: localProgress,
     foreground: true,
-    retryable: localProgress.status === "failed" && Boolean(state.currentRun),
+    retryable: ["failed", "cancelled", "interrupted"].includes(localProgress.status) && Boolean(state.currentRun),
     retry_mode: "develop",
     context: { run_id: localProgress.run_id || state.currentRun?.run_id },
   } : null;
@@ -987,7 +1028,7 @@ function renderJobBar() {
   }
   const active = Boolean(job && ["queued", "running", "cancelling"].includes(job.status));
   const partialFailure = job?.status === "completed" && job?.result?.style_status === "partial";
-  const failed = ["failed", "interrupted"].includes(job?.status) || partialFailure;
+  const failed = ["failed", "interrupted"].includes(job?.status) || (job?.kind === "develop" && job.status === "cancelled") || partialFailure;
   if (!job || (!active && !failed)) {
     bar.classList.add("hidden");
     bar.classList.remove("failed");
@@ -1039,7 +1080,7 @@ function renderJobBar() {
   const percent = $("#job-percent");
   const track = $("#job-progress-track");
   const fill = $("#job-progress-fill");
-  percent.textContent = partialFailure ? "部分失败" : failed ? "失败" : (overall === null ? "进行中" : `${Math.round(overall)}%`);
+  percent.textContent = job.status === "cancelled" ? "已取消" : partialFailure ? "部分失败" : failed ? "失败" : (overall === null ? "进行中" : `${Math.round(overall)}%`);
   track.classList.toggle("indeterminate", overall === null);
   if (overall === null) {
     fill.style.width = "";
@@ -1066,13 +1107,42 @@ function renderJobBar() {
   const retry = $("#job-retry");
   retry.textContent = state.jobRetryBusy
     ? "正在重试…"
-    : partialFailure ? "重试失败组" : job.retry_mode === "export_failed" ? "重试失败项" : "重试";
+    : reclassificationRunId(job) ? "重新分类" : partialFailure ? "重试失败组" : job.retry_mode === "develop" ? "继续构图" : job.retry_mode === "export_failed" ? "重试失败项" : "重试";
   retry.disabled = state.jobRetryBusy;
   retry.classList.toggle("hidden", !failed || !job.retryable);
-  $("#job-cancel").textContent = failed ? "关闭" : job.foreground ? "处理中" : "取消";
-  $("#job-cancel").disabled = job.status === "cancelling" || Boolean(job.foreground && !failed);
-  bar.classList.toggle("failed", failed);
+  $("#job-cancel").textContent = failed ? "关闭" : job.status === "cancelling" ? "正在取消…" : job.foreground && !job.id ? "正在启动…" : "取消";
+  $("#job-cancel").disabled = job.status === "cancelling" || Boolean(job.foreground && !job.id && !failed);
+  bar.classList.toggle("failed", failed && job.status !== "cancelled");
   bar.classList.remove("hidden");
+}
+
+let thumbnailSave = Promise.resolve();
+
+function setThumbnailSize(value) {
+  const number = Number(value);
+  state.thumbnailSize = Number.isFinite(number) ? Math.min(420, Math.max(160, Math.round(number / 10) * 10)) : 210;
+  const workspace = $("#review-workspace");
+  workspace.style.setProperty("--review-thumbnail-size", `${state.thumbnailSize}px`);
+  workspace.style.setProperty("--review-preview-height", `${Math.round(state.thumbnailSize * 6 / 7)}px`);
+  $("#thumbnail-size").value = state.thumbnailSize;
+}
+
+async function saveThumbnailSize() {
+  const size = state.thumbnailSize;
+  const save = thumbnailSave.catch(() => {}).then(() => api("/api/preferences/ui", {
+    method: "PATCH", body: { thumbnail_size: size },
+  }));
+  thumbnailSave = save;
+  try {
+    const ui = await save;
+    if (state.bootstrap && state.thumbnailSize === size) {
+      state.bootstrap.preferences = { ...state.bootstrap.preferences, ui };
+    }
+  } catch (error) {
+    toast(`缩略图大小未能保存：${error.message}`);
+  } finally {
+    if (state.thumbnailSize === size) state.thumbnailDirty = false;
+  }
 }
 
 async function refreshBootstrap() {
@@ -1085,11 +1155,6 @@ async function refreshBootstrap() {
     state.lightroomStatus = null;
   }
   try {
-    state.styleLibrary = await api("/api/style-library");
-  } catch (_error) {
-    state.styleLibrary = null;
-  }
-  try {
     state.modelResources = await api("/api/model-resources");
   } catch (_error) {
     state.modelResources = null;
@@ -1100,6 +1165,7 @@ async function refreshBootstrap() {
   state.toolboxTransactions = data.toolbox_transactions || [];
   state.xmpCleanupTransactions = data.xmp_cleanup_transactions || [];
   const preferences = data.preferences || {};
+  if (!state.thumbnailDirty) setThumbnailSize(preferences.ui?.thumbnail_size ?? 210);
   if (!state.modelProfile && preferences.model_profile_preference) state.modelProfile = preferences.model_profile_preference;
   if (!state.currentRun) {
     const workflow = preferences.workflow_defaults || data.defaults || {};
@@ -1120,7 +1186,6 @@ async function refreshBootstrap() {
   renderAlerts();
   renderProjects();
   renderLightroom();
-  renderStyleLibrary();
   renderContentRootSettings();
   renderModelResources();
   renderModelSetupState();
@@ -1133,7 +1198,8 @@ function warningText(item) {
 }
 
 function ratingControls(item, compact = false) {
-  const buttons = [0, 3, 4, 5].map((rating) => `<button class="rating-button ${item.effective_rating === rating ? "active" : ""}" data-rate-index="${item.index}" data-rating="${rating}" title="设为 ${rating} 星">${rating}</button>`).join("");
+  const labels = {0: "不入选", 3: "候选", 4: "推荐", 5: "精选"};
+  const buttons = [0, 3, 4, 5].map((rating) => `<button class="rating-button ${item.effective_rating === rating ? "active" : ""}" data-rate-index="${item.index}" data-rating="${rating}" aria-pressed="${item.effective_rating === rating}" title="${labels[rating]}（${rating} 星，快捷键 ${rating}）">${rating}</button>`).join("");
   const reset = item.manual_override ? `<button class="rating-button rating-reset" data-rate-index="${item.index}" data-rating="reset">恢复 AI</button>` : "";
   return `<div class="rating-buttons ${compact ? "compact" : ""}">${buttons}${reset}</div>`;
 }
@@ -1141,6 +1207,7 @@ function ratingControls(item, compact = false) {
 function matchesFilter(item) {
   if (state.filter === "all") return true;
   if (state.filter === "warning") return Boolean(warningText(item));
+  if (state.filter === "candidates") return item.effective_rating >= 3;
   const rating = Number(state.filter);
   if (rating === 4) return item.effective_rating >= 4;
   return item.effective_rating === rating;
@@ -1171,7 +1238,7 @@ function endGroupingDrag() {
 
 function canDragGroups() {
   const run = state.currentRun;
-  return run && !state.activeJob && !state.batchBusy &&
+  return run && !jobBlocksProject() && !state.batchBusy &&
     (state.groupingMode || run.workflow_state !== "scored" || run.needs_rescore);
 }
 
@@ -1273,6 +1340,15 @@ function bindGroupingDrag() {
   });
   document.addEventListener("dragend", () => { if (groupingDrag) suppressDragClickUntil = Date.now() + 400; endGroupingDrag(); });
   document.addEventListener("click", (event) => {
+    const framepick = event.target.closest("[data-framepick-launch]");
+    if (framepick && !framepick.disabled) {
+      framepick.disabled = true;
+      api("/api/toolbox/framepick/launch", { method: "POST", body: {} })
+        .then(() => toast("帧选已打开"))
+        .catch(error => toast(error.message))
+        .finally(() => { framepick.disabled = false; });
+      return;
+    }
     if (Date.now() < suppressDragClickUntil && event.target.closest("#review-groups")) { event.preventDefault(); event.stopImmediatePropagation(); }
   }, true);
   document.addEventListener("keydown", (event) => { if (event.key === "Escape" && groupingDrag) { event.stopImmediatePropagation(); endGroupingDrag(); } }, true);
@@ -1280,6 +1356,11 @@ function bindGroupingDrag() {
   window.addEventListener("blur", endGroupingDrag);
   window.addEventListener("hashchange", endGroupingDrag);
   document.addEventListener("visibilitychange", () => { if (document.hidden) endGroupingDrag(); });
+}
+
+function photoScoreMarkup(item, grouping) {
+  if (grouping || !Number.isFinite(item.score) || item.score < 0 || item.score > 1) return "";
+  return `<span class="photo-score" title="综合分（满分 100）">综合分 ${(item.score * 100).toFixed(1)}</span>`;
 }
 
 function renderReview() {
@@ -1302,19 +1383,20 @@ function renderReview() {
     ? `${run.group_count || 0} 个相似组 · ${run.manual_group_adjusted_count || 0} 张人工调整${excludedItems.length ? ` · ${excludedItems.length} 张不参与评分` : ""}`
     : `${mode} · 跨组统一排名 · ${run.strong_count} 张 4–5 星 · ${run.candidate_count} 张候选 · ${run.manual_adjusted_count || 0} 张人工调星`;
   $("#review-toolbar").classList.toggle("hidden", grouping);
-  $("#develop-open").classList.toggle("hidden", grouping || !run.xmp_ready);
+  $("#selection-export-open").classList.toggle("hidden", grouping || !run.xmp_ready);
   $("#score-run").classList.toggle("hidden", !grouping);
   $("#score-run").textContent = scored ? "重新 AI 选片" : "开始 AI 选片";
   $("#score-run").disabled = Boolean(state.activeJob) || state.batchBusy || activeItems.length === 0 || !modelSetupStatus().ready;
   $("#score-settings").classList.toggle("hidden", !grouping);
   $("#review-flow-copy").textContent = grouping
     ? "核对相似分组，确认后开始 AI 评分"
-    : `${run.candidate_count} 张候选已就绪；继续完成可选处理并导出`;
+    : `${run.candidate_count} 张候选已就绪；确认后导出选择`;
   $("#grouping-toggle").classList.toggle("hidden", !scored || Boolean(run.needs_rescore));
   $("#grouping-toggle").textContent = grouping ? "返回审片" : "调整分组";
+  $("#reclassify-run").disabled = Boolean(state.activeJob) || state.batchBusy;
   $("#batch-select-toggle").classList.toggle("hidden", !grouping);
   $("#batch-select-toggle").textContent = batch ? "结束批量" : "批量选择";
-  $("#batch-select-toggle").disabled = Boolean(state.activeJob) || state.batchBusy;
+  $("#batch-select-toggle").disabled = Boolean(jobBlocksProject()) || state.batchBusy;
   const selectionToolbar = $("#selection-toolbar");
   selectionToolbar.classList.toggle("hidden", !batch);
   $("#selection-count").textContent = `已选 ${state.selectedIndices.size} 张`;
@@ -1343,7 +1425,7 @@ function renderReview() {
     groups.get(item.group_id).push(item);
   });
   let visible = 0;
-  const groupMarkup = [...groups.entries()].sort((a, b) => orderedGroups.indexOf(Number(a[0])) - orderedGroups.indexOf(Number(b[0]))).map(([groupId, items]) => {
+  const groupSections = [...groups.entries()].sort((a, b) => orderedGroups.indexOf(Number(a[0])) - orderedGroups.indexOf(Number(b[0]))).map(([groupId, items]) => {
     const ordered = grouping
       ? items.sort((a, b) => a.index - b.index)
       : items.sort((a, b) => b.effective_rating - a.effective_rating || b.score - a.score);
@@ -1357,8 +1439,8 @@ function renderReview() {
       const statusLine = status || (!grouping && item.existing_xmp) ? `<div class="photo-line">${status}${!grouping && item.existing_xmp ? `<span class="status-chip">已有 XMP</span>` : ""}</div>` : "";
       const warningLine = !grouping && warning ? `<div class="tags">${escapeHtml(warning)}</div>` : "";
       const selected = batch && state.selectedIndices.has(item.index);
-      const selector = batch ? `<label class="card-select" title="选择 ${escapeHtml(item.filename)}"><input type="checkbox" data-select-index="${item.index}" ${selected ? "checked" : ""} ${state.batchBusy || state.activeJob ? "disabled" : ""}><span></span></label>` : "";
-      const actionDisabled = state.activeJob || state.batchBusy;
+      const selector = batch ? `<label class="card-select" title="选择 ${escapeHtml(item.filename)}"><input type="checkbox" data-select-index="${item.index}" ${selected ? "checked" : ""} ${state.batchBusy || jobBlocksProject() ? "disabled" : ""}><span></span></label>` : "";
+      const actionDisabled = jobBlocksProject() || state.batchBusy;
       const actions = grouping && !batch ? `<div class="card-actions">
         <button class="move-group-button" data-move-group="${item.index}" ${actionDisabled ? "disabled" : ""}>移动到…</button>
         <button class="move-group-button" data-shift-index="${item.index}" data-shift-direction="previous" ${actionDisabled || Number(item.group_id) === firstGroup ? "disabled" : ""}>上移</button>
@@ -1371,7 +1453,7 @@ function renderReview() {
         ${selector}
         <button class="preview-button" data-open-photo="${item.index}" ${grouping ? `data-drag-photo="${item.index}" draggable="${!actionDisabled}" title="拖动照片到其他分组"` : ""}><img draggable="false" src="${item.preview_url}" loading="lazy" alt="${escapeHtml(item.filename)}"></button>
         <div class="photo-meta">
-          <div class="photo-line"><strong title="${escapeHtml(item.filename)}">${escapeHtml(item.filename)}</strong></div>
+          <div class="photo-line"><strong title="${escapeHtml(item.filename)}">${escapeHtml(item.filename)}</strong>${photoScoreMarkup(item, grouping)}</div>
           ${actions}
           ${statusLine}
           ${grouping ? "" : ratingControls(item)}
@@ -1381,21 +1463,28 @@ function renderReview() {
     }).join("");
     const groupVisible = grouping || items.some(matchesFilter);
     const selectGroup = batch ? `<button class="text-button select-group" data-select-group="${groupId}">选择本组</button>` : "";
-    const dragHandle = grouping ? `<button class="group-drag-handle" data-drag-group="${groupId}" draggable="${!state.activeJob && !state.batchBusy}" ${state.activeJob || state.batchBusy ? "disabled" : ""} title="拖动调整分组顺序" aria-label="拖动组 ${groupId} 调整顺序">⠿</button>` : "";
-    return `<section class="photo-group ${groupVisible ? "" : "hidden-by-filter"}" data-group-id="${groupId}"><div class="group-head">${dragHandle}<strong>组 ${groupId}</strong><span>${items.length === 1 ? "单张" : `${items.length} 张相似照片`}</span>${selectGroup}</div><div class="filmstrip">${cards}</div></section>`;
-  }).join("");
-  const excludedMarkup = grouping && excludedItems.length ? `<details class="excluded-group">
-    <summary>已移出工程 ${excludedItems.length} 张</summary>
-    <div class="excluded-head"><span>这些照片不参与评分或 XMP，RAW 文件仍在原处。</span><button class="text-button" data-restore-all>全部恢复</button></div>
+    const dragHandle = grouping ? `<button class="group-drag-handle" data-drag-group="${groupId}" draggable="${!jobBlocksProject() && !state.batchBusy}" ${jobBlocksProject() || state.batchBusy ? "disabled" : ""} title="拖动调整分组顺序" aria-label="拖动组 ${groupId} 调整顺序">⠿</button>` : "";
+    const kept = items.filter((item) => item.effective_rating >= 3).length;
+    const selectionSummary = grouping ? "" : `<span class="group-selection-count">${kept ? `候选 ${kept} 张` : "本组未入选"}</span>`;
+    return {key: `group:${groupId}`, html: `<section class="photo-group ${groupVisible ? "" : "hidden-by-filter"}" data-group-id="${groupId}"><div class="group-head">${dragHandle}<strong>组 ${groupId}</strong><span>${items.length === 1 ? "单张" : `${items.length} 张相似照片`}</span>${selectionSummary}${selectGroup}</div><div class="filmstrip">${cards}</div></section>`};
+  });
+  const unreadableCount = excludedItems.filter((item) => item.read_error).length;
+  const excludedMarkup = (grouping || unreadableCount) && excludedItems.length ? `<details class="excluded-group" ${unreadableCount ? "open" : ""}>
+    <summary>未参与评分 ${excludedItems.length} 张${unreadableCount ? ` · 读取失败 ${unreadableCount} 张` : ""}</summary>
+    <div class="excluded-head"><span>${unreadableCount ? "读取失败的照片请修复源文件后重新分类。" : "这些照片不参与评分或 XMP，RAW 文件仍在原处。"}</span>${excludedItems.some((item) => !item.read_error) ? '<button class="text-button" data-restore-all>恢复已移出照片</button>' : ""}</div>
     <div class="filmstrip">${excludedItems.map((item) => `<article class="photo-card removed-card" data-index="${item.index}">
-      <button class="preview-button" data-open-photo="${item.index}"><img src="${item.preview_url}" loading="lazy" alt="${escapeHtml(item.filename)}"></button>
-      <div class="photo-meta"><div class="photo-line"><strong title="${escapeHtml(item.filename)}">${escapeHtml(item.filename)}</strong><button class="move-group-button" data-restore-index="${item.index}">恢复</button><button class="move-group-button delete-item-button" data-delete-photo-index="${item.index}" ${state.activeJob || state.batchBusy ? "disabled" : ""}>删除</button></div></div>
+      ${item.read_error ? `<div class="unreadable-preview" title="${escapeHtml(item.read_error)}">读取失败</div>` : `<button class="preview-button" data-open-photo="${item.index}"><img src="${item.preview_url}" loading="lazy" alt="${escapeHtml(item.filename)}"></button>`}
+      <div class="photo-meta"><div class="photo-line"><strong title="${escapeHtml(item.filename)}">${escapeHtml(item.filename)}</strong>${item.read_error ? "" : `<button class="move-group-button" data-restore-index="${item.index}">恢复</button>`}<button class="move-group-button delete-item-button" data-delete-photo-index="${item.index}" ${jobBlocksProject() || state.batchBusy ? "disabled" : ""}>删除</button></div></div>
     </article>`).join("")}</div>
   </details>` : "";
-  const activeMarkup = groupMarkup || (grouping ? `<div class="empty">当前没有参与评分的照片</div>` : "");
-  $("#review-groups").innerHTML = `${activeMarkup}${excludedMarkup}`;
+  const sections = !grouping && visible === 0
+    ? [{key: "empty", html: `<div class="empty">当前筛选下没有照片</div>`}]
+    : groupSections.length ? groupSections : [{key: "empty", html: `<div class="empty">当前没有参与评分的照片</div>`}];
+  if (excludedMarkup) sections.push({key: "excluded", html: excludedMarkup});
+  if (reviewGrid) reviewGrid.render(run.run_id, sections);
+  else $("#review-groups").innerHTML = sections.map(section => section.html).join("");
   $("#visible-count").textContent = grouping || state.filter === "all" ? "" : `显示 ${visible} / ${activeItems.length}`;
-  $("#develop-open").disabled = Boolean(state.activeJob) || Number(run.candidate_count || 0) < 1;
+  $("#selection-export-open").disabled = Number(run.candidate_count || 0) < 1;
   renderWorkflow("review");
   if (state.dialogIndex != null) updatePhotoDialog(state.dialogIndex);
 }
@@ -1422,11 +1511,22 @@ function syncProjectRunStats(run) {
 }
 
 async function openRun(runId, route = `review/${runId}`, historyMode = "replace") {
-  state.currentRun = await api(`/api/runs/${runId}`);
+  const request = ++reviewOpenRequest;
+  await ratingSave;
+  if (request !== reviewOpenRequest) return;
+  const opened = await api(`/api/runs/${runId}`);
+  if (request !== reviewOpenRequest) return;
+  state.dialogIndex = null;
+  state.dialogSequence = null;
+  if ($("#photo-dialog").open) $("#photo-dialog").close();
+  state.currentRun = opened;
   const project = state.projects.find((item) => item.latest_run_id === runId);
   if (project) state.currentProject = project;
   else if (state.currentProject?.latest_run_id !== runId) state.currentProject = null;
   state.developPlan = null;
+  state.developBusy = false;
+  state.developProgress = null;
+  state.developFlowProgress = null;
   state.developStage = "crop";
   const exportDefaults = state.bootstrap?.preferences?.export_defaults || {};
   state.exportTargets = {
@@ -1446,6 +1546,7 @@ async function openRun(runId, route = `review/${runId}`, historyMode = "replace"
   $$(".filter").forEach((node) => node.classList.toggle("active", node.dataset.filter === "all"));
   renderReview();
   setView("review", route, historyMode);
+  return opened;
 }
 
 function currentProjectRoute() {
@@ -1461,7 +1562,13 @@ function isStyleJob(job) {
 function styleJobMatchesCurrentRun(job) {
   if (!isStyleJob(job) || !state.currentRun) return false;
   const runId = job.context?.run_id ?? job.result?.run_id;
-  return runId == null || String(runId) === String(state.currentRun.run_id);
+  return runId != null && String(runId) === String(state.currentRun.run_id);
+}
+
+function jobMatchesProject(job, run = state.currentRun, project = state.currentProject) {
+  const scope = job.context || {};
+  if (run?.run_id && [scope.run_id, scope.source_run_id, job.result?.run_id].includes(run.run_id)) return true;
+  return Boolean(scope.project_id && scope.project_id === (run?.project_id || project?.project_id));
 }
 
 function activateJob(job) {
@@ -1476,1101 +1583,9 @@ function activateJob(job) {
   renderJobBar();
   if (state.currentProject && !state.currentProject.latest_run_id) renderProjectStart();
   renderReview();
-  if (location.hash.replace(/^#/, "").startsWith("develop/")) renderDevelop();
   if ($("#view-export").classList.contains("active")) renderExport();
   pollJobs();
   return job;
-}
-
-async function reloadDevelopAfterStyleJob(job) {
-  if (!styleJobMatchesCurrentRun(job)) return false;
-  const plan = await api(`/api/runs/${state.currentRun.run_id}/develop`);
-  state.developPlan = plan;
-  syncDevelopSummary(plan);
-  return true;
-}
-
-function currentCropComplete(plan = state.developPlan) {
-  const status = plan?.crop?.status;
-  if (["confirmed", "skipped"].includes(status)) return Boolean(plan?.exists) && !plan?.stale;
-  return Boolean(plan?.exists) && !plan?.stale
-    && Number(plan?.eligible_count || 0) > 0
-    && Number(plan?.confirmed_count || 0) === Number(plan?.eligible_count || 0);
-}
-
-function currentColorMode(plan = state.developPlan) {
-  if (["skip", "auto", "style"].includes(plan?.color_mode)) return plan.color_mode;
-  if (plan?.creative_style?.status === "confirmed" || Object.keys(plan?.creative_style?.groups || {}).length) return "style";
-  if (plan?.basic_color?.status === "enabled") return "auto";
-  if (plan?.basic_color?.status === "skipped") return "skip";
-  return "auto";
-}
-
-function currentStyleScope(plan = state.developPlan) {
-  return plan?.creative_style?.scope === "global" ? "global" : "group";
-}
-
-function currentBaseComplete(plan = state.developPlan) {
-  return ["enabled", "skipped"].includes(plan?.basic_color?.status);
-}
-
-function currentStyleComplete(plan = state.developPlan) {
-  const mode = currentColorMode(plan);
-  if (mode !== "style") return currentBaseComplete(plan);
-  const creative = plan?.creative_style || {};
-  if (creative.status !== "confirmed") return false;
-  if (currentStyleScope(plan) === "global") {
-    const selection = creative.global_selection;
-    if (!selection || !["confirmed", "skipped"].includes(selection.status)) return false;
-    return Boolean(selection.manual_override) || selection.recommendation_status === "complete";
-  }
-  const groups = creative.groups || {};
-  const groupIds = [...new Set((plan?.items || []).map((item) => String(item.group_id)))];
-  if (!groupIds.length) return false;
-  return groupIds.every((groupId) => {
-    const selection = groups[groupId];
-    if (!selection || !["confirmed", "skipped"].includes(selection.status)) return false;
-    return Boolean(selection.manual_override) || selection.recommendation_status === "complete";
-  });
-}
-
-function currentColorComplete(plan = state.developPlan) {
-  return currentBaseComplete(plan) && currentStyleComplete(plan);
-}
-
-function renderWorkflow(activeStage) {
-  const run = state.currentRun;
-  const plan = state.developPlan || run?.develop;
-  const scored = Boolean(run?.xmp_ready);
-  const hasCandidates = Number(run?.candidate_count || 0) > 0;
-  const cropComplete = currentCropComplete(plan);
-  const cropStale = Boolean(plan?.stale);
-  const exportStatus = state.exportSpec?.status;
-  const statuses = {
-    review: scored ? "completed" : "pending",
-    crop: cropStale ? "stale" : cropComplete ? (plan?.crop_skipped ? "skipped" : "completed") : "pending",
-    base: currentBaseComplete(plan) ? (plan?.basic_color?.status === "skipped" ? "skipped" : "completed") : "pending",
-    style: currentStyleComplete(plan) ? (currentColorMode(plan) === "style" ? "completed" : "skipped") : "pending",
-    export: ["complete", "completed"].includes(exportStatus) ? "completed" : ["failed", "partial", "partial_failure"].includes(exportStatus) ? "stale" : "pending",
-  };
-  const order = { review: "1", crop: "2", base: "3", style: "4", export: "5" };
-  $$(".workflow-step").forEach((node) => {
-    const stage = node.dataset.workflowStage;
-    const available = stage === "review"
-      || (stage === "crop" && scored && hasCandidates)
-      || (stage === "base" && scored && cropComplete)
-      || (stage === "style" && scored && cropComplete && currentBaseComplete(plan))
-      || (stage === "export" && (activeStage === "export" || (activeStage === "style" && cropComplete && currentColorComplete(plan))));
-    const status = statuses[stage];
-    node.disabled = !available;
-    node.classList.toggle("active", stage === activeStage);
-    node.classList.toggle("completed", status === "completed" && stage !== activeStage);
-    node.classList.toggle("skipped", status === "skipped" && stage !== activeStage);
-    node.classList.toggle("stale", status === "stale" && stage !== activeStage);
-    node.querySelector("span").textContent = status === "completed" && stage !== activeStage
-      ? "✓" : status === "skipped" && stage !== activeStage ? "—" : status === "stale" && stage !== activeStage ? "!" : order[stage];
-    node.setAttribute("aria-current", stage === activeStage ? "step" : "false");
-  });
-}
-
-function renderExport() {
-  const run = state.currentRun;
-  if (!run) return;
-  const plan = state.developPlan;
-  const candidates = run.results.filter((item) => !item.excluded && Number(item.effective_rating ?? item.rating) >= 3);
-  const proprietary = new Set(["arw", "cr2", "cr3", "nef", "nrw", "orf", "rw2", "raf", "pef", "srw", "x3f"]);
-  const sidecarCandidates = candidates.filter((item) => proprietary.has(String(item.filename || item.path || "").split(".").at(-1).toLowerCase()));
-  const existingCount = sidecarCandidates.filter((item) => item.existing_xmp).length;
-  const xmp = Boolean(state.exportTargets.xmp);
-  const jpeg = Boolean(state.exportTargets.jpeg);
-  const mode = currentColorMode(plan);
-  const creativeGroups = Object.values(plan?.creative_style?.groups || {});
-  const styledGroupCount = creativeGroups.filter((item) => item?.status === "confirmed" && (item?.lut_id || item?.preset_id)).length;
-  const globalStyle = plan?.creative_style?.global_selection || {};
-  const globalStyled = currentStyleScope(plan) === "global"
-    && globalStyle.status === "confirmed"
-    && Boolean(globalStyle.lut_id || globalStyle.preset_id);
-  const styleSummary = mode !== "style" ? "自然"
-    : currentStyleScope(plan) === "global" ? (globalStyled ? "全局统一" : "自然")
-      : styledGroupCount ? `${styledGroupCount} 组` : "自然";
-  const projectName = run.input_root.split(/[\\/]/).filter(Boolean).at(-1) || "工程";
-  const outputDirectory = $("#export-directory");
-  if (!outputDirectory.value) outputDirectory.value = `${String(run.input_root).replace(/[\\/]$/, "")}\\成片`;
-  $("#export-directory-field").classList.toggle("hidden", !jpeg);
-  $("#export-xmp").checked = xmp;
-  $("#export-jpeg").checked = jpeg;
-  $$('[data-export-target]').forEach((node) => node.classList.toggle("selected", node.dataset.exportTarget === "xmp" ? xmp : jpeg));
-  $("#export-title").textContent = `${projectName} · 导出`;
-  $("#export-summary").textContent = `${candidates.length} 张`;
-  $("#export-back").textContent = "上一步：创意外观";
-  $("#export-content").innerHTML = `<div class="export-summary-list">
-      <div class="export-summary-row"><span>构图</span><strong>${plan?.crop?.status === "confirmed" ? "已确认" : "已跳过"}</strong></div>
-      <div class="export-summary-row"><span>基础调色</span><strong>${plan?.basic_color?.status === "enabled" ? "Lightroom 自动" : "已跳过"}</strong></div>
-      <div class="export-summary-row"><span>创意外观</span><strong>${styleSummary}</strong></div>
-    </div>
-    ${existingCount && xmp ? `<div class="export-impact warning">${existingCount} 张已有 XMP 将通过 Lightroom 安全更新；执行前会备份并记录文件指纹。</div>` : ""}`;
-
-  const button = $("#export-action");
-  button.classList.remove("completed");
-  button.disabled = Boolean(state.activeJob) || candidates.length === 0 || (!xmp && !jpeg) || !currentColorComplete(plan);
-  button.textContent = xmp && jpeg ? `保存 XMP 并导出 ${candidates.length} 张 JPEG`
-    : jpeg ? `导出 ${candidates.length} 张 JPEG`
-      : `保存 ${sidecarCandidates.length} 个 XMP`;
-  const status = $("#export-status");
-  status.className = "develop-output-hint hidden";
-  const spec = state.exportSpec;
-  if (["complete", "completed"].includes(spec?.status)) {
-    status.classList.remove("hidden");
-    status.classList.add("success");
-    const xmpDone = Number(spec.results?.xmp?.succeeded || 0);
-    const jpegDone = Number(spec.results?.jpeg?.succeeded || 0);
-    // The controls may have been rehydrated while Lightroom was working.  A
-    // completion summary must describe the frozen export specification, not
-    // whichever checkboxes happen to be selected after the job finishes.
-    const completedXmp = Boolean(spec.targets?.xmp);
-    const completedJpeg = Boolean(spec.targets?.jpeg);
-    status.innerHTML = `<strong>导出完成</strong><span>${completedXmp ? `XMP ${xmpDone} 个` : ""}${completedXmp && completedJpeg ? " · " : ""}${completedJpeg ? `JPEG ${jpegDone} 张` : ""}</span>`;
-  } else if (["queued", "running", "cancelling"].includes(spec?.status)) {
-    button.disabled = true;
-  } else if (["failed", "partial", "partial_failure"].includes(spec?.status)) {
-    status.classList.remove("hidden");
-    status.classList.add("warning");
-    const partial = ["partial", "partial_failure"].includes(spec.status);
-    status.innerHTML = `<strong>${partial ? "部分完成" : "导出未完成"}</strong><span>${escapeHtml(spec.message || "再次执行只会重试失败项。")}</span>`;
-    button.disabled = Boolean(state.activeJob);
-    button.textContent = partial ? "重试失败项" : button.textContent;
-  }
-  renderWorkflow("export");
-}
-
-function renderDevelopGeneration(progress = {}) {
-  const projectName = state.currentRun?.input_root.split(/[\\/]/).filter(Boolean).at(-1) || "工程";
-  const total = Number(progress.total || state.developPlan?.eligible_count || 0);
-  const current = Number(progress.current || 0);
-  const filenameText = progress.filename ? ` · ${progress.filename}` : "";
-  $("#develop-title").textContent = `${projectName} · 智能构图`;
-  $("#develop-summary").textContent = total ? `${Math.max(1, current)} / ${total} 张${filenameText}` : "正在准备本地 AI";
-  $("#develop-back").textContent = "上一步：选片";
-  $("#develop-base-workspace").classList.add("hidden");
-  $("#style-workspace").classList.add("hidden");
-  $("#develop-grid").classList.remove("hidden");
-  $("#develop-next").disabled = true;
-  $("#develop-skip").disabled = true;
-  $("#develop-flow-title").textContent = "";
-  $("#develop-flow-copy").textContent = "";
-  $("#develop-output-hint").className = "develop-output-hint hidden";
-  $("#develop-output-hint").replaceChildren();
-  $("#develop-grid").innerHTML = `<div class="empty">正在分析构图，完成后会自动显示结果。</div>`;
-  renderJobBar();
-  renderWorkflow("crop");
-}
-
-function renderStyleGroups(plan) {
-  const container = $("#style-groups");
-  const controlsBusy = state.developBusy || Boolean(state.activeJob);
-  const groups = new Map();
-  for (const item of plan.items || []) {
-    const key = String(item.group_id);
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(item);
-  }
-  const creative = plan.creative_style || {};
-  const scope = currentStyleScope(plan);
-  container.classList.toggle("group-table", scope === "group");
-  const entries = scope === "global"
-    ? [["global", [...groups.values()].flat(), creative.global_selection || {}]]
-    : [...groups.entries()].map(([groupId, items]) => [groupId, items, creative.groups?.[groupId] || {}]);
-  container.innerHTML = entries.map(([entryId, items, selection]) => {
-    const global = entryId === "global";
-    const groupId = global ? null : entryId;
-    const top3 = Array.isArray(selection.top3) ? selection.top3 : [];
-    const representative = items.find((item) => Number(item.index) === Number(selection.representative_index)) || items[0];
-    const neutral = {
-      preset_id: null, lut_id: null,
-      label: "自然",
-      preview_url: selection.neutral_preview_url || representative?.preview_url,
-      score: selection.neutral_score,
-    };
-    const choices = [neutral, ...top3.slice(0, 3)];
-    while (!global && choices.length < 4) {
-      choices.push({ placeholder: true, label: `候选 ${choices.length}` });
-    }
-    const recommendationComplete = selection.recommendation_status === "complete";
-    const naturalSelected = creative.status === "skipped" || selection.status === "skipped"
-      || (selection.status !== "confirmed"
-        && recommendationComplete
-        && selection.recommended_kind === "neutral");
-    const selectedId = selection.status === "skipped" ? null
-      : (selection.lut_id ?? selection.preset_id
-        ?? (recommendationComplete ? (selection.recommended_lut_id ?? selection.recommended_preset_id) : null)
-        ?? null);
-    const recommendedId = recommendationComplete && ["preset", "lut"].includes(selection.recommended_kind)
-      ? (selection.recommended_lut_id ?? selection.recommended_preset_id ?? null)
-      : null;
-    const recommendedChoice = recommendedId == null ? null : top3.find((choice) =>
-      String(choice.lut_id ?? choice.preset_id ?? choice.id ?? "") === String(recommendedId)
-    );
-    const usesPendingRecommendation = selection.status !== "confirmed"
-      && selection.status !== "skipped"
-      && Boolean(recommendedChoice)
-      && String(selectedId) === String(recommendedId);
-    const cards = choices.map((choice, rank) => {
-      if (choice.placeholder) {
-        return `<div class="style-choice style-choice-empty" aria-label="${escapeHtml(choice.label)}等待生成">
-          <div class="style-choice-preview style-choice-placeholder pending" role="img"><span>等待生成</span></div>
-          <span class="style-choice-copy"><strong>${escapeHtml(choice.label)}</strong></span>
-        </div>`;
-      }
-      const lutId = choice.lut_id ?? null;
-      const presetId = choice.preset_id ?? choice.id ?? null;
-      const choiceId = lutId ?? presetId;
-      const selected = rank === 0 ? naturalSelected : Boolean(selectedId) && String(choiceId) === String(selectedId);
-      const renderStatus = rank === 0 ? "ready" : String(choice.render_status || "pending").toLowerCase();
-      const preview = rank === 0 ? (choice.preview_url || "") : (renderStatus === "ready" ? (choice.preview_url || "") : "");
-      const previewReady = Boolean(preview) && (rank === 0 || renderStatus === "ready");
-      const selectable = rank === 0 || previewReady;
-      const disabled = controlsBusy || !selectable;
-      const placeholderLabel = renderStatus === "failed"
-        ? "Lightroom 预览失败"
-        : renderStatus === "ready" ? "预览文件暂不可用" : "等待 Lightroom 真实预览";
-      const previewMarkup = previewReady
-        ? `<img class="style-choice-preview" src="${escapeHtml(preview)}" loading="lazy" alt="${escapeHtml(choice.label || choice.name || "风格预览")}">`
-        : `<div class="style-choice-preview style-choice-placeholder ${renderStatus === "failed" ? "failed" : "pending"}" role="img" aria-label="${escapeHtml(placeholderLabel)}"><span>${escapeHtml(placeholderLabel)}</span></div>`;
-      const recommendedCandidate = recommendationComplete
-        && ["preset", "lut"].includes(selection.recommended_kind)
-        && String(choiceId) === String(selection.recommended_lut_id ?? selection.recommended_preset_id ?? "");
-      const badge = rank === 0
-        ? (recommendationComplete && selection.recommended_kind === "neutral" ? "AI 推荐" : "")
-        : recommendedCandidate ? "AI 推荐" : "";
-      return `<button type="button" class="style-choice ${selected ? "selected" : ""} ${previewReady ? "preview-ready" : `preview-${renderStatus === "failed" ? "failed" : "pending"}`}" data-style-choice data-style-scope="${scope}" data-group-id="${escapeHtml(groupId ?? "")}" data-choice-id="${escapeHtml(choiceId || "natural")}" data-lut-id="${escapeHtml(lutId || "")}" data-lut-hash="${escapeHtml(choice.lut_hash || "")}" data-preset-id="${escapeHtml(presetId || "")}" data-preset-hash="${escapeHtml(choice.preset_hash || choice.hash || "")}" data-style-choice-amount="${Number(choice.strength ?? choice.amount ?? 100)}" data-preview-ready="${previewReady ? "true" : "false"}" aria-disabled="${disabled ? "true" : "false"}" ${disabled ? "disabled" : ""}>
-        ${previewMarkup}
-        <span class="style-choice-copy"><strong>${escapeHtml(choice.label || choice.name || "未命名外观")}</strong>${badge ? `<small>${escapeHtml(badge)}</small>` : ""}</span>
-      </button>`;
-    }).join("");
-    const recommendationStatus = String(selection.recommendation_status || "").toLowerCase();
-    const hasReadyCandidate = top3.some((choice) => choice?.render_status === "ready" && choice?.preview_url);
-    const groupState = recommendationStatus === "failed" ? "预览失败"
-      : recommendationStatus === "rendering" || (!hasReadyCandidate && top3.length) ? "渲染中"
-        : selection.status === "confirmed" ? "已确认"
-          : selection.status === "skipped" ? "自然" : "";
-    // Before confirmation, capability and default strength belong to the
-    // recommended Top 3 candidate. Once the user confirms or changes a look,
-    // the persisted group selection is authoritative.
-    const amountSource = usesPendingRecommendation ? recommendedChoice : selection;
-    const amount = Number(amountSource.strength ?? amountSource.amount ?? 100);
-    const amountSupported = Boolean(selectedId) && amountSource.amount_supported !== false;
-    const amountNote = selectedId && !amountSupported
-      ? (amountSource.amount_note || (amountSource.preset_scope === "plugin"
-        ? "此预设由插件托管，Lightroom 仅支持 100%；可换原生预设调强度"
-        : "此预设未启用 Lightroom 强度调整"))
-      : "";
-    const actions = global ? "" : `<div class="style-group-actions"><button type="button" class="text-button" data-style-recommend-group="${groupId}" ${controlsBusy ? "disabled" : ""}>AI 推荐</button><button type="button" class="text-button" data-style-search-group="${groupId}" ${controlsBusy ? "disabled" : ""}>搜索</button></div>`;
-    const amountKey = global ? "global" : groupId;
-    const amountLutId = amountSource.lut_id ?? recommendedChoice?.lut_id ?? null;
-    const amountPresetId = amountLutId ? null : (amountSource.preset_id ?? recommendedChoice?.preset_id ?? null);
-    const amountLutHash = amountSource.lut_hash ?? recommendedChoice?.lut_hash ?? null;
-    const amountPresetHash = amountLutId ? null : (amountSource.preset_hash ?? recommendedChoice?.preset_hash ?? null);
-    const tierSupported = amountSupported && !(global && Boolean(amountLutId));
-    const tiers = tierSupported ? `<div class="style-amount-tiers" role="group" aria-label="外观强度">
-      <span>强度</span>${STYLE_AMOUNT_TIERS.map((tier) => `<button type="button" class="style-amount-tier ${amount === tier ? "selected" : ""}" data-style-tier="${tier}" data-style-scope="${scope}" data-style-amount="${escapeHtml(amountKey)}" data-lut-id="${escapeHtml(amountLutId || "")}" data-lut-hash="${escapeHtml(amountLutHash || "")}" data-preset-id="${escapeHtml(amountPresetId || "")}" data-preset-hash="${escapeHtml(amountPresetHash || "")}" ${controlsBusy ? "disabled" : ""}>${tier === 50 ? "轻" : tier === 100 ? "标准" : "强"}<small>${tier}%</small></button>`).join("")}
-    </div>` : "";
-    const selectedChoice = selectedId == null ? null : top3.find((choice) =>
-      String(choice.lut_id ?? choice.preset_id ?? choice.id ?? "") === String(selectedId)
-    );
-    const exactSamples = Array.isArray(selectedChoice?.preview_samples) && selectedChoice.preview_samples.length
-      ? selectedChoice.preview_samples
-      : (selectedId != null && Array.isArray(selection.selected_preview_samples) ? selection.selected_preview_samples : []);
-    const probeItems = (selection.preview_probe_indices || []).map((probe) => {
-      const item = items.find((value) => Number(value.index) === Number(probe.index));
-      return item ? { ...probe, preview_url: item.preview_url } : null;
-    }).filter(Boolean);
-    const sampleValues = exactSamples.length ? exactSamples : probeItems;
-    const roleLabels = { representative: "代表", brightest: "最亮", darkest: "最暗" };
-    const coverage = global && sampleValues.length ? `<section class="style-global-coverage ${exactSamples.length ? "ready" : "pending"}">
-      <div class="style-global-coverage-head"><strong>统一效果抽查</strong><span>${exactSamples.length ? `已用 Lightroom 刷新 ${sampleValues.length} 张` : "选择外观或强度后刷新真实预览"}</span></div>
-      <div class="style-global-samples">${sampleValues.map((sample) => `<figure><img src="${escapeHtml(sample.preview_url || "")}" loading="lazy" alt="${escapeHtml(roleLabels[sample.role] || "抽查")}预览"><figcaption><strong>${escapeHtml(roleLabels[sample.role] || "抽查")}</strong><span>${escapeHtml(sample.filename || "")}</span></figcaption></figure>`).join("")}</div>
-    </section>` : "";
-    const representativeName = representative?.filename || "代表图";
-    return `<article class="panel style-group ${global ? "style-global-group" : "style-group-row"}" data-style-group="${escapeHtml(amountKey)}"${global ? "" : ` data-representative-index="${escapeHtml(representative?.index ?? "")}"`}>
-      <div class="style-group-head"><div class="style-group-copy"><strong>${global ? "全局统一" : `组 ${groupId}`}</strong><span title="${escapeHtml(representativeName)}">${global ? `应用于 ${items.length} 张` : `${escapeHtml(representativeName)} · ${items.length} 张`}${groupState ? ` · ${escapeHtml(groupState)}` : ""}</span></div>${actions}</div>
-      <div class="style-choices">${cards}</div>
-      <div class="style-group-controls">
-        ${tiers}
-        ${amountNote ? `<span class="muted style-amount-note">${escapeHtml(amountNote)}</span>` : ""}
-      </div>
-      ${coverage}
-    </article>`;
-  }).join("") || `<div class="empty">没有可调色的照片组</div>`;
-}
-
-function renderDevelop() {
-  const plan = state.developPlan;
-  renderJobBar();
-  if (plan?.generating || (state.developBusy && state.developProgress?.status === "running")) {
-    renderDevelopGeneration(state.developProgress || {});
-    return;
-  }
-  if (!plan?.exists) {
-    $("#develop-grid").innerHTML = `<div class="empty">尚未生成基础处理方案</div>`;
-    return;
-  }
-  const stage = ["base", "style"].includes(state.developStage) ? state.developStage : "crop";
-  const projectName = state.currentRun?.input_root.split(/[\\/]/).filter(Boolean).at(-1) || "工程";
-  const styleJobRunning = styleJobMatchesCurrentRun(state.activeJob);
-  const baseComplete = currentBaseComplete(plan);
-  const styleComplete = currentStyleComplete(plan);
-  const stageNames = { crop: "构图", base: "基础调色", style: "创意外观" };
-  $("#develop-title").textContent = `${projectName} · ${stageNames[stage]}`;
-  $("#develop-summary").textContent = stage === "crop"
-    ? `${plan.eligible_count} 张`
-    : stage === "style" ? `${new Set((plan.items || []).map((item) => item.group_id)).size} 组` : `${plan.eligible_count} 张`;
-  $("#develop-back").textContent = stage === "crop" ? "上一步：选片" : stage === "base" ? "上一步：构图" : "上一步：基础调色";
-  $("#develop-grid").classList.toggle("hidden", stage !== "crop");
-  $("#develop-base-workspace").classList.toggle("hidden", stage !== "base");
-  $("#style-workspace").classList.toggle("hidden", stage !== "style");
-  $("#develop-next").disabled = state.developBusy || plan.stale
-    || (stage === "base" && !baseComplete)
-    || (stage === "style" && (styleJobRunning || !styleComplete));
-  $("#develop-skip").disabled = state.developBusy || Boolean(state.activeJob) || plan.stale;
-  $("#develop-skip").classList.toggle("hidden", stage === "base");
-  const styleScope = currentStyleScope(plan);
-  const hasStyleRecommendations = styleScope === "global"
-    ? Boolean(plan.creative_style?.global_selection?.top3?.length || plan.creative_style?.global_selection?.recommendation_status === "complete")
-    : Object.keys(plan.creative_style?.groups || {}).length > 0;
-  $("#develop-apply-style").classList.toggle("hidden", stage !== "style" || currentColorMode(plan) !== "style");
-  $("#develop-apply-style").disabled = state.developBusy || styleJobRunning || !hasStyleRecommendations;
-  $("#develop-apply-style").textContent = styleScope === "global" ? "采用 AI 推荐" : "全部采用 AI 推荐";
-  $("#develop-flow-title").textContent = "";
-  $("#develop-flow-copy").textContent = stage === "crop"
-    ? "裁剪选择会即时保存"
-    : stage === "base"
-      ? (baseComplete ? "选择已保存" : "请选择一种基础处理方式")
-      : (styleComplete ? "外观选择已保存" : "选择 AI 推荐或保持自然");
-  $("#develop-skip").textContent = stage === "crop" ? "保持原图并跳过" : "保持自然并跳过";
-  $("#develop-next").textContent = stage === "crop"
-    ? "采用当前构图并继续"
-    : stage === "base" ? "下一步：创意外观" : "下一步：导出";
-  const developHint = $("#develop-output-hint");
-  developHint.className = `develop-output-hint ${plan.stale ? "warning" : "hidden"}`;
-  developHint.innerHTML = plan.stale ? "<strong>方案已失效</strong><span>请重新分析。</span>" : "";
-  renderWorkflow(stage);
-
-  if (stage === "base") {
-    $$("[data-color-mode]").forEach((node) => {
-      const selected = node.dataset.colorMode === "auto"
-        ? plan.basic_color?.status === "enabled"
-        : plan.basic_color?.status === "skipped";
-      node.classList.toggle("selected", selected);
-      node.setAttribute("aria-pressed", selected ? "true" : "false");
-      node.disabled = state.developBusy || Boolean(state.activeJob);
-    });
-    $("#develop-base-auto-state").textContent = plan.basic_color?.status === "enabled" ? "已选择" : "";
-    $("#develop-base-skip-state").textContent = plan.basic_color?.status === "skipped" ? "已选择" : "";
-    return;
-  }
-
-  if (stage === "style") {
-    const styleBusy = state.developBusy || Boolean(state.activeJob);
-    state.styleScope = styleScope;
-    $$(".style-scope-option").forEach((node) => {
-      const selected = node.dataset.styleScope === styleScope;
-      node.classList.toggle("selected", selected);
-      node.setAttribute("aria-pressed", selected ? "true" : "false");
-      node.disabled = styleBusy;
-    });
-    $("#style-recommend").classList.toggle("hidden", styleScope !== "global");
-    $("#style-recommend").disabled = styleBusy;
-    $("#style-recommend").textContent = "AI 推荐统一外观";
-    const groupIds = [...new Set((plan.items || []).map((item) => String(item.group_id)))];
-    const generatedGroups = groupIds.filter((groupId) =>
-      plan.creative_style?.groups?.[groupId]?.recommendation_status === "complete"
-    ).length;
-    const allGroupsJob = styleJobRunning && state.activeJob?.context?.scope === "groups";
-    const recommendAll = $("#style-recommend-all");
-    recommendAll.classList.toggle("hidden", styleScope !== "group");
-    recommendAll.disabled = styleBusy || groupIds.length === 0;
-    recommendAll.textContent = allGroupsJob
-      ? "正在生成所有组"
-      : generatedGroups === 0
-        ? "一键为所有组生成"
-        : generatedGroups < groupIds.length ? "补齐未完成组" : "重新生成所有组";
-    const batchStatus = $("#style-group-batch-status");
-    batchStatus.classList.toggle("hidden", styleScope !== "group" || (!allGroupsJob && generatedGroups === 0));
-    batchStatus.textContent = allGroupsJob
-      ? "逐组生成中"
-      : `已生成 ${generatedGroups} / ${groupIds.length} 组`;
-    renderStyleGroups(plan);
-    return;
-  }
-
-  const cards = (plan.items || []).map((item) => {
-    const cropButtons = (item.crop_candidates || []).map((crop) =>
-      `<button type="button" class="button develop-crop-choice ${crop.id === item.crop_id ? "active" : ""}" data-develop-crop-choice="${item.index}" data-crop-id="${escapeHtml(crop.id)}" aria-pressed="${crop.id === item.crop_id ? "true" : "false"}" ${state.developBusy ? "disabled" : ""}>${escapeHtml(crop.label)}</button>`
-    ).join("");
-    const selectedCrop = (item.crop_candidates || []).find((crop) => crop.id === item.crop_id);
-    const cropText = item.crop_id === "original" ? "保留原始构图" : (selectedCrop?.label || "智能构图");
-    return `<article class="develop-card" data-develop-index="${item.index}">
-      <img class="develop-preview" src="${item.preview_url}" loading="lazy" alt="${escapeHtml(item.filename)} 构图预览">
-      <div class="develop-body">
-        <div class="develop-name"><strong title="${escapeHtml(item.filename)}">${escapeHtml(item.filename)}</strong><span class="status-chip">${item.rating} 星 · 组 ${item.group_id}</span></div>
-        <div class="develop-controls">
-          <div class="develop-crop-row"><span>构图</span><div class="develop-crop-buttons" role="group" aria-label="${escapeHtml(item.filename)} 裁剪方案">${cropButtons}</div></div>
-        </div>
-        <div class="develop-base">${escapeHtml(cropText)}</div>
-      </div>
-    </article>`;
-  }).join("");
-  $("#develop-grid").innerHTML = cards || `<div class="empty">没有 3 星以上照片</div>`;
-}
-
-function syncDevelopSummary(plan) {
-  if (!state.currentRun) return;
-  state.currentRun.develop = {
-    exists: Boolean(plan?.exists), stale: Boolean(plan?.stale), revision: plan?.revision ?? null,
-    eligible_count: Number(plan?.eligible_count || 0), confirmed_count: Number(plan?.confirmed_count || 0),
-    plan_id: plan?.plan_id || null, crop_skipped: Boolean(plan?.crop_skipped), color_enabled: plan?.color_enabled !== false,
-    crop: plan?.crop || { status: plan?.crop_skipped ? "skipped" : "pending" },
-    basic_color: plan?.basic_color || { status: plan?.color_enabled === false ? "skipped" : "pending" },
-    creative_style: plan?.creative_style || { status: "skipped", groups: {} },
-  };
-}
-
-function stageFromDevelopRoute(route) {
-  const parts = String(route || "").split("/");
-  const stage = parts.at(-1);
-  if (["style", "color"].includes(stage)) return "style";
-  return stage === "base" ? "base" : "crop";
-}
-
-async function loadDevelop(force = false, route = null, requestedStage = null, createIfMissing = true, historyMode = "push") {
-  const run = state.currentRun;
-  if (!run) throw new Error("请先打开工程。 ");
-  state.developBusy = true;
-  let progressTimer = null;
-  let enteredGeneration = false;
-  try {
-    let plan = force ? null : await api(`/api/runs/${run.run_id}/develop`);
-    if (!plan?.exists || plan.stale || force) {
-      if (!createIfMissing) throw new Error(plan?.stale ? "构图方案已经失效，请从选片页重新开始构图。" : "尚未开始构图，请从选片页进入。 ");
-      if (!await requireModelSetupUi()) throw new Error("请先完成 AI 模型套装配置。 ");
-      const expected = Number(plan?.eligible_count || run.candidate_count || 0);
-      state.developStage = "crop";
-      state.developProgress = { status: "running", stage_label: "准备智能构图", current: 0, total: expected, overall_percent: 0, nodes: [] };
-      state.developPlan = { exists: true, generating: true, stale: false, eligible_count: expected, confirmed_count: 0, items: [] };
-      enteredGeneration = true;
-      setView("develop", `develop/${run.run_id}/crop`, historyMode);
-      renderDevelop();
-      const request = api(`/api/runs/${run.run_id}/develop`, {
-        method: "POST",
-        body: { base_revision: Number(run.review_revision) },
-      });
-      progressTimer = setInterval(async () => {
-        try {
-          const progress = await api(`/api/runs/${run.run_id}/develop/progress`);
-          if (state.developBusy && progress?.status !== "idle") {
-            state.developProgress = progress;
-            renderDevelop();
-          }
-        } catch (_error) { /* keep the last visible progress */ }
-      }, 650);
-      plan = await request;
-    }
-    state.developProgress = null;
-    state.developPlan = plan;
-    state.styleScope = currentStyleScope(plan);
-    syncDevelopSummary(plan);
-    let stage = requestedStage || stageFromDevelopRoute(route);
-    const cropComplete = Number(plan?.eligible_count || 0) > 0
-      && Number(plan?.confirmed_count || 0) === Number(plan?.eligible_count || 0)
-      && !plan?.stale;
-    if (["base", "style"].includes(stage) && !cropComplete) stage = "crop";
-    if (stage === "style" && !currentBaseComplete(plan)) stage = "base";
-    state.developStage = stage;
-    if (!enteredGeneration || location.hash.replace(/^#/, "").startsWith(`develop/${run.run_id}/`)) {
-      setView("develop", `develop/${run.run_id}/${stage}`, historyMode);
-    }
-  } catch (error) {
-    state.developProgress = {
-      ...(state.developProgress || {}),
-      status: "failed",
-      stage_label: "构图分析失败",
-      message: error.message,
-      run_id: run.run_id,
-    };
-    renderDevelop();
-    throw error;
-  } finally {
-    if (progressTimer) clearInterval(progressTimer);
-    state.developBusy = false;
-    renderDevelop();
-  }
-}
-
-async function updateDevelop(index, changes) {
-  if (!state.currentRun || !state.developPlan || state.developBusy) return;
-  state.developBusy = true;
-  renderDevelop();
-  try {
-    const plan = await api(`/api/runs/${state.currentRun.run_id}/develop/${index}`, {
-      method: "PATCH",
-      body: { base_revision: Number(state.developPlan.revision), ...changes },
-    });
-    state.developPlan = plan;
-    syncDevelopSummary(plan);
-  } catch (error) {
-    toast(error.message);
-    if (error.message.includes("刷新") || error.message.includes("重新生成")) await loadDevelop(false, null, state.developStage);
-  } finally {
-    state.developBusy = false;
-    renderDevelop();
-  }
-}
-
-async function confirmAllDevelop(announce = true) {
-  if (!state.currentRun || !state.developPlan || state.developBusy) return null;
-  state.developBusy = true;
-  state.developFlowProgress = { status: "running", stage_label: "正在核对最新构图", overall_percent: 20 };
-  renderDevelop();
-  try {
-    let plan = null;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const latest = await api(`/api/runs/${state.currentRun.run_id}/develop`);
-      if (!latest?.exists || latest.stale) throw new Error("构图方案已经变化，请重新分析后再继续。 ");
-      state.developPlan = latest;
-      syncDevelopSummary(latest);
-      state.developFlowProgress = { status: "running", stage_label: "正在保存当前构图", overall_percent: 65 };
-      renderDevelop();
-      try {
-        plan = await api(`/api/runs/${state.currentRun.run_id}/develop/confirm-all`, {
-          method: "POST",
-          body: { base_revision: Number(latest.revision) },
-        });
-        break;
-      } catch (error) {
-        if (attempt > 0 || (!error.message.includes("更新") && !error.message.includes("刷新"))) throw error;
-      }
-    }
-    if (!plan) throw new Error("构图确认未完成，请重试。 ");
-    state.developPlan = plan;
-    syncDevelopSummary(plan);
-    if (announce) toast(`已保存 ${plan.confirmed_count} 张构图`);
-    return plan;
-  } catch (error) {
-    toast(error.message);
-    return null;
-  } finally {
-    state.developBusy = false;
-    state.developFlowProgress = null;
-    renderDevelop();
-  }
-}
-
-async function advanceFromCrop() {
-  if (!state.currentRun || state.developBusy) return;
-  state.developBusy = true;
-  state.developFlowProgress = { status: "running", stage_label: "正在读取最新构图状态", overall_percent: 10 };
-  renderDevelop();
-  try {
-    let plan = await api(`/api/runs/${state.currentRun.run_id}/develop`);
-    state.developPlan = plan;
-    syncDevelopSummary(plan);
-    if (!plan?.exists || plan.stale) {
-      toast("构图方案已经变化，请重新分析后再继续。");
-      return;
-    }
-    state.developBusy = false;
-    const allConfirmed = Number(plan.confirmed_count || 0) === Number(plan.eligible_count || 0);
-    if (!allConfirmed) {
-      plan = await confirmAllDevelop(false);
-      if (!plan || Number(plan.confirmed_count || 0) !== Number(plan.eligible_count || 0)) return;
-    }
-    await goWorkflowStage("base");
-  } finally {
-    state.developBusy = false;
-    state.developFlowProgress = null;
-    renderDevelop();
-  }
-}
-
-async function skipCropDevelop() {
-  if (!state.currentRun || !state.developPlan || state.developBusy) return;
-  state.developBusy = true;
-  renderDevelop();
-  try {
-    const plan = await api(`/api/runs/${state.currentRun.run_id}/develop/skip-crop`, {
-      method: "POST",
-      body: { base_revision: Number(state.developPlan.revision) },
-    });
-    state.developPlan = plan;
-    syncDevelopSummary(plan);
-    toast("已保留全部原始构图");
-  } catch (error) {
-    toast(error.message);
-    throw error;
-  } finally {
-    state.developBusy = false;
-    renderDevelop();
-  }
-}
-
-async function setColorMode(mode) {
-  if (!state.currentRun || !state.developPlan || state.developBusy) return false;
-  if (currentColorMode(state.developPlan) === mode && currentColorComplete(state.developPlan)) {
-    renderDevelop();
-    return true;
-  }
-  state.developBusy = true;
-  state.developFlowProgress = { status: "running", stage_label: mode === "style" ? "正在准备创意外观" : "正在保存基础调色", overall_percent: 85 };
-  renderDevelop();
-  try {
-    let plan = null;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const latest = attempt === 0
-        ? state.developPlan
-        : await api(`/api/runs/${state.currentRun.run_id}/develop`);
-      state.developPlan = latest;
-      syncDevelopSummary(latest);
-      try {
-        plan = await api(`/api/runs/${state.currentRun.run_id}/develop/options`, {
-          method: "POST",
-          body: { base_revision: Number(latest.revision), mode, color_enabled: mode !== "skip" },
-        });
-        break;
-      } catch (error) {
-        if (attempt > 0 || (!error.message.includes("更新") && !error.message.includes("刷新"))) throw error;
-      }
-    }
-    if (!plan) throw new Error("设置保存失败，请重试。 ");
-    state.developPlan = plan;
-    state.styleScope = currentStyleScope(plan);
-    syncDevelopSummary(plan);
-    return true;
-  } catch (error) {
-    toast(error.message);
-    return false;
-  } finally {
-    state.developBusy = false;
-    state.developFlowProgress = null;
-    renderDevelop();
-  }
-}
-
-function setStyleScope(scope) {
-  if (!state.developPlan || state.developBusy || state.activeJob) return;
-  const nextScope = scope === "global" ? "global" : "group";
-  if (currentStyleScope(state.developPlan) === nextScope) return;
-  state.styleScope = nextScope;
-  state.developPlan.creative_style ||= { status: "pending", groups: {} };
-  state.developPlan.creative_style.scope = nextScope;
-  state.developPlan.creative_style.status = "pending";
-  renderDevelop();
-}
-
-async function recommendStyles(groupId = null, scope = state.styleScope) {
-  if (!state.currentRun || !state.developPlan || state.developBusy || state.activeJob) return;
-  if (!await requireModelSetupUi()) return;
-  const resolvedScope = scope === "global" ? "global" : "group";
-  if (resolvedScope === "group" && groupId == null) {
-    toast("请从具体照片组启动 AI 推荐。 ");
-    return;
-  }
-  if (currentColorMode(state.developPlan) !== "style") {
-    const enabled = await setColorMode("style");
-    if (!enabled || !state.developPlan || state.activeJob) return;
-  }
-  state.developBusy = true;
-  renderDevelop();
-  try {
-    const job = await api(`/api/runs/${state.currentRun.run_id}/style-recommendations`, {
-      method: "POST",
-      body: {
-        base_revision: Number(state.developPlan.revision),
-        scope: resolvedScope,
-        group_id: resolvedScope === "group" ? Number(groupId) : null,
-      },
-    });
-    activateJob(job);
-  } catch (error) {
-    toast(error.message);
-  } finally {
-    state.developBusy = false;
-    renderDevelop();
-  }
-}
-
-async function recommendStylesForAllGroups() {
-  if (!state.currentRun || !state.developPlan || state.developBusy || state.activeJob) return;
-  if (!await requireModelSetupUi()) return;
-  const groupIds = new Set((state.developPlan.items || []).map((item) => Number(item.group_id)));
-  if (!groupIds.size) {
-    toast("没有可生成外观的照片组。 ");
-    return;
-  }
-  if (currentColorMode(state.developPlan) !== "style") {
-    const enabled = await setColorMode("style");
-    if (!enabled || !state.developPlan || state.activeJob) return;
-  }
-  state.styleScope = "group";
-  state.developPlan.creative_style ||= { status: "pending", groups: {} };
-  state.developPlan.creative_style.scope = "group";
-  state.developPlan.creative_style.status = "pending";
-  state.developBusy = true;
-  renderDevelop();
-  try {
-    const job = await api(`/api/runs/${state.currentRun.run_id}/style-recommendations/groups`, {
-      method: "POST",
-      body: { base_revision: Number(state.developPlan.revision) },
-    });
-    activateJob(job);
-  } catch (error) {
-    toast(error.message);
-  } finally {
-    state.developBusy = false;
-    renderDevelop();
-  }
-}
-
-async function requestStylePreview(groupId, { lutId = null, lutHash = null, presetId = null, presetHash = null, amount = null, scope = null } = {}) {
-  if (!state.currentRun || !state.developPlan || state.developBusy || state.activeJob) return false;
-  if (!await requireModelSetupUi()) return false;
-  const resolvedScope = scope === "global" || (scope == null && state.styleScope === "global") ? "global" : "group";
-  if (currentColorMode(state.developPlan) !== "style") {
-    const enabled = await setColorMode("style");
-    if (!enabled || !state.developPlan || state.activeJob) return false;
-  }
-  const selection = resolvedScope === "global"
-    ? (state.developPlan.creative_style?.global_selection || {})
-    : (state.developPlan.creative_style?.groups?.[String(groupId)] || {});
-  const recommendedId = selection.recommended_lut_id || selection.recommended_preset_id;
-  const recommendedChoice = (selection.top3 || []).find((choice) =>
-    String(choice.lut_id || choice.preset_id || "") === String(recommendedId || "")
-  ) || {};
-  const resolvedLutId = lutId || selection.lut_id || recommendedChoice.lut_id;
-  const resolvedLutHash = lutHash || selection.lut_hash || recommendedChoice.lut_hash;
-  // A calibrated LUT is the authoritative creative resource. Some catalog
-  // results retain their source preset metadata for provenance; never submit
-  // both pairs because the API deliberately accepts exactly one resource.
-  const resolvedPresetId = resolvedLutId ? null : (presetId || selection.preset_id || recommendedChoice.preset_id);
-  const resolvedPresetHash = resolvedLutId ? null : (presetHash || selection.preset_hash || recommendedChoice.preset_hash);
-  const resolvedId = resolvedLutId || resolvedPresetId;
-  const resolvedHash = resolvedLutId ? resolvedLutHash : resolvedPresetHash;
-  if (!resolvedId || !resolvedHash) {
-    toast("此外观缺少可验证资源，请重新推荐。 ");
-    return false;
-  }
-  const requestedAmount = Number(amount ?? selection.strength ?? selection.amount ?? 100);
-  if (!Number.isFinite(requestedAmount)) {
-    toast("风格强度无效，请重新选择。 ");
-    return false;
-  }
-  const resolvedAmount = Math.max(0, Math.min(200, Math.round(requestedAmount)));
-  const previewsCurrentSelection = String(resolvedId) === String(selection.lut_id || selection.preset_id || "");
-  const previousAmount = selection.amount;
-  const previousStrength = selection.strength;
-  if (previewsCurrentSelection) {
-    selection.amount = resolvedAmount;
-    if (resolvedLutId) selection.strength = resolvedAmount;
-  }
-  state.developBusy = true;
-  renderDevelop();
-  try {
-    const job = await api(`/api/runs/${state.currentRun.run_id}/style-preview`, {
-      method: "POST",
-      body: {
-        base_revision: Number(state.developPlan.revision),
-        scope: resolvedScope,
-        group_id: resolvedScope === "global" ? null : Number(groupId),
-        ...(resolvedLutId ? { lut_id: resolvedLutId, lut_hash: resolvedLutHash } : {}),
-        ...(resolvedPresetId ? { preset_id: resolvedPresetId, preset_hash: resolvedPresetHash } : {}),
-        amount: resolvedAmount,
-        ...(resolvedLutId ? { strength: resolvedAmount } : {}),
-      },
-    });
-    activateJob(job);
-    return true;
-  } catch (error) {
-    if (previewsCurrentSelection) {
-      selection.amount = previousAmount;
-      selection.strength = previousStrength;
-    }
-    toast(error.message);
-    return false;
-  } finally {
-    state.developBusy = false;
-    renderDevelop();
-  }
-}
-
-async function updateStyleGroup(groupId, changes) {
-  if (!state.currentRun || !state.developPlan || state.developBusy) return;
-  state.developBusy = true;
-  renderDevelop();
-  try {
-    const plan = await api(`/api/runs/${state.currentRun.run_id}/develop/style/groups/${groupId}`, {
-      method: "PUT",
-      body: { base_revision: Number(state.developPlan.revision), ...changes },
-    });
-    state.developPlan = plan;
-    syncDevelopSummary(plan);
-  } catch (error) {
-    toast(error.message);
-  } finally {
-    state.developBusy = false;
-    renderDevelop();
-  }
-}
-
-async function updateStyleGlobal(changes) {
-  if (!state.currentRun || !state.developPlan || state.developBusy) return;
-  state.developBusy = true;
-  renderDevelop();
-  try {
-    const plan = await api(`/api/runs/${state.currentRun.run_id}/develop/style/global`, {
-      method: "PUT",
-      body: { base_revision: Number(state.developPlan.revision), ...changes },
-    });
-    state.developPlan = plan;
-    state.styleScope = "global";
-    syncDevelopSummary(plan);
-  } catch (error) {
-    toast(error.message);
-  } finally {
-    state.developBusy = false;
-    renderDevelop();
-  }
-}
-
-async function confirmRecommendedStyles() {
-  if (!state.currentRun || !state.developPlan || state.developBusy) return;
-  if (state.styleScope === "global") {
-    const selection = state.developPlan.creative_style?.global_selection || {};
-    if (selection.recommendation_status === "complete" && selection.recommended_kind === "preset") {
-      const candidateId = selection.recommended_lut_id || selection.recommended_preset_id;
-      const candidate = (selection.top3 || []).find((choice) =>
-        String(choice.lut_id || choice.preset_id || "") === String(candidateId || "")
-      );
-      if (candidate) {
-        await requestStylePreview(null, {
-          scope: "global",
-          lutId: candidate.lut_id || null,
-          lutHash: candidate.lut_hash || null,
-          presetId: candidate.preset_id || null,
-          presetHash: candidate.preset_hash || null,
-          amount: Number(candidate.strength ?? candidate.amount ?? selection.recommended_amount ?? 100),
-        });
-        return;
-      }
-    }
-  }
-  state.developBusy = true;
-  renderDevelop();
-  try {
-    const plan = await api(`/api/runs/${state.currentRun.run_id}/develop/style/confirm-all`, {
-      method: "POST",
-      body: { base_revision: Number(state.developPlan.revision), scope: state.styleScope },
-    });
-    state.developPlan = plan;
-    syncDevelopSummary(plan);
-    toast(state.styleScope === "global" ? "已采用统一 AI 外观" : "已采用各组 AI 推荐");
-  } catch (error) {
-    toast(error.message);
-  } finally {
-    state.developBusy = false;
-    renderDevelop();
-  }
-}
-
-async function syncStyleLibrary(overrides = {}, successMessage = "风格库已更新") {
-  if (state.styleLibraryBusy) return;
-  const current = state.styleLibrary?.settings || {};
-  const requested = {
-    include_lightroom_presets: overrides.include_lightroom_presets ?? current.include_lightroom_presets ?? true,
-    include_user_uploads: overrides.include_user_uploads ?? current.include_user_uploads ?? true,
-  };
-  if (state.styleLibrary) state.styleLibrary = { ...state.styleLibrary, settings: { ...(state.styleLibrary.settings || {}), ...requested } };
-  state.styleLibraryBusy = true;
-  renderStyleLibrary();
-  try {
-    const result = await api("/api/style-library/sync", {
-      method: "POST",
-      body: requested,
-    });
-    state.styleLibrary = result.library || result;
-    renderStyleLibrary();
-    toast(successMessage);
-  } catch (error) {
-    toast(error.message);
-  } finally {
-    state.styleLibraryBusy = false;
-    renderStyleLibrary();
-  }
-}
-
-async function setStyleSourceEnabled(source, enabled) {
-  const overrides = source === "user"
-    ? { include_user_uploads: enabled }
-    : { include_lightroom_presets: enabled };
-  await syncStyleLibrary(overrides, `${source === "user" ? "用户上传" : "Lightroom"}风格已${enabled ? "启用" : "停用"}`);
-}
-
-async function setStyleLibraryItemHidden(resourceId, hidden) {
-  if (!resourceId || state.styleLibraryItemBusy || state.styleLibraryBusy) return;
-  const item = state.styleLibrary?.presets?.find((candidate) => candidate.resource_id === resourceId);
-  if (!item) return;
-  state.styleLibraryItemBusy = resourceId;
-  renderStyleLibraryManager();
-  try {
-    const result = await api(`/api/style-library/items/${encodeURIComponent(resourceId)}`, {
-      method: "PATCH",
-      body: { hidden },
-    });
-    state.styleLibrary = result.library;
-    renderStyleLibrary();
-    toast(`“${item.label || "未命名风格"}”已${hidden ? "停用" : "启用"}，AI 索引已更新`);
-  } catch (error) {
-    toast(error.message);
-  } finally {
-    state.styleLibraryItemBusy = null;
-    renderStyleLibraryManager();
-  }
-}
-
-async function deleteStyleLibraryItem(resourceId) {
-  if (!resourceId || state.styleLibraryItemBusy) return;
-  const item = state.styleLibrary?.presets?.find((candidate) => candidate.resource_id === resourceId);
-  if (!item || !window.confirm(`从风格库删除“${item.label || "未命名风格"}”？\n原资源会保留在所选数据目录的归档中。`)) return;
-  state.styleLibraryItemBusy = resourceId;
-  renderStyleLibraryManager();
-  try {
-    const result = await api(`/api/style-library/items/${encodeURIComponent(resourceId)}`, { method: "DELETE" });
-    state.styleLibrary = result.library;
-    renderStyleLibrary();
-    toast("已从风格库删除，AI 索引已更新");
-  } catch (error) {
-    toast(error.message);
-  } finally {
-    state.styleLibraryItemBusy = null;
-    renderStyleLibraryManager();
-  }
-}
-
-function readFileBase64(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.addEventListener("load", () => resolve(String(reader.result || "").split(",").at(-1) || ""));
-    reader.addEventListener("error", () => reject(new Error(`无法读取 ${file.name}`)));
-    reader.readAsDataURL(file);
-  });
-}
-
-async function importStyleLibraryFiles() {
-  const input = $("#style-library-files");
-  const files = [...input.files];
-  if (!files.length || state.styleImportBusy) return;
-  if (files.length > 500) return toast("单次最多导入 500 个文件。 ");
-  if (files.reduce((total, file) => total + file.size, 0) > 96 * 1024 * 1024) {
-    return toast("单次批量导入不能超过 96 MB。 ");
-  }
-  state.styleImportBusy = true;
-  renderStyleLibrary();
-  const status = $("#style-library-import-status");
-  status.textContent = "正在上传并增量重建索引…";
-  status.classList.remove("hidden");
-  try {
-    const payload = await Promise.all(files.map(async (file) => ({
-      name: file.name,
-      content_base64: await readFileBase64(file),
-    })));
-    const result = await api("/api/style-library/import", {
-      method: "POST",
-      body: { files: payload },
-    });
-    state.styleLibrary = result.library;
-    input.value = "";
-    const failed = Number(result.failed_count || 0);
-    const indexCopy = result.registration_pending ? "Lightroom 将自动完成注册" : "AI 索引已更新";
-    status.textContent = `${result.imported_count} 个已上传 · ${result.reused_count} 个复用${failed ? ` · ${failed} 个失败` : ""} · ${indexCopy}`;
-    toast(failed ? "上传完成，部分文件未通过校验" : `风格已上传，${indexCopy}`);
-  } catch (error) {
-    status.textContent = error.message;
-    toast(error.message);
-  } finally {
-    state.styleImportBusy = false;
-    renderStyleLibrary();
-  }
-}
-
-async function executeExport() {
-  if (!state.currentRun || state.activeJob) return;
-  const xmp = Boolean(state.exportTargets.xmp);
-  const jpeg = Boolean(state.exportTargets.jpeg);
-  if (!xmp && !jpeg) return toast("请至少选择 XMP 或 JPEG。 ");
-  try {
-    const retry = ["failed", "partial", "partial_failure"].includes(state.exportSpec?.status)
-      && state.exportSpec?.run_id === state.currentRun.run_id;
-    const spec = retry ? state.exportSpec : await api(`/api/runs/${state.currentRun.run_id}/exports/prepare`, {
-        method: "POST",
-        body: {
-          base_revision: Number(state.currentRun.review_revision),
-          develop_revision: state.developPlan?.exists ? Number(state.developPlan.revision) : null,
-          xmp,
-          jpeg,
-          jpeg_output_dir: jpeg ? $("#export-directory").value.trim() : null,
-          jpeg_settings: {
-            color_space: "sRGB",
-            size: "original",
-            quality: 90,
-            sharpening: "screen_standard",
-            collision: "suffix",
-            ...(state.bootstrap?.preferences?.export_defaults?.jpeg_settings || {}),
-          },
-        },
-      });
-    state.exportSpec = spec;
-    renderExport();
-    const execution = await api(`/api/exports/${encodeURIComponent(spec.export_spec_id)}/execute`, {
-      method: "POST",
-      body: { retry_failed_only: retry },
-    });
-    if (execution?.id) {
-      state.activeJob = execution;
-      state.jobs.unshift(execution);
-      state.exportSpec = { ...spec, status: execution.status || "queued", job_id: execution.id };
-      renderJobBar();
-      renderExport();
-      pollJobs();
-    } else {
-      state.exportSpec = execution;
-      renderExport();
-    }
-  } catch (error) {
-    toast(error.message);
-    if (state.exportSpec) state.exportSpec = { ...state.exportSpec, status: "failed", message: error.message };
-    renderExport();
-  }
-}
-
-function renderStyleSearch() {
-  const query = $("#style-search-input").value.trim().toLowerCase();
-  const presets = state.styleLibrary?.presets || [];
-  const matches = presets.filter((preset) => {
-    if (!preset.ai_enabled) return false;
-    const haystack = [preset.label, preset.name, preset.source, preset.category, preset.tier].filter(Boolean).join(" ").toLowerCase();
-    return !query || haystack.includes(query);
-  }).slice(0, 120);
-  const controlsBusy = state.developBusy || Boolean(state.activeJob);
-  $("#style-search-results").innerHTML = matches.map((preset) => {
-    const lutId = preset.lut_id || "";
-    const presetId = preset.preset_id || "";
-    return `<article class="style-search-result"><div><strong>${escapeHtml(preset.label || preset.name)}</strong><small>${escapeHtml([preset.source, preset.category].filter(Boolean).join(" · "))}</small></div><button type="button" class="button" data-style-search-select="${escapeHtml(lutId || presetId)}" data-lut-id="${escapeHtml(lutId)}" data-lut-hash="${escapeHtml(preset.lut_hash || "")}" data-preset-id="${escapeHtml(presetId)}" data-preset-hash="${escapeHtml(preset.preset_hash || preset.hash || "")}" ${controlsBusy ? "disabled" : ""}>预览</button></article>`;
-  }).join("") || `<div class="empty">没有匹配的外观</div>`;
-}
-
-function openStyleSearch(groupId = null) {
-  state.styleSearchGroupId = groupId == null ? null : Number(groupId);
-  $("#style-search-input").value = "";
-  renderStyleSearch();
-  $("#style-search-dialog").showModal();
 }
 
 async function configureLightroom(autoDetect = false) {
@@ -2635,77 +1650,44 @@ async function refreshLightroomConnection() {
 }
 
 async function loadExport(historyMode = "push") {
-  if (!state.currentRun?.xmp_ready) throw new Error("请先完成 AI 评分。 ");
-  let plan = state.developPlan;
-  if (!plan || plan.stale || Number(plan.source_review_revision) !== Number(state.currentRun.review_revision)) {
-    plan = await api(`/api/runs/${state.currentRun.run_id}/develop`);
-  }
-  if (!currentCropComplete(plan)) throw new Error("请先完成或跳过构图。 ");
-  if (!currentBaseComplete(plan)) throw new Error("请先选择基础调色方式。 ");
-  if (!currentStyleComplete(plan)) throw new Error("请先确认或跳过创意外观。 ");
-  state.developPlan = plan;
-  syncDevelopSummary(plan);
-  setView("export", `export/${state.currentRun.run_id}`, historyMode);
+  const run = state.currentRun;
+  const navigationRequest = reviewOpenRequest;
+  await ratingSave;
+  if (state.currentRun !== run || !run) return;
+  const summary = await api(`/api/runs/${run.run_id}/selection-export`);
+  if (state.currentRun !== run || navigationRequest !== reviewOpenRequest) return;
+  state.selectionExport = summary;
+  setView("export", `export/${run.run_id}`, historyMode);
   renderExport();
 }
 
 async function goWorkflowStage(stage) {
-  if (!state.currentRun) return;
-  if (stage === "color") stage = "style";
-  if (stage === "review") {
-    state.developStage = "crop";
-    renderReview();
-    setView("review", currentProjectRoute(), "push");
-    return;
-  }
-  if (!state.currentRun.xmp_ready) {
-    toast("请先确认分组并完成 AI 评分。 ");
-    return;
-  }
-  if (stage === "export") {
-    if ($("#view-export").classList.contains("active")) return;
-    if ($("#view-develop").classList.contains("active") && state.developStage === "style") {
-      await loadExport();
-      return;
-    }
-    toast("请按顺序完成或跳过可选步骤。 ");
-    return;
-  }
-  if (stage === "crop") {
-    await loadDevelop(false, null, "crop");
-    return;
-  }
-  let plan = state.developPlan;
-  if (!plan || plan.stale || Number(plan.source_review_revision) !== Number(state.currentRun.review_revision)) {
-    plan = await api(`/api/runs/${state.currentRun.run_id}/develop`);
-  }
-  if (!plan?.exists || plan.stale || Number(plan.confirmed_count || 0) !== Number(plan.eligible_count || 0)) {
-    toast("请先在构图步骤确认全部照片。 ");
-    await loadDevelop(false, null, "crop");
-    return;
-  }
-  state.developPlan = plan;
-  state.styleScope = currentStyleScope(plan);
-  syncDevelopSummary(plan);
-  if (stage === "style" && !currentBaseComplete(plan)) {
-    toast("请先选择或跳过基础调色。 ");
-    stage = "base";
-  }
-  state.developStage = stage === "style" ? "style" : "base";
-  setView("develop", `develop/${state.currentRun.run_id}/${state.developStage}`, "push");
-  renderDevelop();
+  const run = state.currentRun;
+  await ratingSave;
+  if (!run || state.currentRun !== run) return;
+  if (stage === "export") return loadExport();
+  renderReview();
+  setView("review", currentProjectRoute(), "push");
 }
 
-async function setRating(index, rating) {
+function setRating(index, rating) {
   if (!state.currentRun || state.groupingMode || !state.currentRun.xmp_ready) return;
   const parsed = rating === "reset" ? null : Number(rating);
+  if (parsed != null && ![0, 3, 4, 5].includes(parsed)) return;
+  const run = state.currentRun;
+  const save = () => saveRating(run, Number(index), parsed);
+  ratingSave = ratingSave.then(save, save);
+  return ratingSave;
+}
+
+async function saveRating(run, index, parsed) {
+  const item = run.results.find((value) => value.index === index && !value.excluded && !value.deleted);
+  if (!item) return;
   try {
-    const update = await api(`/api/runs/${state.currentRun.run_id}/items/${index}`, {
+    const update = await api(`/api/runs/${run.run_id}/items/${index}`, {
       method: "PATCH",
-      body: { rating: parsed, base_revision: state.currentRun.review_revision },
+      body: { rating: parsed, base_revision: run.review_revision },
     });
-    const item = state.currentRun.results.find((value) => value.index === Number(index));
-    if (!item) return;
     if (parsed == null) {
       item.rating = item.ai_rating;
       item.effective_rating = item.ai_rating;
@@ -2717,29 +1699,89 @@ async function setRating(index, rating) {
       item.manual_rating = parsed;
       item.manual_override = true;
     }
-    state.currentRun.review_revision = update.review_revision;
-    if (state.currentRun.develop?.exists) {
-      state.currentRun.develop.stale = true;
-      state.currentRun.develop.confirmed_count = 0;
+    run.review_revision = update.review_revision;
+    if (run.develop?.exists) {
+      run.develop.stale = true;
+      run.develop.confirmed_count = 0;
     }
-    state.developPlan = null;
-    state.currentRun.manual_adjusted_count = update.manual_adjusted_count;
-    state.currentRun.candidate_count = state.currentRun.results.filter((value) => value.effective_rating >= 3).length;
-    state.currentRun.strong_count = state.currentRun.results.filter((value) => value.effective_rating >= 4).length;
-    syncProjectRunStats(state.currentRun);
-    renderReview();
+    run.manual_adjusted_count = update.manual_adjusted_count;
+    const active = run.results.filter((value) => !value.excluded && !value.deleted);
+    run.candidate_count = active.filter((value) => value.effective_rating >= 3).length;
+    run.strong_count = active.filter((value) => value.effective_rating >= 4).length;
+    syncProjectRunStats(run);
+    if (state.currentRun === run) {
+      state.developPlan = null;
+      renderReview();
+    }
   } catch (error) {
     toast(error.message);
-    if (error.message.includes("刷新")) await openRun(state.currentRun.run_id);
+    if (error.message.includes("刷新")) {
+      // Do not call openRun here: it waits for this queue. Refresh the captured
+      // run, never whichever project the user navigated to during the request.
+      try {
+        Object.assign(run, await api(`/api/runs/${run.run_id}`));
+        if (state.currentRun === run) renderReview();
+      } catch (refreshError) { toast(refreshError.message); }
+    }
   }
+}
+
+function photoGroupItems(index = state.dialogIndex) {
+  const run = state.currentRun;
+  const current = run?.results.find((item) => item.index === Number(index));
+  if (!current || current.deleted) return [];
+  const grouping = state.groupingMode || run.workflow_state !== "scored" || run.needs_rescore;
+  return run.results.filter((item) => !item.deleted && Boolean(item.excluded) === Boolean(current.excluded)
+    && Number(item.group_id) === Number(current.group_id))
+    .sort(grouping ? (a, b) => a.index - b.index
+      : (a, b) => b.effective_rating - a.effective_rating || b.score - a.score || a.index - b.index);
+}
+
+function navigatePhotoGroup(direction) {
+  const items = photoNavigationItems().filter(item => item.index !== reviewViewer?.referenceIndex);
+  const position = items.findIndex((item) => item.index === state.dialogIndex);
+  const next = items[position + direction];
+  if (position >= 0 && next) updatePhotoDialog(next.index);
+}
+
+function photoNavigationItems(index = state.dialogIndex) {
+  const run = state.currentRun;
+  const current = run?.results.find((item) => item.index === Number(index));
+  if (!current) return [];
+  const grouping = state.groupingMode || run.workflow_state !== "scored" || run.needs_rescore;
+  const items = photoGroupItems(index);
+  const snapshot = state.dialogSequence;
+  if (!snapshot || snapshot.run !== run || snapshot.group !== current.group_id
+      || snapshot.excluded !== Boolean(current.excluded) || snapshot.grouping !== grouping) {
+    state.dialogSequence = {run, group: current.group_id, excluded: Boolean(current.excluded),
+      grouping, indexes: items.map((item) => item.index)};
+  }
+  const byIndex = new Map(items.map((item) => [item.index, item]));
+  const order = state.dialogSequence.indexes.filter((value) => byIndex.has(value));
+  items.forEach((item) => { if (!order.includes(item.index)) order.push(item.index); });
+  state.dialogSequence.indexes = order;
+  return order.map((value) => byIndex.get(value));
 }
 
 function updatePhotoDialog(index) {
   const item = state.currentRun?.results.find((value) => value.index === Number(index));
-  if (!item) return;
+  if (!item || item.deleted) return;
   state.dialogIndex = item.index;
-  $("#dialog-image").src = item.preview_url;
+  if ($("#dialog-image").getAttribute?.("src") !== item.preview_url) $("#dialog-image").src = item.preview_url;
+  $("#dialog-image").alt = item.filename;
+  const items = photoNavigationItems(item.index);
+  const position = items.findIndex((value) => value.index === item.index);
+  $("#dialog-previous").disabled = position <= 0;
+  $("#dialog-next").disabled = position < 0 || position >= items.length - 1;
+  $("#dialog-position").textContent = `组 ${item.group_id} · ${position + 1} / ${items.length}`;
   const grouping = state.groupingMode || state.currentRun.workflow_state !== "scored" || state.currentRun.needs_rescore;
+  reviewViewer?.setPhoto(item, items, grouping);
+  if (reviewViewer?.referenceIndex != null) {
+    const candidates = items.filter(value => value.index !== reviewViewer.referenceIndex);
+    const current = candidates.findIndex(value => value.index === item.index);
+    $("#dialog-previous").disabled = current <= 0;
+    $("#dialog-next").disabled = current < 0 || current >= candidates.length - 1;
+  }
   $("#dialog-name").textContent = grouping
     ? `${item.filename} · 组 ${item.group_id}`
     : item.manual_override ? `${item.filename} · 你 ${item.effective_rating} / AI ${item.ai_rating}` : item.filename;
@@ -2767,6 +1809,8 @@ function updatePhotoDialog(index) {
 }
 
 function openPhoto(index) {
+  state.dialogSequence = null;
+  reviewViewer?.reset();
   updatePhotoDialog(index);
   $("#photo-dialog").showModal();
 }
@@ -2801,7 +1845,7 @@ async function applyGroupChange(indexes, { selected = null, direction = null, cl
   const run = state.currentRun;
   indexes = [...new Set(indexes.map(Number))];
   if (!run || !indexes.length) return;
-  if (state.activeJob || state.batchBusy) return toast("请等待当前任务完成");
+  if (jobBlocksProject() || state.batchBusy) return toast("请等待当前任务完成");
   const scrollTop = window.scrollY;
   const body = { indexes, base_revision: baseRevision ?? run.review_revision };
   if (direction) body.direction = direction;
@@ -2859,7 +1903,7 @@ async function moveGroup() {
 }
 
 function toggleBatchGrouping() {
-  if (!state.currentRun || state.activeJob || state.batchBusy) return;
+  if (!state.currentRun || jobBlocksProject() || state.batchBusy) return;
   state.batchGrouping = !state.batchGrouping;
   clearGroupingSelection();
   renderReview();
@@ -2888,7 +1932,7 @@ function selectGroupingIndex(index, selected, range = false) {
 async function updateExcluded(indexes, excluded) {
   const run = state.currentRun;
   indexes = [...new Set(indexes.map(Number))];
-  if (!run || !indexes.length || state.activeJob || state.batchBusy) return;
+  if (!run || !indexes.length || jobBlocksProject() || state.batchBusy) return;
   state.batchBusy = true;
   renderReview();
   try {
@@ -2916,7 +1960,7 @@ async function updateExcluded(indexes, excluded) {
 
 function openDeletePhotos(indexes) {
   const run = state.currentRun;
-  if (!run || state.activeJob || state.batchBusy || !indexes.length) return;
+  if (!run || jobBlocksProject() || state.batchBusy || !indexes.length) return;
   const items = run.results.filter((item) => indexes.includes(item.index) && !item.deleted);
   if (!items.length) return;
   state.deletePhotoTarget = { runId: run.run_id, revision: Number(run.review_revision), indexes: items.map((item) => item.index) };
@@ -2928,7 +1972,7 @@ function openDeletePhotos(indexes) {
 
 async function deletePhotos() {
   const target = state.deletePhotoTarget;
-  if (!target || state.batchBusy || state.activeJob || target.runId !== state.currentRun?.run_id) return;
+  if (!target || state.batchBusy || jobBlocksProject() || target.runId !== state.currentRun?.run_id) return;
   const button = $("#delete-photos-submit");
   state.batchBusy = true;
   button.disabled = true;
@@ -2986,6 +2030,31 @@ async function scoreCurrentGroups() {
   });
 }
 
+function reclassificationRunId(job) {
+  return job?.kind === "score" && ["failed", "interrupted"].includes(job.status)
+    && job.requires_reclassification !== false
+    && /照片目录内容已变化|照片在分类后发生变化/.test(job.message || "")
+    ? String(job.context?.source_run_id || "") : "";
+}
+
+async function reclassifyRun(runId = state.currentRun?.run_id) {
+  if (!runId || state.activeJob || state.batchBusy) return;
+  if (!await requireModelSetupUi()) return;
+  state.batchBusy = true;
+  renderReview();
+  try {
+    const run = state.currentRun?.run_id === runId ? state.currentRun : await api(`/api/runs/${encodeURIComponent(runId)}`);
+    if (!run.project_id) throw new Error("工程信息不完整，请刷新后重试。 ");
+    return await startJob(`/api/projects/${encodeURIComponent(run.project_id)}/group`, {
+      retain_ratio: Number(run.retain_ratio || 0.30),
+      mode: run.scoring_mode === "fast" ? "fast" : "deep",
+    });
+  } finally {
+    state.batchBusy = false;
+    renderReview();
+  }
+}
+
 async function startJob(path, body) {
   try {
     state.jobNotice = null;
@@ -2998,62 +2067,28 @@ async function startJob(path, body) {
 }
 
 async function retryFailedJob(requestedJob = currentProgressJob()) {
-  const job = typeof requestedJob === "string"
-    ? state.jobs.find((item) => item.id === requestedJob) || state.jobNotice
-    : requestedJob;
-  if (!job || !job.retryable || state.activeJob || state.jobRetryBusy) return;
+  const job = typeof requestedJob === "string" ? state.jobs.find(item => item.id === requestedJob) : requestedJob;
+  if (!job?.id || state.jobRetryBusy) return;
   state.jobRetryBusy = true;
-  const previousNotice = state.jobNotice;
-  renderJobBar();
-  renderModelInstallProgress(job);
-  try {
-    if (job.retry_mode === "export_failed") {
-      const exportSpecId = job.context?.export_spec_id;
-      if (!exportSpecId) throw new Error("导出失败项清单不存在，请返回导出步骤重新准备。 ");
-      const spec = await api(`/api/exports/${encodeURIComponent(exportSpecId)}`);
-      const execution = await api(`/api/exports/${encodeURIComponent(exportSpecId)}/execute`, {
-        method: "POST",
-        body: { retry_failed_only: true },
-      });
-      state.exportSpec = execution?.id ? { ...spec, status: execution.status || "queued", job_id: execution.id } : execution;
-      if (execution?.id) activateJob(execution);
-      else {
-        toast("失败项已处理完毕，无需再次运行");
-        renderExport();
-      }
-      return;
-    }
-    if (job.retry_mode === "develop") {
-      const runId = String(job.context?.run_id || "");
-      if (!runId) throw new Error("构图任务缺少工程信息，请返回选片步骤重新进入。 ");
-      if (String(state.currentRun?.run_id || "") !== runId) await openRun(runId);
-      else state.currentRun = await api(`/api/runs/${runId}`);
-      state.jobNotice = null;
-      state.developProgress = null;
-      await loadDevelop(true, null, "crop", true, "replace");
-      return;
-    }
-    const retried = await api(`/api/jobs/${encodeURIComponent(job.id)}/retry`, { method: "POST" });
-    activateJob(retried);
-  } catch (error) {
-    if (!state.activeJob) state.jobNotice = previousNotice || job;
-    toast(`重试未启动：${error.message}`);
-  } finally {
-    state.jobRetryBusy = false;
-    renderJobBar();
-    renderModelInstallProgress();
-  }
+  try { activateJob(await api(`/api/jobs/${job.id}/retry`, {method: "POST"})); pollJobs(); }
+  catch (error) { toast(error.message); }
+  finally { state.jobRetryBusy = false; renderJobBar(); }
 }
 
 async function cancelActiveJob() {
-  const current = state.activeJob;
-  if (!current || current.status === "cancelling") return;
+  const current = currentProgressJob();
+  if (!current?.id || current.status === "cancelling") return;
+  const previousStatus = current.status;
+  if (current.foreground) state.developProgress = { ...state.developProgress, status: "cancelling" };
   current.status = "cancelling";
   current.stage = "正在取消";
   renderJobBar();
   renderModelInstallProgress(current);
   try {
     const cancelled = await api(`/api/jobs/${current.id}`, { method: "DELETE" });
+    if (cancelled.kind === "develop" && cancelled.context?.run_id === state.currentRun?.run_id) {
+      state.developProgress = { ...(state.developProgress || {}), status: cancelled.status, job_id: cancelled.id, run_id: cancelled.context.run_id, stage_label: cancelled.stage, message: cancelled.message };
+    }
     const index = state.jobs.findIndex((item) => item.id === cancelled.id);
     if (index >= 0) state.jobs[index] = cancelled;
     if (["cancelled", "failed", "interrupted", "completed"].includes(cancelled.status)) {
@@ -3065,8 +2100,9 @@ async function cancelActiveJob() {
     renderModelInstallProgress(cancelled);
     pollJobs();
   } catch (error) {
-    current.status = "running";
-    state.activeJob = current;
+    current.status = previousStatus;
+    if (current.foreground) state.developProgress.status = previousStatus;
+    else state.activeJob = current;
     renderJobBar();
     renderModelInstallProgress(current);
     toast(error.message);
@@ -3074,124 +2110,45 @@ async function cancelActiveJob() {
 }
 
 async function pollJobs() {
+  if (jobsPolling) { jobsPollAgain = true; return; }
+  jobsPolling = true;
   clearTimeout(pollJobs.timer);
   try {
     state.jobs = await api("/api/jobs");
-    const active = state.jobs.find((job) => ["queued", "running", "cancelling"].includes(job.status));
-    const activeChanged = (state.activeJob?.id || null) !== (active?.id || null);
+    const active = state.jobs.find(job => ["queued", "running", "cancelling"].includes(job.status));
+    const changed = (state.activeJob?.id || null) !== (active?.id || null);
     state.activeJob = active || null;
     renderJobBar();
-    if (state.currentProject && !state.currentProject.latest_run_id) renderProjectStart();
-    if (location.hash.replace(/^#/, "").startsWith("develop/")) renderDevelop();
-    if (location.hash.replace(/^#/, "").startsWith("export/")) renderExport();
-    if (activeChanged) renderReview();
-    if (activeChanged) renderToolbox();
-    const completed = state.jobs.filter((job) => ["completed", "failed", "cancelled", "interrupted"].includes(job.status));
-    for (const job of completed) {
+    if (changed) { renderReview(); renderToolbox(); }
+    for (const job of state.jobs.filter(job => ["completed", "failed", "cancelled", "interrupted"].includes(job.status))) {
       if (state.handledJobs.has(job.id)) continue;
-      const styleTerminal = isStyleJob(job);
-      if (!styleTerminal) state.handledJobs.add(job.id);
+      state.handledJobs.add(job.id);
       if (job.status === "completed") {
-        const partialStyle = styleTerminal && job.result?.style_status === "partial";
-        toast(partialStyle ? `${job.title}部分完成：${job.message}` : `${job.title}已完成`);
-        if (partialStyle) {
-          state.jobNotice = job;
-          renderJobBar();
-        }
+        toast(`${job.title}已完成`);
         await refreshBootstrap();
-        if (isStyleJob(job) && styleJobMatchesCurrentRun(job)) {
-          await reloadDevelopAfterStyleJob(job);
-          renderDevelop();
+        if (["group", "score"].includes(job.kind) && job.result?.run_id && jobMatchesProject(job)
+          && /^(review|export|project)(\/|$)/.test(location.hash.slice(1))) await openRun(job.result.run_id);
+        if (["xmp_commit", "rollback", "selection_copy"].includes(job.kind) && state.currentRun && jobMatchesProject(job)
+          && /^(review|export|project)(\/|$)/.test(location.hash.slice(1))) {
+          const run = state.currentRun;
+          const onExport = location.hash.startsWith("#export/");
+          await openRun(run.run_id, onExport ? `export/${run.run_id}` : currentProjectRoute());
+          if (onExport) await loadExport("replace");
         }
-        if (["group", "score"].includes(job.kind) && job.result?.run_id) await openRun(job.result.run_id);
-        if (["xmp_commit", "rollback", "lightroom_apply"].includes(job.kind) && state.currentRun) {
-          const route = location.hash.replace(/^#/, "");
-          const returnToDevelop = route.startsWith("develop/");
-          const returnToExport = route.startsWith("export/");
-          const developStage = state.developStage;
-          const selectedExportTargets = { ...state.exportTargets };
-          await openRun(state.currentRun.run_id, returnToDevelop || returnToExport || route.startsWith("project/") ? route : "review");
-          if (returnToDevelop) await loadDevelop(false, route, developStage, false, "replace");
-          if (returnToExport) {
-            state.exportTargets = selectedExportTargets;
-            await loadExport("replace");
-          }
-        }
-        if (job.context?.export_spec_id) {
-          state.exportSpec = await api(`/api/exports/${encodeURIComponent(job.context.export_spec_id)}`);
-          if (location.hash.replace(/^#/, "").startsWith("export/")) renderExport();
-        }
-        if (["raw_jpeg_execute", "raw_jpeg_rollback"].includes(job.kind)) {
-          state.rawJpegPlan = null;
-          renderToolbox();
-        }
-        if (["xmp_cleanup_execute", "xmp_cleanup_rollback"].includes(job.kind)) {
-          state.xmpCleanupPlan = null;
-          renderToolbox();
-        }
-        if (job.kind === "model_download") await refreshModelResources();
-      } else if (job.status === "failed") {
+        if (["raw_jpeg_execute", "raw_jpeg_rollback"].includes(job.kind)) state.rawJpegPlan = null;
+        if (job.kind.startsWith("xmp_cleanup")) state.xmpCleanupPlan = null;
+      } else if (["failed", "interrupted"].includes(job.status)) {
         state.jobNotice = job;
-        renderJobBar();
-        toast(`${job.title}失败：${job.message}`);
-        if (isStyleJob(job) && styleJobMatchesCurrentRun(job)) {
-          await reloadDevelopAfterStyleJob(job);
-          renderDevelop();
-        }
-        if (job.kind === "lightroom_apply") {
-          try { state.lightroomStatus = await api("/api/lightroom/status"); renderLightroom(); } catch (_error) { /* keep failure message */ }
-        }
-        if (job.kind === "model_download") {
-          try { await refreshModelResources(); } catch (_error) { /* keep failure message */ }
-        }
-        if (location.hash.replace(/^#/, "").startsWith("export/")) renderExport();
-        if (job.context?.export_spec_id) {
-          try {
-            state.exportSpec = await api(`/api/exports/${encodeURIComponent(job.context.export_spec_id)}`);
-            renderExport();
-          } catch (_error) { /* keep the worker failure details */ }
-        }
-        if (job.kind === "raw_jpeg_execute") {
-          state.rawJpegPlan = null;
-          renderToolbox();
-        }
-        if (["xmp_cleanup_execute", "xmp_cleanup_rollback"].includes(job.kind)) {
-          try { await refreshBootstrap(); } catch (_error) { /* keep the worker failure details */ }
-          state.xmpCleanupPlan = null;
-          renderToolbox();
-        }
-      } else if (["cancelled", "interrupted"].includes(job.status)) {
-        if (job.status === "interrupted") {
-          state.jobNotice = job;
-          renderJobBar();
-          toast(`${job.title}已中断；点击重试可从最近进度继续。`);
-        }
-        if (job.kind === "model_download") {
-          try { await refreshModelResources(); } catch (_error) { /* keep partial download state */ }
-          if (job.status !== "interrupted") {
-            toast(`${job.title}已停止；可以稍后继续安装。`);
-          }
-        }
-        if (["raw_jpeg_execute", "raw_jpeg_rollback"].includes(job.kind)) {
-          await refreshBootstrap();
-          state.rawJpegPlan = null;
-          renderToolbox();
-        }
-        if (["xmp_cleanup_execute", "xmp_cleanup_rollback"].includes(job.kind)) {
-          await refreshBootstrap();
-          state.xmpCleanupPlan = null;
-          renderToolbox();
-        }
-        if (isStyleJob(job) && styleJobMatchesCurrentRun(job)) {
-          await reloadDevelopAfterStyleJob(job);
-          renderDevelop();
-        }
+        toast(`${job.title}：${job.message || (job.status === "failed" ? "失败" : "已中断")}`);
       }
-      if (styleTerminal) state.handledJobs.add(job.id);
+      if (job.kind === "model_download") await refreshModelResources();
+      renderJobBar(); renderToolbox();
     }
     if (active) pollJobs.timer = setTimeout(pollJobs, 1200);
-  } catch (_error) {
-    pollJobs.timer = setTimeout(pollJobs, 2500);
+  } catch (_error) { pollJobs.timer = setTimeout(pollJobs, 2500); }
+  finally {
+    jobsPolling = false;
+    if (jobsPollAgain) { jobsPollAgain = false; clearTimeout(pollJobs.timer); pollJobs.timer = setTimeout(pollJobs, 0); }
   }
 }
 
@@ -3382,24 +2339,17 @@ async function routeFromHash() {
     return;
   }
   if (requested.startsWith("develop/")) {
-    const parts = requested.slice("develop/".length).split("/");
-    const runId = parts[0];
-    const stage = ["style", "color"].includes(parts[1]) ? "style" : parts[1] === "base" ? "base" : "crop";
-    await openRun(runId, requested, "replace");
-    try {
-      await loadDevelop(false, requested, stage, false, "replace");
-    } catch (error) {
-      setView("review", currentProjectRoute(), "replace");
-      toast(error.message);
-    }
+    await openRun(requested.split("/")[1]);
     return;
   }
   if (requested.startsWith("export/")) {
     const runId = requested.slice("export/".length).split("/")[0];
-    await openRun(runId, requested, "replace");
+    const run = await openRun(runId, requested, "replace");
+    if (!run || state.currentRun !== run) return;
     try {
       await loadExport("replace");
     } catch (error) {
+      if (state.currentRun !== run || location.hash.replace(/^#/, "") !== requested) return;
       setView("review", currentProjectRoute(), "replace");
       toast(error.message);
     }
@@ -3417,17 +2367,27 @@ async function routeFromHash() {
   }
   if (requested === "train") return setView("settings");
   if (requested === "settings/resources") return openModelResources("replace");
-  setView(["cull", "toolbox", "settings"].includes(requested) ? requested : "cull");
+  if (!["cull", "settings"].includes(requested)) return openToolboxSection("home", "replace");
+  setView(requested);
 }
 
 function bindEvents() {
+  $("#thumbnail-size").addEventListener("input", (event) => {
+    state.thumbnailDirty = true;
+    setThumbnailSize(event.target.value);
+  });
+  $("#thumbnail-size").addEventListener("change", saveThumbnailSize);
+  $("#dialog-previous").addEventListener("click", () => navigatePhotoGroup(-1));
+  $("#dialog-next").addEventListener("click", () => navigatePhotoGroup(1));
   let updateTimer = null;
   async function renderAppUpdate() {
     clearTimeout(updateTimer);
     try {
       const info = await api("/api/app-updates");
       const busy = ["checking", "downloading", "installing"].includes(info.phase);
-      $("#app-update-version").textContent = `当前 ${info.current_version}${info.release ? ` · 可用 ${info.release.version}` : ""}`;
+      const buildCopy = info.build?.status === "identified" ? ` · 构建 ${info.build.id}`
+        : ["invalid", "mismatch"].includes(info.build?.status) ? " · 构建资料不匹配" : "";
+      $("#app-update-version").textContent = `当前 ${info.current_version}${buildCopy}${info.release ? ` · 可用 ${info.release.version}` : ""}`;
       $("#app-update-check").disabled = busy;
       $("#app-update-download").classList.toggle("hidden", !info.release || busy || info.phase === "ready");
       $("#app-update-cancel").classList.toggle("hidden", info.phase !== "downloading");
@@ -3456,27 +2416,16 @@ function bindEvents() {
     });
   }
   renderAppUpdate();
+  $("#app-diagnostics-copy").addEventListener("click", copyDiagnostics);
   $("#vision-mode").addEventListener("change", () => $("#vision-cloud-fields").classList.toggle("hidden", $("#vision-mode").value !== "cloud"));
   $("#vision-bailian").addEventListener("click", () => {
     $("#vision-url").value = "https://dashscope.aliyuncs.com/compatible-mode/v1";
     $("#vision-model").value = "qwen3-vl-plus";
+    refreshVisionThinkingOptions();
   });
-  $("#vision-provider-form").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const button = event.submitter;
-    button.disabled = true;
-    try {
-      await api("/api/vision-provider", {method: "PUT", body: {
-        mode: $("#vision-mode").value, base_url: $("#vision-url").value,
-        model: $("#vision-model").value, api_key: $("#vision-key").value,
-        timeout: Number($("#vision-timeout").value), upload_consent: $("#vision-consent").checked,
-      }});
-      $("#vision-key").value = "";
-      $("#vision-status").textContent = "已保存，下次任务生效。";
-      await refreshModelResources();
-    } catch (error) { $("#vision-status").textContent = error.message; }
-    finally { button.disabled = false; }
-  });
+  $("#vision-url").addEventListener("change", refreshVisionThinkingOptions);
+  $("#vision-model").addEventListener("change", refreshVisionThinkingOptions);
+  $("#vision-provider-form").addEventListener("submit", saveVisionProviderSettings);
   $("#vision-test").addEventListener("click", async () => {
     $("#vision-test").disabled = true;
     $("#vision-status").textContent = "正在测试已保存配置（仅发送测试色块）…";
@@ -3490,6 +2439,7 @@ function bindEvents() {
     $("#vision-model").value = config.model;
     $("#vision-timeout").value = config.timeout;
     $("#vision-consent").checked = config.upload_consent;
+    renderVisionThinkingOptions(config.thinking_capabilities, config.thinking_effort);
     $("#vision-cloud-fields").classList.toggle("hidden", config.mode !== "cloud");
     if (config.has_key) $("#vision-key").placeholder = "已保存密钥；留空不变";
   }).catch((error) => { $("#vision-status").textContent = error.message; });
@@ -3515,7 +2465,7 @@ function bindEvents() {
   });
   $("#xmp-cleanup-execute").addEventListener("click", executeXmpCleanup);
   $("#job-cancel").addEventListener("click", async () => {
-    if (state.activeJob) return cancelActiveJob();
+    if (currentProgressJob()?.id && ["queued", "running", "cancelling"].includes(currentProgressJob().status)) return cancelActiveJob();
     state.developProgress = null;
     state.developFlowProgress = null;
     state.jobNotice = null;
@@ -3523,20 +2473,16 @@ function bindEvents() {
   });
   $("#job-retry").addEventListener("click", () => retryFailedJob());
   $("#review-back").addEventListener("click", () => setView("cull", "cull", "push"));
-  $("#develop-open").addEventListener("click", () => goWorkflowStage("crop").catch((error) => toast(error.message)));
-  $("#develop-back").addEventListener("click", () => {
-    const previous = state.developStage === "style" ? "base" : state.developStage === "base" ? "crop" : "review";
-    goWorkflowStage(previous).catch((error) => toast(error.message));
+  $("#selection-export-open").addEventListener("click", () => goWorkflowStage("export").catch((error) => toast(error.message)));
+  $("#photo-dialog").addEventListener("close", () => {
+    state.dialogIndex = null;
+    state.dialogSequence = null;
+    reviewViewer?.reset();
   });
-  $("#develop-apply-style").addEventListener("click", confirmRecommendedStyles);
-  $("#style-recommend").addEventListener("click", () => recommendStyles(null, "global"));
-  $("#style-recommend-all").addEventListener("click", recommendStylesForAllGroups);
-  $("#style-library-manage").addEventListener("click", () => {
-    state.styleLibrarySection = "home";
-    $("#style-library-manager-search").value = "";
-    renderStyleLibraryManager();
-    $("#style-library-manager-dialog").showModal();
+  if (globalThis.PhotoReviewViewer) reviewViewer = new PhotoReviewViewer($("#photo-dialog"), {
+    selectPhoto: updatePhotoDialog, ratings: ratingControls, score: photoScoreMarkup,
   });
+  if (globalThis.KeyedReviewGrid) reviewGrid = new KeyedReviewGrid($("#review-groups"));
   $("#model-resource-open").addEventListener("click", () => openModelResources("push"));
   $("#model-setup-open").addEventListener("click", () => openModelResources("push"));
   $("#project-model-setup-open").addEventListener("click", () => openModelResources("push"));
@@ -3585,31 +2531,6 @@ function bindEvents() {
     if (remove) deleteModelResource(remove.dataset.modelDelete);
   });
   $("#model-profile-delete").addEventListener("click", deleteSelectedModelProfile);
-  $$('[data-style-source-open]').forEach((node) => {
-    node.addEventListener("click", () => {
-      state.styleLibrarySection = node.dataset.styleSourceOpen;
-      $("#style-library-manager-search").value = "";
-      $("#style-library-import-status").classList.add("hidden");
-      renderStyleLibraryManager();
-    });
-  });
-  $("#style-library-source-back").addEventListener("click", () => { state.styleLibrarySection = "home"; renderStyleLibraryManager(); });
-  $("#style-library-source-toggle").addEventListener("click", (event) => setStyleSourceEnabled(event.currentTarget.dataset.source, event.currentTarget.dataset.enabled === "true"));
-  $("#style-library-source-rescan").addEventListener("click", () => syncStyleLibrary({}, "Lightroom 预设已重新扫描，AI 索引已更新"));
-  $("#style-library-files").addEventListener("change", renderStyleLibrary);
-  $("#style-library-import").addEventListener("click", importStyleLibraryFiles);
-  $("#style-library-manager-search").addEventListener("input", renderStyleLibraryManager);
-  $("#style-library-manager-list").addEventListener("click", (event) => {
-    const toggle = event.target.closest("[data-style-library-toggle]");
-    if (toggle) {
-      setStyleLibraryItemHidden(toggle.dataset.styleLibraryToggle, toggle.dataset.hidden === "true");
-      return;
-    }
-    const remove = event.target.closest("[data-style-library-delete]");
-    if (remove) {
-      deleteStyleLibraryItem(remove.dataset.styleLibraryDelete);
-    }
-  });
   $("#lightroom-config-form").addEventListener("submit", (event) => {
     event.preventDefault();
     configureLightroom(false);
@@ -3617,29 +2538,9 @@ function bindEvents() {
   $("#lightroom-auto-configure").addEventListener("click", () => configureLightroom(true));
   $("#lightroom-refresh").addEventListener("click", refreshLightroomConnection);
   $("#lightroom-path").addEventListener("input", renderLightroom);
-  $("#style-search-input").addEventListener("input", renderStyleSearch);
-  $("#develop-next").addEventListener("click", () => {
-    const action = state.developStage === "crop"
-      ? advanceFromCrop()
-      : state.developStage === "base"
-        ? goWorkflowStage("style")
-        : loadExport();
-    action.catch((error) => toast(error.message));
-  });
-  $("#develop-skip").addEventListener("click", () => {
-    const action = state.developStage === "crop"
-      ? skipCropDevelop().then(() => goWorkflowStage("base"))
-      : state.developStage === "style"
-        ? setColorMode(state.developPlan?.basic_color?.status === "enabled" ? "auto" : "skip")
-          .then((saved) => saved && loadExport())
-        : Promise.resolve();
-    action.catch((error) => toast(error.message));
-  });
-  $("#export-back").addEventListener("click", () => goWorkflowStage("style").catch((error) => toast(error.message)));
-  $("#export-action").addEventListener("click", executeExport);
-  $("#export-xmp").addEventListener("change", (event) => { state.exportTargets.xmp = event.target.checked; state.exportSpec = null; renderExport(); });
-  $("#export-jpeg").addEventListener("change", (event) => { state.exportTargets.jpeg = event.target.checked; state.exportSpec = null; renderExport(); });
+  $("#export-back").addEventListener("click", () => goWorkflowStage("review").catch(error => toast(error.message)));
   $("#grouping-toggle").addEventListener("click", toggleGrouping);
+  $("#reclassify-run").addEventListener("click", () => reclassifyRun().catch((error) => toast(error.message)));
   $("#batch-select-toggle").addEventListener("click", toggleBatchGrouping);
   $("#selection-all").addEventListener("click", () => {
     state.currentRun?.results.filter((item) => !item.excluded).forEach((item) => state.selectedIndices.add(item.index));
@@ -3658,6 +2559,7 @@ function bindEvents() {
   $("#rollback-submit").addEventListener("click", rollbackXmp);
   $("#delete-project-submit").addEventListener("click", deleteProject);
   document.addEventListener("click", (event) => {
+    if (event.target.closest("[data-open-cull]")) { setView("cull", "cull", "push"); return; }
     const toolboxModule = event.target.closest("[data-toolbox-open]");
     if (toolboxModule) {
       openToolboxSection(toolboxModule.dataset.toolboxOpen, "push");
@@ -3674,85 +2576,6 @@ function bindEvents() {
         : $("#view-export").classList.contains("active") ? "export" : state.developStage;
       if (workflowStep.dataset.workflowStage === activeStage) return;
       goWorkflowStage(workflowStep.dataset.workflowStage).catch((error) => toast(error.message));
-      return;
-    }
-    const colorOption = event.target.closest("[data-color-mode]");
-    if (colorOption) {
-      setColorMode(colorOption.dataset.colorMode);
-      return;
-    }
-    const styleScopeOption = event.target.closest(".style-scope-option");
-    if (styleScopeOption) {
-      setStyleScope(styleScopeOption.dataset.styleScope);
-      return;
-    }
-    const styleTier = event.target.closest("[data-style-tier]");
-    if (styleTier) {
-      const global = styleTier.dataset.styleScope === "global";
-      requestStylePreview(global ? null : Number(styleTier.dataset.styleAmount), {
-        scope: global ? "global" : "group",
-        lutId: styleTier.dataset.lutId || null,
-        lutHash: styleTier.dataset.lutHash || null,
-        presetId: styleTier.dataset.presetId || null,
-        presetHash: styleTier.dataset.presetHash || null,
-        amount: Number(styleTier.dataset.styleTier),
-      });
-      return;
-    }
-    const styleChoice = event.target.closest("[data-style-choice]");
-    if (styleChoice) {
-      const natural = styleChoice.dataset.choiceId === "natural";
-      if (styleChoice.disabled || (!natural && styleChoice.dataset.previewReady !== "true")) return;
-      if (natural && currentColorMode(state.developPlan) !== "style") return;
-      const changes = {
-        amount: natural ? 0 : Number(styleChoice.dataset.styleChoiceAmount || 100),
-        status: natural ? "skipped" : "confirmed",
-      };
-      if (natural) {
-        changes.lut_id = null;
-        changes.lut_hash = null;
-        changes.preset_id = null;
-        changes.preset_hash = null;
-      } else if (styleChoice.dataset.lutId) {
-        changes.lut_id = styleChoice.dataset.lutId;
-        changes.lut_hash = styleChoice.dataset.lutHash || null;
-        changes.preset_id = null;
-        changes.preset_hash = null;
-        changes.strength = changes.amount;
-      } else {
-        changes.lut_id = null;
-        changes.lut_hash = null;
-        changes.preset_id = styleChoice.dataset.presetId;
-        changes.preset_hash = styleChoice.dataset.presetHash || null;
-      }
-      if (styleChoice.dataset.styleScope === "global" && !natural) {
-        requestStylePreview(null, {
-          scope: "global",
-          lutId: changes.lut_id || null,
-          lutHash: changes.lut_hash || null,
-          presetId: changes.preset_id || null,
-          presetHash: changes.preset_hash || null,
-          amount: changes.amount,
-        });
-      } else if (styleChoice.dataset.styleScope === "global") updateStyleGlobal(changes);
-      else updateStyleGroup(Number(styleChoice.dataset.groupId), changes);
-      return;
-    }
-    const styleRecommendGroup = event.target.closest("[data-style-recommend-group]");
-    if (styleRecommendGroup) { recommendStyles(Number(styleRecommendGroup.dataset.styleRecommendGroup), "group"); return; }
-    const styleSearchGroup = event.target.closest("[data-style-search-group]");
-    if (styleSearchGroup) { openStyleSearch(Number(styleSearchGroup.dataset.styleSearchGroup)); return; }
-    const styleSearchSelect = event.target.closest("[data-style-search-select]");
-    if (styleSearchSelect) {
-      if (state.styleSearchGroupId == null) return toast("请先从具体照片组打开预设搜索。 ");
-      requestStylePreview(state.styleSearchGroupId, {
-        lutId: styleSearchSelect.dataset.lutId || null,
-        lutHash: styleSearchSelect.dataset.lutHash || null,
-        presetId: styleSearchSelect.dataset.presetId || null,
-        presetHash: styleSearchSelect.dataset.presetHash || null,
-        amount: 100,
-        scope: "group",
-      }).then((started) => { if (started) $("#style-search-dialog").close(); });
       return;
     }
     const selectInput = event.target.closest("[data-select-index]");
@@ -3796,15 +2619,12 @@ function bindEvents() {
     const restoreButton = event.target.closest("[data-restore-index]");
     if (restoreButton) updateExcluded([Number(restoreButton.dataset.restoreIndex)], false);
     const restoreAllButton = event.target.closest("[data-restore-all]");
-    if (restoreAllButton) updateExcluded(state.currentRun?.results.filter((item) => item.excluded && !item.deleted).map((item) => item.index) || [], false);
+    if (restoreAllButton) updateExcluded(state.currentRun?.results.filter((item) => item.excluded && !item.deleted && !item.read_error).map((item) => item.index) || [], false);
     const rollbackButton = event.target.closest(".rollback-open");
     if (rollbackButton) { state.rollbackId = rollbackButton.dataset.transactionId; $("#rollback-dialog").showModal(); }
     const closeButton = event.target.closest("[data-close-dialog]");
     if (closeButton) { event.preventDefault(); $(`#${closeButton.dataset.closeDialog}`).close(); }
-    const cropChoice = event.target.closest("[data-develop-crop-choice]");
-    if (cropChoice && cropChoice.dataset.cropId) {
-      updateDevelop(Number(cropChoice.dataset.developCropChoice), { crop_id: cropChoice.dataset.cropId, confirmed: true });
-    }
+
   });
   $$(".filter").forEach((node) => node.addEventListener("click", () => {
     state.filter = node.dataset.filter;
@@ -3818,11 +2638,14 @@ function bindEvents() {
       return;
     }
     if (!$("#photo-dialog").open || state.dialogIndex == null || ["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement.tagName)) return;
-    const items = state.currentRun.results;
-    const position = items.findIndex((item) => item.index === state.dialogIndex);
-    if (event.key === "ArrowRight" && position < items.length - 1) updatePhotoDialog(items[position + 1].index);
-    if (event.key === "ArrowLeft" && position > 0) updatePhotoDialog(items[position - 1].index);
-    if (["0", "3", "4", "5"].includes(event.key)) setRating(state.dialogIndex, event.key);
+    if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
+      event.preventDefault();
+      navigatePhotoGroup(event.key === "ArrowRight" ? 1 : -1);
+    }
+    if (!event.repeat && !event.ctrlKey && !event.metaKey && !event.altKey && ["0", "3", "4", "5"].includes(event.key)) {
+      event.preventDefault();
+      setRating(state.dialogIndex, event.key);
+    }
   });
   window.addEventListener("hashchange", () => routeFromHash().catch((error) => toast(error.message)));
 }
@@ -3839,3 +2662,20 @@ document.addEventListener("DOMContentLoaded", async () => {
     $("#alert-bar").classList.remove("hidden");
   }
 });
+
+function renderWorkflow(activeStage) {
+  $$(".workflow-step").forEach(node => {
+    const stage = node.dataset.workflowStage;
+    node.disabled = stage === "export" && !state.currentRun?.xmp_ready;
+    node.classList.toggle("active", stage === activeStage);
+    node.classList.toggle("completed", stage === "review" && activeStage === "export");
+    node.setAttribute("aria-current", stage === activeStage ? "step" : "false");
+  });
+}
+function renderExport() {
+  if (!state.currentRun) return;
+  $("#export-title").textContent = "导出选择";
+  $("#export-summary").textContent = `${state.currentRun.candidate_count || 0} 张候选 · 星级与选择记录`;
+  PhotoSelectionOutput.render(state.currentRun, state.selectionExport);
+  renderWorkflow("export");
+}
