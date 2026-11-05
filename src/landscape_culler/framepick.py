@@ -27,7 +27,7 @@ class FramePickLauncher:
 
     def status(self) -> dict:
         executable = self.executable()
-        return {"available": os.name == "nt" and executable.is_file(), "version": "1.2.0",
+        return {"available": os.name == "nt" and executable.is_file(), "version": "1.3.0",
                 "project_directory": str(self.storage / "projects"), "storage_root": str(self.storage)}
 
     def launch_spec(self) -> dict:

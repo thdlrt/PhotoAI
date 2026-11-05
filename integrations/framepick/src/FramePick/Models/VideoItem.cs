@@ -33,7 +33,18 @@ public sealed class VideoItem : ObservableObject
     public VideoDescriptor Descriptor { get; }
     public string FullPath => Descriptor.FullPath;
     public string Title => Path.GetFileNameWithoutExtension(FullPath);
-    public string PreviewPath { get; }
+    public string PreviewPath { get; private set; }
+
+    public void ChangePreviewPath(string path)
+    {
+        if (PreviewPath == path) return;
+        PreviewPath = path;
+        PreviewImage = null;
+        DetailImage = null;
+        Error = string.Empty;
+        PreviewState = PreviewState.Waiting;
+        OnPropertyChanged(nameof(PreviewPath));
+    }
 
     public string CategoryId
     {

@@ -37,7 +37,7 @@ internal static class Program
         {
             var uiOutput = Path.Combine(TestRoot, "ui-" + DateTime.UtcNow.Ticks);
             File.WriteAllText(Path.Combine(testBase, "latest-ui.txt"), uiOutput);
-            UiSmoke.Run(Path.Combine(TestRoot, "input"), uiOutput, args.Contains("--inspect"));
+            UiSmoke.Run(Path.Combine(TestRoot, "input"), uiOutput, args.Contains("--inspect"), args.Contains("--headless-ui"));
             return Environment.ExitCode;
         }
         return RunAsync(args).GetAwaiter().GetResult();
@@ -53,6 +53,7 @@ internal static class Program
             var videos = await CreateVideosAsync();
             await TestScannerAsync(videos);
             await TestPreviewsAsync(videos);
+            await TestPreviewOptionsAsync(videos[0]);
             await TestBatchExecutorAsync();
             await TestCancelledBatchAsync();
             await TestInvalidPreviewAsync(videos[0]);
@@ -146,6 +147,35 @@ internal static class Program
             Assert(cached.Success && cached.FrameCount == 16, "缓存复用");
             Console.WriteLine($"预览 {Path.GetFileName(video.FullPath)}: {watch.Elapsed.TotalSeconds:F2}s -> {output}");
         }
+    }
+
+    private static async Task TestPreviewOptionsAsync(VideoDescriptor video)
+    {
+        var generator = new PreviewGenerator();
+        var path = Path.Combine(TestRoot, "previews", "25-frames.jpg");
+        var result = await generator.GenerateAsync(video, path, frameCount: 25);
+        Assert(result.Success && result.FrameCount == 25, $"生成25帧：{result.Error}");
+        using (var stream = File.OpenRead(path))
+        {
+            var bitmap = BitmapFrame.Create(stream, BitmapCreateOptions.None, BitmapCacheOption.OnLoad);
+            Assert(bitmap.PixelWidth == 1600 && bitmap.PixelHeight == 1000, "25帧使用5×5网格");
+        }
+        var sentinel = new DateTime(2001, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        File.SetLastWriteTimeUtc(path, sentinel);
+        result = await generator.GenerateAsync(video, path, frameCount: 25);
+        Assert(result.Success && File.GetLastWriteTimeUtc(path) == sentinel, "只补充复用有效25帧缓存");
+        result = await generator.GenerateAsync(video, path, frameCount: 25, forceRegenerate: true);
+        Assert(result.Success && File.GetLastWriteTimeUtc(path) > sentinel, "全部重新生成替换有效缓存");
+        var bytes = File.ReadAllBytes(path);
+        using var cancel = new CancellationTokenSource();
+        cancel.Cancel();
+        await AssertThrows<OperationCanceledException>(() => generator.GenerateAsync(video, path, cancel.Token, 25, true), "强制生成支持取消");
+        Assert(File.ReadAllBytes(path).SequenceEqual(bytes), "取消强制生成保留原有效缓存");
+        result = await generator.GenerateAsync(video, path, frameCount: 16);
+        Assert(result.Success && result.FrameCount == 16, "网格尺寸不匹配时不复用缓存");
+        await AssertThrows<ArgumentOutOfRangeException>(() => generator.GenerateAsync(video, path, frameCount: 17), "拒绝不支持的帧数");
+        Assert(StateStore.PreviewPathFor(video.FullPath, video.Length, video.LastWriteTimeUtc) == StateStore.PreviewPathFor(video.FullPath, video.Length, video.LastWriteTimeUtc, 16)
+            && StateStore.PreviewPathFor(video.FullPath, video.Length, video.LastWriteTimeUtc, 16) != StateStore.PreviewPathFor(video.FullPath, video.Length, video.LastWriteTimeUtc, 25), "16帧沿用旧缓存且与25帧隔离");
     }
 
     private static async Task TestBatchExecutorAsync()
@@ -258,6 +288,14 @@ internal static class Program
         var second = Path.Combine(root, "two.framepick");
         ProjectStore.Save(second, new FramePickProject { Name = "项目二" }, createNew: true);
         Assert(ProjectStore.Load(second).Categories.Count == 0 && ProjectStore.Load(path).Categories.Count == 1, "项目分类独立保存");
+        loaded.Name = "项目新名称";
+        loaded.PreviewFrameCount = 25;
+        ProjectStore.Save(path, loaded);
+        Assert(ProjectStore.Load(path).Name == "项目新名称" && ProjectStore.Load(path).PreviewFrameCount == 25, "项目名称与帧数保存后恢复");
+        var legacy = Path.Combine(root, "legacy.framepick");
+        await File.WriteAllTextAsync(legacy, "{\"Format\":\"FramePick.Project\",\"Version\":1,\"Id\":\"legacy\",\"Name\":\"旧项目\"}");
+        var legacyBytes = File.ReadAllBytes(legacy);
+        Assert(ProjectStore.Load(legacy).PreviewFrameCount == 16 && File.ReadAllBytes(legacy).SequenceEqual(legacyBytes), "旧项目默认16帧且读取不重写原文件");
         var invalid = Path.Combine(root, "invalid.framepick");
         await File.WriteAllTextAsync(invalid, "{\"Name\":\"not a project\"}");
         await AssertThrows<InvalidDataException>(() => Task.Run(() => ProjectStore.Load(invalid)), "拒绝伪项目格式");

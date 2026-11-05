@@ -11,6 +11,7 @@ public sealed class FramePickProject
     public List<string> SourceFolders { get; set; } = new();
     public List<CategoryDefinition> Categories { get; set; } = new();
     public int PreviewConcurrency { get; set; } = 2;
+    public int PreviewFrameCount { get; set; } = 16;
     public List<VideoDecision> Decisions { get; set; } = new();
 }
 

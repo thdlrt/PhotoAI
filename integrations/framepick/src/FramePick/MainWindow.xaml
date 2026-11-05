@@ -54,7 +54,7 @@
      <Border Background="#11171E" CornerRadius="8" Padding="13" Margin="0,12,0,14">
       <StackPanel><TextBlock Text="{Binding TotalCount, StringFormat='共 {0} 个视频'}" FontWeight="SemiBold"/><TextBlock Text="{Binding UndecidedCount, StringFormat='{}{0} 项尚未分类'}" Foreground="{StaticResource MutedBrush}" FontSize="11" Margin="0,7,0,0"/></StackPanel>
      </Border>
-     <Button Style="{StaticResource SecondaryButton}" Click="Categories_Click" Content="项目分类与设置" IsEnabled="{Binding CanManageCategories}"/>
+     <Button Style="{StaticResource SecondaryButton}" Click="Categories_Click" Content="项目设置" IsEnabled="{Binding CanManageCategories}"/>
      <Button Click="ImportLegacy_Click" Content="导入旧版分类与进度" FontSize="10" Margin="0,5,0,0" Foreground="{StaticResource MutedBrush}" Visibility="{Binding HasLegacySettings, Converter={StaticResource BoolToVisibility}}"/>
     </StackPanel>
    </Grid>
@@ -69,7 +69,12 @@
     </StackPanel>
     <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
      <Border Background="{StaticResource CardBrush}" CornerRadius="6" Padding="10,5" Margin="0,0,10,0"><TextBlock Text="{Binding CountText}" Foreground="{StaticResource AccentBrush}" VerticalAlignment="Center"/></Border>
-     <Button Style="{StaticResource SecondaryButton}" Click="Retry_Click" Content="继续 / 重试预览" IsEnabled="{Binding CanGeneratePreviews}" ToolTip="生成未完成或失败的预览，保留已完成的预览"/>
+     <Button x:Name="RegenerateButton" Style="{StaticResource SecondaryButton}" Click="Regenerate_Click" Content="重新生成 ▾" IsEnabled="{Binding CanGeneratePreviews}">
+      <Button.ContextMenu><ContextMenu x:Name="RegenerateMenu" Placement="Bottom" Background="{StaticResource PanelBrush}" Foreground="{StaticResource TextBrush}" BorderBrush="{StaticResource BorderBrush}">
+       <MenuItem x:Name="RegenerateAllOption" Header="全部重新生成" Tag="all" Click="RegenerateOption_Click" ToolTip="扫描全部项目文件夹，并重新生成所有视频预览"/>
+       <MenuItem x:Name="RegenerateMissingOption" Header="只补充" Tag="missing" Click="RegenerateOption_Click" ToolTip="扫描最新文件，复用有效预览，补齐新增、变更或失败项"/>
+      </ContextMenu></Button.ContextMenu>
+     </Button>
     </StackPanel>
    </Grid>
    <Grid Grid.Row="1" Margin="26,0,26,15">
@@ -120,7 +125,7 @@
             <Image.Style><Style TargetType="Image"><Style.Triggers><DataTrigger Binding="{Binding IsMarkedForDeletion}" Value="True"><Setter Property="Opacity" Value="0.35"/></DataTrigger></Style.Triggers></Style></Image.Style>
            </Image>
            <Border Background="#F0101820" Visibility="{Binding IsPreviewLoading, Converter={StaticResource BoolToVisibility}}">
-            <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center"><TextBlock Text="正在生成 16 帧预览" FontSize="12" Foreground="{StaticResource AccentBrush}"/><ProgressBar IsIndeterminate="True" Width="110" Margin="0,13,0,0"/></StackPanel>
+            <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center"><TextBlock Text="{Binding DataContext.PreviewLoadingText, RelativeSource={RelativeSource AncestorType=Window}}" FontSize="12" Foreground="{StaticResource AccentBrush}"/><ProgressBar IsIndeterminate="True" Width="110" Margin="0,13,0,0"/></StackPanel>
            </Border>
            <Border Background="#F0281D24" Visibility="{Binding HasPreviewError, Converter={StaticResource BoolToVisibility}}" Padding="18">
             <StackPanel VerticalAlignment="Center"><TextBlock Text="预览失败" FontWeight="SemiBold" Foreground="{StaticResource DangerBrush}" HorizontalAlignment="Center"/><TextBlock Text="{Binding Error}" TextWrapping="Wrap" MaxHeight="90" FontSize="11" Margin="0,9,0,0" Foreground="{StaticResource MutedBrush}" ToolTip="{Binding Error}"/></StackPanel>

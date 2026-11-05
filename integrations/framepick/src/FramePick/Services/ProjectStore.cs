@@ -56,6 +56,8 @@ public static class ProjectStore
             throw new InvalidDataException("项目分类无效或标识重复。");
         foreach (var category in project.Categories) category.Destination = NormalizeFolder(category.Destination);
         project.PreviewConcurrency = Math.Clamp(project.PreviewConcurrency, 1, 4);
+        if (project.PreviewFrameCount is not (16 or 25))
+            throw new InvalidDataException("预览帧数仅支持 16 或 25。");
         project.Decisions = (project.Decisions ?? new()).Where(d => d is not null && !string.IsNullOrWhiteSpace(d.Path))
             .GroupBy(d => d.Path, StringComparer.OrdinalIgnoreCase).Select(g => g.Last()).ToList();
     }

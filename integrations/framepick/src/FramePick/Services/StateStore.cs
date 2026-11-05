@@ -74,9 +74,11 @@ public static class StateStore
         lock (Sync) WriteJson(WorkspacePath(sourceFolder), state);
     }
 
-    public static string PreviewPathFor(string fullPath, long length, DateTime lastWriteUtc)
+    public static string PreviewPathFor(string fullPath, long length, DateTime lastWriteUtc, int frameCount = 16)
     {
         var identity = $"{fullPath}|{length}|{lastWriteUtc.Ticks}";
+        if (frameCount is not (16 or 25)) throw new ArgumentOutOfRangeException(nameof(frameCount));
+        if (frameCount != 16) identity += $"|frames={frameCount}";
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity))).ToLowerInvariant();
         return Path.Combine(CacheDirectory, hash[..2], hash + ".jpg");
     }

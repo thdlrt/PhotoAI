@@ -80,10 +80,10 @@ public partial class MainWindow : Window
     private void Categories_Click(object sender, RoutedEventArgs e)
     {
         if (!_viewModel.CanManageCategories) return;
-        var dialog = new CategoryManagerWindow(_viewModel.Categories, _viewModel.PreviewConcurrency) { Owner = this };
+        var dialog = new CategoryManagerWindow(_viewModel.Categories, _viewModel.PreviewConcurrency, _viewModel.ProjectName, _viewModel.PreviewFrameCount) { Owner = this };
         if (dialog.ShowDialog() == true)
         {
-            try { _viewModel.ApplyCategories(dialog.CategoriesResult, dialog.PreviewConcurrency); }
+            try { _viewModel.ApplyProjectSettings(dialog.ProjectName, dialog.CategoriesResult, dialog.PreviewConcurrency, dialog.PreviewFrameCount); }
             catch (Exception ex) { MessageBox.Show(this, ex.Message, "设置保存失败", MessageBoxButton.OK, MessageBoxImage.Error); }
         }
     }
@@ -115,9 +115,17 @@ public partial class MainWindow : Window
 
     private void Cancel_Click(object sender, RoutedEventArgs e) => _viewModel.Cancel();
 
-    private async void Retry_Click(object sender, RoutedEventArgs e)
+    private void Regenerate_Click(object sender, RoutedEventArgs e)
     {
-        try { await _viewModel.RetryPreviewsAsync(); }
+        if (!_viewModel.CanGeneratePreviews || sender is not Button button) return;
+        button.ContextMenu!.PlacementTarget = button;
+        button.ContextMenu.IsOpen = true;
+    }
+
+    private async void RegenerateOption_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not MenuItem option || !_viewModel.CanGeneratePreviews) return;
+        try { await _viewModel.RegeneratePreviewsAsync((string?)option.Tag == "all"); }
         catch (Exception ex) { MessageBox.Show(this, ex.Message, "预览失败", MessageBoxButton.OK, MessageBoxImage.Error); }
     }
 

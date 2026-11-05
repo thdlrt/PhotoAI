@@ -13,14 +13,17 @@ namespace FramePick.Tests;
 internal static class UiSmoke
 {
     private static int _checks;
-    public static void Run(string sourceFolder, string outputDirectory, bool inspect = false)
+    private static bool _headless;
+    public static void Run(string sourceFolder, string outputDirectory, bool inspect = false, bool headless = false)
     {
+        _headless = headless;
         Directory.CreateDirectory(outputDirectory);
         RenderOptions.ProcessRenderMode = RenderMode.SoftwareOnly;
         var app = new FramePick.App();
         app.InitializeComponent();
         app.Properties["UiSmoke"] = true;
         var window = new FramePick.MainWindow { ShowActivated = false };
+        if (headless) { window.WindowStartupLocation = WindowStartupLocation.Manual; window.Left = -10000; window.Top = -10000; }
         window.Loaded += async (_, _) =>
         {
             try
@@ -134,6 +137,7 @@ internal static class UiSmoke
                 await Task.Delay(100);
                 Capture(window, Path.Combine(outputDirectory, "ui-gallery-full.png"));
                 Check(ProjectStore.Load(projectA).SourceFolders.Count == 3, "项目记录所有逐次导入的文件夹");
+                await TestRegenerationAsync(window, vm, template, outputDirectory);
                 if (!inspect) window.Close();
                 File.WriteAllText(Path.Combine(outputDirectory, "result.txt"), $"UI PASS: {_checks} 项检查");
                 Console.WriteLine($"UI PASS: {_checks} 项检查");
@@ -150,7 +154,7 @@ internal static class UiSmoke
 
     private static async Task TestCategoryDialogAsync(Window owner, MainViewModel vm, string output)
     {
-        var dialog = new FramePick.CategoryManagerWindow(vm.Categories, vm.PreviewConcurrency) { Owner = owner, ShowActivated = false };
+        var dialog = new FramePick.CategoryManagerWindow(vm.Categories, vm.PreviewConcurrency, vm.ProjectName, vm.PreviewFrameCount) { Owner = owner, ShowActivated = false };
         dialog.Loaded += async (_, _) =>
         {
             try
@@ -159,14 +163,23 @@ internal static class UiSmoke
                 for (var i = 0; i < 12; i++) add.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
                 await Task.Delay(120);
                 dialog.UpdateLayout();
-                Check(ReadableTitle(dialog, "管理你的分类"), "分类窗口标题具有可读的浅色前景");
+                Check(ReadableTitle(dialog, "项目设置"), "项目设置标题具有可读的浅色前景");
                 var categories = dialog.CategoriesResult.ToList();
                 Check(categories.Count == 14, "连续添加12个分类无异常");
                 var inputs = Descendants<TextBox>(dialog).ToList();
-                Check(inputs.Count == 28, "所有分类编辑控件均能创建");
+                Check(inputs.Count == 29, "所有项目与分类编辑控件均能创建");
+                var name = (TextBox)dialog.FindName("ProjectNameInput");
+                name.Text = "   ";
+                var save = (Button)dialog.FindName("SaveCategoriesButton");
+                save.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+                Check(((TextBlock)dialog.FindName("ValidationMessage")).Text == "请输入项目名称。", "项目空名称使用内联提示");
+                name.Text = "旅行整理·改名";
+                var frameCount = (ComboBox)dialog.FindName("PreviewFrameCountInput");
+                frameCount.SelectedValue = 25;
+                Check(dialog.PreviewFrameCount == 25, "项目设置可选择25帧");
+                frameCount.SelectedValue = 16;
                 categories[2].Name = "旅行 片段";
                 categories[2].Destination = Path.Combine(output, "travel");
-                var save = (Button)dialog.FindName("SaveCategoriesButton");
                 categories[3].Name = "缺少地址";
                 save.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
                 Check(((TextBlock)dialog.FindName("ValidationMessage")).Text.Length > 0, "缺失路径使用内联提示");
@@ -177,12 +190,97 @@ internal static class UiSmoke
             catch { dialog.Close(); throw; }
         };
         Check(dialog.ShowDialog() == true, "分类可以保存并关闭");
-        vm.ApplyCategories(dialog.CategoriesResult, dialog.PreviewConcurrency);
-        var reopened = new FramePick.CategoryManagerWindow(vm.Categories, vm.PreviewConcurrency) { Owner = owner };
+        vm.ApplyProjectSettings(dialog.ProjectName, dialog.CategoriesResult, dialog.PreviewConcurrency, dialog.PreviewFrameCount);
+        Check(vm.ProjectName == "旅行整理·改名" && owner.Title.Contains(vm.ProjectName) && ProjectStore.Load(vm.ProjectFilePath).Name == vm.ProjectName, "修改名称同步窗口标题和项目文件");
+        var reopened = new FramePick.CategoryManagerWindow(vm.Categories, vm.PreviewConcurrency, vm.ProjectName, vm.PreviewFrameCount) { Owner = owner };
         reopened.Show();
         await Task.Delay(80);
         Check(reopened.CategoriesResult.Count() == 4, "保存后重新打开分类数量正确");
         reopened.Close();
+    }
+
+    private static async Task TestRegenerationAsync(FramePick.MainWindow window, MainViewModel vm, string template, string output)
+    {
+        var root = Path.Combine(output, "refresh-input");
+        Directory.CreateDirectory(root);
+        var keep = Path.Combine(root, "keep.mp4");
+        var removed = Path.Combine(root, "removed.mp4");
+        var changed = Path.Combine(root, "changed.mp4");
+        foreach (var path in new[] { keep, removed, changed }) File.Copy(template, path);
+        var projectPath = Path.Combine(output, "refresh.framepick");
+        vm.CreateProject(projectPath);
+        await vm.ImportFolderAsync(root);
+        Check(vm.CanGeneratePreviews && vm.VisibleVideos.All(v => v.HasPreview), "所有预览就绪仍可重新扫描生成");
+        var category = new CategoryDefinition { Name = "保留分类", Destination = Path.Combine(output, "kept") };
+        vm.ApplyCategories(new[] { category }, 2);
+        vm.VisibleVideos.Single(v => v.FullPath == keep).CategoryId = category.Id;
+        vm.VisibleVideos.Single(v => v.FullPath == changed).IsMarkedForDeletion = true;
+        vm.FlushWorkspace(true);
+        var oldBytes = File.ReadAllBytes(projectPath);
+        await vm.OpenProjectAsync(projectPath);
+        vm.FlushWorkspace(true);
+        Check(File.ReadAllBytes(projectPath).SequenceEqual(oldBytes), "打开未修改的旧项目不重写文件");
+        var cachePath = vm.VisibleVideos.Single(v => v.FullPath == keep).PreviewPath;
+        var sentinel = new DateTime(2001, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        File.SetLastWriteTimeUtc(cachePath, sentinel);
+        File.Delete(removed);
+        File.Move(changed, Path.Combine(root, "renamed.mp4"));
+        var added = Path.Combine(root, "new.mp4");
+        File.Copy(template, added);
+        await RunRegenerateMenuAsync(window, vm, false);
+        Check(vm.TotalCount == 3 && vm.VisibleVideos.Any(v => v.FullPath == added) && vm.VisibleVideos.All(v => v.FullPath != removed && v.FullPath != changed), "只补充扫描新增、删除和重命名文件");
+        Check(File.GetLastWriteTimeUtc(cachePath) == sentinel && vm.MoveCount == 1, "只补充保留已有缓存与分类");
+        var current = vm.VisibleVideos.Single(v => v.FullPath == keep);
+        File.SetLastWriteTimeUtc(keep, File.GetLastWriteTimeUtc(keep).AddMinutes(1));
+        await vm.RegeneratePreviewsAsync(false);
+        Check(vm.VisibleVideos.Single(v => v.FullPath == keep).PreviewPath != current.PreviewPath && vm.MoveCount == 0, "源文件变更刷新缓存且不沿用旧文件决定");
+        vm.VisibleVideos.Single(v => v.FullPath == added).CategoryId = category.Id;
+        vm.VisibleVideos.Single(v => v.FullPath.EndsWith("renamed.mp4")).IsMarkedForDeletion = true;
+        var framePaths = vm.VisibleVideos.Select(v => v.PreviewPath).ToList();
+        foreach (var path in framePaths) File.SetLastWriteTimeUtc(path, sentinel);
+        File.Copy(template, Path.Combine(root, "all-new.mp4"));
+        await RunRegenerateMenuAsync(window, vm, true);
+        Check(vm.TotalCount == 4 && framePaths.All(p => File.GetLastWriteTimeUtc(p) > sentinel), "全部重新生成同时扫描并重做有效缓存");
+        Check(vm.MoveCount == 1 && vm.DeleteCount == 1, "全部重新生成保留分类与删除决定");
+        vm.ApplyProjectSettings("25帧项目", vm.Categories, 2, 25);
+        Check(vm.VisibleVideos.All(v => !v.HasPreview) && vm.PreviewFrameCount == 25 && vm.MoveCount == 1 && vm.DeleteCount == 1, "修改帧数清除旧图且保留整理决定");
+        await RunRegenerateMenuAsync(window, vm, false);
+        using (var stream = File.OpenRead(vm.VisibleVideos.First().PreviewPath))
+        {
+            var bitmap = BitmapFrame.Create(stream, BitmapCreateOptions.None, BitmapCacheOption.OnLoad);
+            Check(bitmap.PixelWidth == 1600 && bitmap.PixelHeight == 1000, "通过重新生成菜单得到实际25帧拼图");
+        }
+        Capture(window, Path.Combine(output, "ui-gallery-25.png"));
+        vm.CreateProject(Path.Combine(output, "refresh-other.framepick"));
+        await vm.OpenProjectAsync(projectPath);
+        Check(vm.ProjectName == "25帧项目" && vm.PreviewFrameCount == 25 && vm.MoveCount == 1 && vm.DeleteCount == 1, "重开项目恢复名称帧数与决定");
+        vm.CreateProject(Path.Combine(output, "legacy-open.framepick"));
+        var legacyPath = Path.Combine(output, "legacy-framecount.framepick");
+        File.WriteAllText(legacyPath, "{\"Format\":\"FramePick.Project\",\"Version\":1,\"Id\":\"old\",\"Name\":\"旧项目\"}");
+        var legacyBytes = File.ReadAllBytes(legacyPath);
+        await vm.OpenProjectAsync(legacyPath);
+        vm.FlushWorkspace(true);
+        Check(vm.PreviewFrameCount == 16 && File.ReadAllBytes(legacyPath).SequenceEqual(legacyBytes), "缺少帧数字段的旧项目打开保持原文件");
+        await vm.ImportFolderAsync(Path.Combine(output, "refresh-input"));
+        foreach (var file in Directory.GetFiles(root)) File.Delete(file);
+        await vm.RegeneratePreviewsAsync(false);
+        Check(vm.TotalCount == 0 && vm.CanGeneratePreviews, "文件夹变空后仍可扫描后续新增文件");
+        File.Copy(template, Path.Combine(root, "returned.mp4"));
+        await RunRegenerateMenuAsync(window, vm, false);
+        Check(vm.TotalCount == 1 && vm.VisibleVideos[0].HasPreview, "空项目可用只补充找回新文件");
+    }
+
+    private static async Task RunRegenerateMenuAsync(FramePick.MainWindow window, MainViewModel vm, bool all)
+    {
+        var button = (Button)window.FindName("RegenerateButton");
+        button.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+        Check(button.ContextMenu!.IsOpen && button.ContextMenu.Items.Count == 2, "点击重新生成显示两种选项");
+        await Task.Delay(40);
+        var option = button.ContextMenu.Items.OfType<MenuItem>().Single(i => (string)i.Tag == (all ? "all" : "missing"));
+        option.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
+        button.ContextMenu.IsOpen = false;
+        for (var i = 0; vm.IsBusy && i < 6000; i++) await Task.Delay(20);
+        Check(!vm.IsBusy && vm.VisibleVideos.All(v => v.HasPreview), "菜单操作完成并生成有效预览");
     }
 
     private static IEnumerable<T> Descendants<T>(DependencyObject root) where T : DependencyObject
@@ -210,6 +308,7 @@ internal static class UiSmoke
 
     private static void Capture(Window window, string path)
     {
+        if (_headless) return; // 离屏窗口不产生可用画面；无桌面模式只检查真实控件与流程。
         window.UpdateLayout();
         var width = (int)Math.Ceiling(window.ActualWidth);
         var height = (int)Math.Ceiling(window.ActualHeight);

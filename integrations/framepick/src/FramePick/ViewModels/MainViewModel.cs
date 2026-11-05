@@ -39,6 +39,8 @@ public sealed class MainViewModel : ObservableObject
     private int _pageIndex;
     private bool _restoring;
     private bool _refreshQueued;
+    private bool _forceRegenerating;
+    private bool _workspaceDirty;
     private string _searchText = string.Empty;
     private string _selectedSort = "名称 A → Z";
     private string _statusText = "创建或打开项目，开始整理";
@@ -80,7 +82,7 @@ public sealed class MainViewModel : ObservableObject
     public bool HasProject => _project is not null;
     public bool CanImport => HasProject && !IsBusy;
     public bool CanChangeProject => !IsBusy;
-    public bool CanManageCategories => HasProject && !IsExecuting;
+    public bool CanManageCategories => HasProject && !IsBusy;
     public bool HasLegacySettings => HasProject && _settings.Categories.Count > 0 && !IsBusy;
     public string ProjectName => _project?.Name ?? "尚未打开项目";
     public string ProjectFilePath => _projectFilePath;
@@ -117,7 +119,8 @@ public sealed class MainViewModel : ObservableObject
     public int UndecidedCount => _allVideos.Count(v => !v.HasDecision);
     public int PreviewFailedCount => _allVideos.Count(v => v.HasPreviewError);
     public bool HasPreviewFailures => PreviewFailedCount > 0;
-    public bool CanGeneratePreviews => !IsBusy && _allVideos.Any(v => v.PreviewState != PreviewState.Ready);
+    public bool CanGeneratePreviews => !IsBusy && HasProject && ImportedFolders.Count > 0;
+    public string PreviewLoadingText => $"正在生成 {PreviewFrameCount} 帧预览";
     public string DecisionSummary => $"待移动 {MoveCount} 项   ·   待删除 {DeleteCount} 项";
     public string DetailPosition => SelectedVideo is null ? "" : $"{_detailVideos.IndexOf(SelectedVideo) + 1} / {_detailVideos.Count}";
     public string InitialFolder => ImportedFolders.LastOrDefault(f => Directory.Exists(f.FullPath))?.FullPath ?? (HasProject ? Path.GetDirectoryName(ProjectFilePath)! : string.Empty);
@@ -230,6 +233,7 @@ public sealed class MainViewModel : ObservableObject
     public string PageText => $"{Math.Min(PageIndex + 1, PageCount)} / {PageCount}";
     public bool HasMultiplePages => PageCount > 1;
     public int PreviewConcurrency => Math.Clamp(_project?.PreviewConcurrency ?? 2, 1, 4);
+    public int PreviewFrameCount => _project?.PreviewFrameCount ?? 16;
 
     public int PageIndex
     {
@@ -270,6 +274,7 @@ public sealed class MainViewModel : ObservableObject
         CloseDetail();
         ClearVideos();
         _project = project;
+        _workspaceDirty = false;
         _projectFilePath = Path.GetFullPath(path);
         _restoring = true;
         Categories.Clear();
@@ -301,6 +306,7 @@ public sealed class MainViewModel : ObservableObject
         if (!_project!.SourceFolders.Contains(normalized, StringComparer.OrdinalIgnoreCase))
         {
             _project.SourceFolders.Add(normalized);
+            _workspaceDirty = true;
             try { FlushWorkspace(throwOnError: true); }
             catch { _project.SourceFolders.Remove(normalized); throw; }
             ImportedFolders.Add(new SourceFolderItem(normalized));
@@ -326,10 +332,11 @@ public sealed class MainViewModel : ObservableObject
         await RefreshProjectVideosAsync();
     }
 
-    private async Task RefreshProjectVideosAsync()
+    private async Task RefreshProjectVideosAsync(bool forceRegenerate = false)
     {
         if (_project is null || IsBusy) return;
         CloseDetail();
+        _forceRegenerating = forceRegenerate;
 
         IsBusy = true;
         IsProgressIndeterminate = true;
@@ -361,7 +368,7 @@ public sealed class MainViewModel : ObservableObject
             _restoring = true;
             foreach (var descriptor in discovered.Values.OrderBy(d => d.FullPath, StringComparer.CurrentCultureIgnoreCase))
             {
-                var item = new VideoItem(descriptor, StateStore.PreviewPathFor(descriptor.FullPath, descriptor.Length, descriptor.LastWriteTimeUtc));
+                var item = new VideoItem(descriptor, StateStore.PreviewPathFor(descriptor.FullPath, descriptor.Length, descriptor.LastWriteTimeUtc, PreviewFrameCount));
                 if (decisions.TryGetValue(item.FullPath, out var decision)
                     && (decision.Length is null || decision.Length == descriptor.Length)
                     && (decision.LastWriteTimeUtc is null || decision.LastWriteTimeUtc == descriptor.LastWriteTimeUtc))
@@ -377,8 +384,7 @@ public sealed class MainViewModel : ObservableObject
             PageIndex = 0;
             RefreshDecisionProperties();
             RefreshView();
-            SaveWorkspace();
-            await GeneratePreviewsAsync(token);
+            await GeneratePreviewsAsync(token, forceRegenerate);
             StatusText = $"已载入 {TotalCount} 个视频" + (PreviewFailedCount > 0 ? $"，{PreviewFailedCount} 项预览失败，可重试" : "，分类决定自动保存");
             if (unavailable > 0) StatusText += $"；{unavailable} 个文件夹不可访问，已保留其整理进度";
         }
@@ -389,6 +395,7 @@ public sealed class MainViewModel : ObservableObject
         finally
         {
             _restoring = false;
+            _forceRegenerating = false;
             foreach (var item in _allVideos.Where(v => v.IsPreviewLoading)) item.PreviewState = PreviewState.Waiting;
             _workCancellation?.Dispose();
             _workCancellation = null;
@@ -400,7 +407,7 @@ public sealed class MainViewModel : ObservableObject
         }
     }
 
-    public async Task GeneratePreviewsAsync(CancellationToken cancellationToken = default)
+    public async Task GeneratePreviewsAsync(CancellationToken cancellationToken = default, bool forceRegenerate = false)
     {
         if (_allVideos.Count == 0 || IsExecuting) return;
         if (IsBusy && _workCancellation is null) return;
@@ -414,7 +421,8 @@ public sealed class MainViewModel : ObservableObject
         var token = _workCancellation!.Token;
         IsProgressIndeterminate = false;
         OperationProgress = 0;
-        var pending = _allVideos.Where(v => v.PreviewState != PreviewState.Ready).ToList();
+        var pending = _allVideos.Where(v => forceRegenerate || v.PreviewState != PreviewState.Ready).ToList();
+        var frameCount = PreviewFrameCount;
         var total = pending.Count;
         var completed = 0;
         OperationText = $"预览 0/{total}";
@@ -434,7 +442,7 @@ public sealed class MainViewModel : ObservableObject
                 });
                 try
                 {
-                    var result = await _previewGenerator.GenerateAsync(item.Descriptor, item.PreviewPath, ct);
+                    var result = await _previewGenerator.GenerateAsync(item.Descriptor, item.PreviewPath, ct, frameCount, forceRegenerate);
                     await _dispatcher.InvokeAsync(() =>
                     {
                         if (result.Success)
@@ -496,16 +504,9 @@ public sealed class MainViewModel : ObservableObject
         }
     }
 
-    public async Task RetryPreviewsAsync()
-    {
-        if (IsBusy) return;
-        try
-        {
-            await GeneratePreviewsAsync();
-            StatusText = PreviewFailedCount == 0 ? "预览已就绪" : $"{PreviewFailedCount} 项预览失败，点击卡片查看原因";
-        }
-        catch (OperationCanceledException) { StatusText = "已停止；可以继续生成剩余预览"; }
-    }
+    public Task RetryPreviewsAsync() => RegeneratePreviewsAsync(false);
+
+    public Task RegeneratePreviewsAsync(bool regenerateAll) => RefreshProjectVideosAsync(regenerateAll);
 
     public async Task<BatchResult> ExecuteAsync()
     {
@@ -564,27 +565,37 @@ public sealed class MainViewModel : ObservableObject
     }
 
     public void ApplyCategories(IEnumerable<CategoryDefinition> categories, int previewConcurrency)
+        => ApplyProjectSettings(ProjectName, categories, previewConcurrency, PreviewFrameCount);
+
+    public void ApplyProjectSettings(string name, IEnumerable<CategoryDefinition> categories, int previewConcurrency, int frameCount)
     {
         if (!HasProject) throw new InvalidOperationException("请先创建或打开项目。");
-        if (IsExecuting) return;
+        if (IsBusy) throw new InvalidOperationException("请先停止当前任务，再修改项目设置。");
+        name = name.Trim();
+        if (name.Length == 0 || name.Length > 100) throw new ArgumentException("项目名称需为 1–100 个字符。", nameof(name));
+        if (frameCount is not (16 or 25)) throw new ArgumentOutOfRangeException(nameof(frameCount));
+        var frameCountChanged = frameCount != PreviewFrameCount;
         var list = categories.Select(c => c.Clone()).ToList();
         FlushWorkspace(throwOnError: true);
         var updatedProject = new FramePickProject
         {
             Id = _project!.Id,
-            Name = _project.Name,
+            Name = name,
             SourceFolders = _project.SourceFolders.ToList(),
             Categories = list.Select(c => c.Clone()).ToList(),
             PreviewConcurrency = Math.Clamp(previewConcurrency, 1, 4),
+            PreviewFrameCount = frameCount,
             Decisions = _project.Decisions
         };
         ProjectStore.Save(ProjectFilePath, updatedProject);
         _project = updatedProject;
+        if (frameCountChanged) CloseDetail();
         _restoring = true;
         var validIds = list.Select(c => c.Id).ToHashSet();
         var decisions = _allVideos.ToDictionary(v => v, v => v.CategoryId);
         foreach (var item in _allVideos)
         {
+            if (frameCountChanged) item.ChangePreviewPath(StateStore.PreviewPathFor(item.FullPath, item.Descriptor.Length, item.Descriptor.LastWriteTimeUtc, frameCount));
             if (item.CategoryId.Length > 0 && !validIds.Contains(item.CategoryId)) item.CategoryId = string.Empty;
             item.CategoryName = list.FirstOrDefault(c => c.Id == item.CategoryId)?.Name ?? string.Empty;
         }
@@ -599,8 +610,10 @@ public sealed class MainViewModel : ObservableObject
         _restoring = false;
         BuildFilters();
         SaveWorkspace();
+        RefreshProjectProperties();
         RefreshDecisionProperties();
         RefreshView();
+        StatusText = frameCountChanged ? $"项目设置已保存，点击“重新生成”生成 {frameCount} 帧预览" : "项目设置已保存";
     }
 
     public void Cancel()
@@ -721,12 +734,15 @@ public sealed class MainViewModel : ObservableObject
 
     private async Task LoadPreviewImageAsync(VideoItem item)
     {
+        if (_forceRegenerating && item.PreviewState != PreviewState.Ready) return;
         if (!File.Exists(item.PreviewPath) || item.PreviewImage is not null || !_imageLoads.TryAdd(item.FullPath, 0)) return;
+        var previewPath = item.PreviewPath;
         try
         {
-            var image = await ImageLoader.LoadAsync(item.PreviewPath);
+            var image = await ImageLoader.LoadAsync(previewPath);
             await _dispatcher.InvokeAsync(() =>
             {
+                if (item.PreviewPath != previewPath) return;
                 if (image is not null && VisibleVideos.Contains(item))
                 {
                     item.PreviewImage = image;
@@ -734,7 +750,7 @@ public sealed class MainViewModel : ObservableObject
                 }
                 else if (image is null && item.PreviewState == PreviewState.Ready)
                 {
-                    item.Error = "预览缓存无法读取，请点击重试预览";
+                    item.Error = "预览缓存无法读取，请点击“重新生成”并选择“只补充”";
                     item.PreviewState = PreviewState.Failed;
                 }
             });
@@ -805,13 +821,13 @@ public sealed class MainViewModel : ObservableObject
 
     private void SaveWorkspace()
     {
-        if (!_restoring && HasProject) { _saveTimer.Stop(); _saveTimer.Start(); }
+        if (!_restoring && HasProject) { _workspaceDirty = true; _saveTimer.Stop(); _saveTimer.Start(); }
     }
 
     public void FlushWorkspace(bool throwOnError = false)
     {
         _saveTimer.Stop();
-        if (_restoring || _project is null) return;
+        if (_restoring || _project is null || !_workspaceDirty) return;
         try
         {
             var present = _allVideos.Select(v => v.FullPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -823,6 +839,7 @@ public sealed class MainViewModel : ObservableObject
             }));
             _project.Decisions = saved;
             ProjectStore.Save(ProjectFilePath, _project);
+            _workspaceDirty = false;
         }
         catch (Exception ex)
         {
@@ -835,7 +852,8 @@ public sealed class MainViewModel : ObservableObject
     {
         foreach (var property in new[] { nameof(HasProject), nameof(CanImport), nameof(CanChangeProject), nameof(CanManageCategories),
             nameof(HasLegacySettings), nameof(ProjectName), nameof(ProjectFilePath), nameof(WindowTitle), nameof(WorkspaceTitle),
-            nameof(FolderSummary), nameof(EmptyTitle), nameof(EmptyDescription) }) OnPropertyChanged(property);
+            nameof(FolderSummary), nameof(EmptyTitle), nameof(EmptyDescription), nameof(PreviewConcurrency), nameof(PreviewFrameCount),
+            nameof(PreviewLoadingText), nameof(CanGeneratePreviews) }) OnPropertyChanged(property);
     }
 
     private void ClearVideos()

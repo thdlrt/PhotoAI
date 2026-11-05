@@ -19,7 +19,9 @@ public partial class App : Application
             {
                 var window = new MainWindow();
                 var categories = new CategoryManagerWindow(Array.Empty<Models.CategoryDefinition>(), 2);
-                if (window.FindName("GalleryScrollViewer") is null || categories.FindName("AddCategoryButton") is null)
+                if (window.FindName("GalleryScrollViewer") is null || window.FindName("RegenerateButton") is null
+                    || categories.FindName("AddCategoryButton") is null || categories.FindName("ProjectNameInput") is null
+                    || categories.FindName("PreviewFrameCountInput") is null)
                     throw new InvalidDataException("帧选界面资源不完整。");
                 Shutdown(0);
             }

@@ -10,17 +10,21 @@ public partial class CategoryManagerWindow : Window
 {
     private readonly ObservableCollection<CategoryDefinition> _categories;
 
-    public CategoryManagerWindow(IEnumerable<CategoryDefinition> categories, int previewConcurrency)
+    public CategoryManagerWindow(IEnumerable<CategoryDefinition> categories, int previewConcurrency, string projectName = "项目", int previewFrameCount = 16)
     {
         InitializeComponent();
         FramePick.Services.WindowTheme.Attach(this);
         _categories = new ObservableCollection<CategoryDefinition>(categories.Select(c => c.Clone()));
         PreviewConcurrency = Math.Clamp(previewConcurrency, 1, 4);
+        ProjectName = projectName;
+        PreviewFrameCount = previewFrameCount;
         CategoryList.ItemsSource = _categories;
         DataContext = this;
     }
 
     public int PreviewConcurrency { get; set; }
+    public string ProjectName { get; set; }
+    public int PreviewFrameCount { get; set; }
     public IEnumerable<CategoryDefinition> CategoriesResult => _categories;
 
     private void Add_Click(object sender, RoutedEventArgs e)
@@ -69,6 +73,18 @@ public partial class CategoryManagerWindow : Window
 
     private void Save_Click(object sender, RoutedEventArgs e)
     {
+        ProjectName = ProjectName.Trim();
+        if (ProjectName.Length == 0)
+        {
+            ValidationMessage.Text = "请输入项目名称。";
+            ProjectNameInput.Focus();
+            return;
+        }
+        if (PreviewFrameCount is not (16 or 25))
+        {
+            ValidationMessage.Text = "请选择 16 或 25 帧预览。";
+            return;
+        }
         foreach (var category in _categories)
         {
             category.Name = category.Name.Trim();

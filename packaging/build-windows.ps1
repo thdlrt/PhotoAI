@@ -288,7 +288,7 @@ $ReleaseManifest = [ordered]@{
     ai_environment_installed_post_setup = $true
     media_tools_included = [bool]$WithMediaTools
     framepick_included = $true
-    framepick_version = '1.2.0'
+    framepick_version = '1.3.0'
     resources = $ResourceInventory
 }
 $ReleaseManifestPath = Join-Path $StageManifests 'release-manifest.json'

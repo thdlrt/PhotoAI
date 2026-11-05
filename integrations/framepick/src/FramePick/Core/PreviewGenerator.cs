@@ -3,7 +3,7 @@ using System.Runtime.ExceptionServices;
 
 namespace FramePick.Core;
 
-/// <summary>使用 FFmpeg 快速截取 16 帧并合成带时间戳的 4×4 JPEG 预览。</summary>
+/// <summary>使用 FFmpeg 截取 16 或 25 帧，合成带时间戳的方形网格预览。</summary>
 public sealed class PreviewGenerator
 {
     public const int PreviewFrameCount = 16;
@@ -11,22 +11,23 @@ public sealed class PreviewGenerator
     private const int FrameWidth = 320;
     private const int FrameHeight = 180;
     private const int CellHeight = 200;
-    private const int OutputWidth = 1280;
-    private const int OutputHeight = 800;
     private static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(20);
     private static readonly TimeSpan FrameTimeout = TimeSpan.FromSeconds(45);
 
     /// <summary>
-    /// 生成 1280×800、JPEG 质量 82 的预览。已存在且非空的输出文件直接作为缓存使用。
+    /// 生成 4×4（1280×800）或 5×5（1600×1000）预览；可复用有效缓存或强制重做。
     /// 普通失败通过 PreviewResult 返回；取消会结束 FFmpeg 进程树并抛出 OperationCanceledException。
     /// </summary>
     public async Task<PreviewResult> GenerateAsync(
         VideoDescriptor video,
         string outputJpegPath,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        int frameCount = PreviewFrameCount,
+        bool forceRegenerate = false)
     {
         ArgumentNullException.ThrowIfNull(video);
         ArgumentException.ThrowIfNullOrWhiteSpace(outputJpegPath);
+        if (frameCount is not (16 or 25)) throw new ArgumentOutOfRangeException(nameof(frameCount), "预览帧数仅支持 16 或 25。");
 
         double duration = 0;
         var completedFrames = 0;
@@ -40,7 +41,7 @@ public sealed class PreviewGenerator
                 ?? throw new IOException("无法确定预览输出目录。");
             Directory.CreateDirectory(outputDirectory);
 
-            if (HasUsableCache(fullOutputPath))
+            if (!forceRegenerate && HasUsablePreview(fullOutputPath, frameCount))
             {
                 try
                 {
@@ -55,7 +56,7 @@ public sealed class PreviewGenerator
                     // 缓存有效时，时长读取失败不应阻止直接使用预览。
                 }
 
-                return new PreviewResult(true, null, duration, PreviewFrameCount);
+                return new PreviewResult(true, null, duration, frameCount);
             }
 
             if (string.IsNullOrWhiteSpace(video.FullPath) || !File.Exists(video.FullPath))
@@ -64,14 +65,14 @@ public sealed class PreviewGenerator
             }
 
             duration = await ProbeDurationAsync(video.FullPath, cancellationToken).ConfigureAwait(false);
-            var timestamps = CreateTimestamps(duration);
+            var timestamps = CreateTimestamps(duration, frameCount);
 
             temporaryDirectory = Path.Combine(
                 outputDirectory,
                 $".{Path.GetFileName(fullOutputPath)}.{Guid.NewGuid():N}.frames");
             Directory.CreateDirectory(temporaryDirectory);
 
-            var framePaths = Enumerable.Range(0, PreviewFrameCount)
+            var framePaths = Enumerable.Range(0, frameCount)
                 .Select(index => Path.Combine(temporaryDirectory, $"frame-{index:00}.jpg"))
                 .ToArray();
 
@@ -93,8 +94,8 @@ public sealed class PreviewGenerator
                 .ConfigureAwait(false);
 
             cancellationToken.ThrowIfCancellationRequested();
-            CommitPreview(renderedPreviewPath, fullOutputPath);
-            return new PreviewResult(true, null, duration, PreviewFrameCount);
+            CommitPreview(renderedPreviewPath, fullOutputPath, frameCount, forceRegenerate);
+            return new PreviewResult(true, null, duration, frameCount);
         }
         catch (OperationCanceledException)
         {
@@ -149,13 +150,13 @@ public sealed class PreviewGenerator
         return duration;
     }
 
-    private static double[] CreateTimestamps(double duration)
+    private static double[] CreateTimestamps(double duration, int frameCount)
     {
-        var timestamps = new double[PreviewFrameCount];
+        var timestamps = new double[frameCount];
         for (var index = 0; index < timestamps.Length; index++)
         {
-            // 每帧位于对应 1/16 区间的中点，公式保证最后一帧也严格小于 duration。
-            var timestamp = duration * (index + 0.5) / PreviewFrameCount;
+            // 每帧位于对应时间区间的中点，最后一帧严格小于 duration。
+            var timestamp = duration * (index + 0.5) / frameCount;
             timestamps[index] = Math.Max(0, Math.Min(timestamp, duration - double.Epsilon));
         }
 
@@ -175,7 +176,7 @@ public sealed class PreviewGenerator
         var completed = 0;
         Exception? firstFailure = null;
 
-        var tasks = new Task[PreviewFrameCount];
+        var tasks = new Task[framePaths.Count];
         for (var index = 0; index < tasks.Length; index++)
         {
             var frameIndex = index;
@@ -196,6 +197,7 @@ public sealed class PreviewGenerator
                                     "-an", "-sn", "-dn",
                                     "-vf", "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2:black",
                                     "-threads", "2",
+                                    "-pix_fmt", "yuvj420p",
                                     "-q:v", "2",
                                     "-y", framePaths[frameIndex]
                                 };
@@ -269,7 +271,8 @@ public sealed class PreviewGenerator
         }
 
         var filter = new System.Text.StringBuilder(8192);
-        for (var index = 0; index < PreviewFrameCount; index++)
+        var columns = (int)Math.Sqrt(framePaths.Count);
+        for (var index = 0; index < framePaths.Count; index++)
         {
             var timestamp = FormatTimestamp(timestamps[index]).Replace(":", "\\:");
             filter.Append('[').Append(index).Append(":v]pad=320:200:0:0:0x18181C,")
@@ -278,12 +281,12 @@ public sealed class PreviewGenerator
                 .Append("':x=6:y=182:fontsize=13:fontcolor=white[v")
                 .Append(index).Append("];");
         }
-        for (var index = 0; index < PreviewFrameCount; index++) filter.Append("[v").Append(index).Append(']');
-        filter.Append("xstack=inputs=16:layout=");
-        for (var index = 0; index < PreviewFrameCount; index++)
+        for (var index = 0; index < framePaths.Count; index++) filter.Append("[v").Append(index).Append(']');
+        filter.Append("xstack=inputs=").Append(framePaths.Count).Append(":layout=");
+        for (var index = 0; index < framePaths.Count; index++)
         {
             if (index > 0) filter.Append('|');
-            filter.Append((index % 4) * FrameWidth).Append('_').Append((index / 4) * CellHeight);
+            filter.Append((index % columns) * FrameWidth).Append('_').Append((index / columns) * CellHeight);
         }
         filter.Append(":fill=0x18181C[sheet]");
 
@@ -295,6 +298,8 @@ public sealed class PreviewGenerator
         arguments.Add("1");
         arguments.Add("-q:v");
         arguments.Add("2");
+        arguments.Add("-pix_fmt");
+        arguments.Add("yuvj420p");
         arguments.Add("-update");
         arguments.Add("1");
         arguments.Add("-y");
@@ -326,11 +331,31 @@ public sealed class PreviewGenerator
         catch { return false; }
     }
 
-    private static void CommitPreview(string renderedPreviewPath, string outputPath)
+    private static bool HasUsablePreview(string path, int frameCount)
     {
+        try
+        {
+            using var stream = File.OpenRead(path);
+            var decoder = System.Windows.Media.Imaging.BitmapDecoder.Create(stream,
+                System.Windows.Media.Imaging.BitmapCreateOptions.IgnoreColorProfile,
+                System.Windows.Media.Imaging.BitmapCacheOption.OnLoad);
+            var columns = (int)Math.Sqrt(frameCount);
+            return decoder.Frames.Count > 0 && decoder.Frames[0].PixelWidth == columns * FrameWidth
+                && decoder.Frames[0].PixelHeight == columns * CellHeight;
+        }
+        catch { return false; }
+    }
+
+    private static void CommitPreview(string renderedPreviewPath, string outputPath, int frameCount, bool forceRegenerate)
+    {
+        if (forceRegenerate)
+        {
+            File.Move(renderedPreviewPath, outputPath, overwrite: true);
+            return;
+        }
         if (File.Exists(outputPath))
         {
-            if (HasUsableCache(outputPath))
+            if (HasUsablePreview(outputPath, frameCount))
             {
                 return;
             }
@@ -342,7 +367,7 @@ public sealed class PreviewGenerator
         {
             File.Move(renderedPreviewPath, outputPath, overwrite: false);
         }
-        catch (IOException) when (HasUsableCache(outputPath))
+        catch (IOException) when (HasUsablePreview(outputPath, frameCount))
         {
             // 并发生成已先写入有效缓存，保留先完成的文件。
         }
